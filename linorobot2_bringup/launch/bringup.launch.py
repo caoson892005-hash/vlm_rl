@@ -52,6 +52,24 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument(
+        name='offset_x', 
+        default_value='0.0',
+        description='Robot offset in X axis'
+        ),
+
+        DeclareLaunchArgument(
+        name='offset_y', 
+        default_value='0.0',
+        description='Robot offset in Y axis'
+        ),
+
+        DeclareLaunchArgument(
+        name='offset_yaw', 
+        default_value='0.0',
+        description='Robot offset heading'
+        ),
+
+        DeclareLaunchArgument(
             name='custom_robot', 
             default_value='false',
             description='Use custom robot'
@@ -126,6 +144,22 @@ def generate_launch_description():
                 ekf_config_path
             ],
             remappings=[("odometry/filtered", LaunchConfiguration("odom_topic"))]
+        ),
+
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='world_to_odom',
+            arguments=[
+                LaunchConfiguration('offset_x'),   # X
+                LaunchConfiguration('offset_y'),   # Y
+                '0',                              # Z
+                LaunchConfiguration('offset_yaw'), # Yaw
+                '0',                              # Pitch
+                '0',                              # Roll
+                'world',                          # Parent Frame
+                'odom'                            # Child Frame
+            ]
         ),
 
         IncludeLaunchDescription(

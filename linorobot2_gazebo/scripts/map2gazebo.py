@@ -362,7 +362,7 @@ class MapConverter:
         if not mesh.is_volume:
             mesh.fix_normals()
         
-        mesh.remove_duplicate_faces()
+        mesh.process()
         
         return mesh
 

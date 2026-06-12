@@ -10,11 +10,11 @@
         <right_joint>right_wheel_joint</right_joint>
         <wheel_separation>${wheel_separation}</wheel_separation>
         <wheel_diameter>${wheel_radius * 2}</wheel_diameter>
-        <max_wheel_acceleration>1.0</max_wheel_acceleration>
+        <max_wheel_acceleration>40.0</max_wheel_acceleration>
         <robot_base_frame>base_footprint</robot_base_frame>
         <publish_odom>true</publish_odom>
         <publish_odom_tf>false</publish_odom_tf>
-        <publish_wheel_tf>true</publish_wheel_tf>
+        <publish_wheel_tf>true</publish_wheel_tf>  #da sua thanh true ---> false
         <odometry_frame>odom</odometry_frame>
       </plugin>
     </gazebo>

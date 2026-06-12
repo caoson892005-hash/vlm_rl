@@ -1,6 +1,6 @@
 ekf_filter_node:
     ros__parameters:
-        frequency: 50.0
+        frequency: 20.0
         two_d_mode: true
         publish_tf: true
  
@@ -20,10 +20,12 @@ ekf_filter_node:
                        true, true, false,
                        false, false, true,
                        false, false, false]
-
+        
         imu0: imu/data
         imu0_config: [false, false, false,
                       false, false, false,
                       false, false, false,
                       false, false, true,
                       false, false, false]
+
+        imu0_relative: true # Reset IMU angle to 0 during startup

@@ -22,15 +22,15 @@ amcl:
     min_particles: 500
     odom_frame_id: "odom"
     pf_err: 0.05
-    pf_z: 0.99
-    recovery_alpha_fast: 0.0
-    recovery_alpha_slow: 0.0
+    pf_z: 0.95
+    recovery_alpha_fast: 0.3
+    recovery_alpha_slow: 0.05
     resample_interval: 1
     robot_model_type: "nav2_amcl::DifferentialMotionModel"
     save_pose_rate: 0.5
     sigma_hit: 0.2
     tf_broadcast: true
-    transform_tolerance: 1.0
+    transform_tolerance: 2.0
     update_min_a: 0.2
     update_min_d: 0.25
     z_hit: 0.5

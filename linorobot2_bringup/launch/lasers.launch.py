@@ -41,6 +41,8 @@ def launch_rplidar(context, *args, **kwargs):
             )),
             launch_arguments={
                 'serial_port': '/dev/rplidar', 
+                'serial_baudrate': '115200',
+                'scan_mode': 'Standard',
                 'frame_id': LaunchConfiguration('frame_id'),
             }.items()   
         )]

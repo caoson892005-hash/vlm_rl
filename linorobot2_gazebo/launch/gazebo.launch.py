@@ -14,13 +14,14 @@
 
 import os
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, TimerAction
 from launch.substitutions import LaunchConfiguration, Command, PathJoinSubstitution
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 from launch_ros.actions import ComposableNodeContainer
 from launch_ros.descriptions import ComposableNode
+from launch.conditions import IfCondition, UnlessCondition
 
 
 def generate_launch_description():
@@ -31,7 +32,7 @@ def generate_launch_description():
     )
 
     world_path = PathJoinSubstitution(
-        [FindPackageShare("linorobot2_gazebo"), "worlds", "playground.world"]
+        [FindPackageShare("linorobot2_gazebo"), "worlds", "map2.world"]
     )
 
     robot_base = os.getenv('LINOROBOT2_BASE')
@@ -43,7 +44,23 @@ def generate_launch_description():
         [FindPackageShare('linorobot2_description'), 'launch', 'description.launch.py']
     )
 
+    rviz_config_path = PathJoinSubstitution(
+            [FindPackageShare("linorobot2_gazebo"), "rviz", "trajectory_view.rviz"]
+    )
+
     return LaunchDescription([
+        DeclareLaunchArgument(
+            name='paused', 
+            default_value='false',
+            description='Start Gazebo paused'
+        ),
+
+        DeclareLaunchArgument(
+            name='rviz', 
+            default_value='false', # Mặc định là bật, đổi thành 'false' nếu muốn mặc định tắt
+            description='Launch RViz'
+        ),
+
         DeclareLaunchArgument(
             name='urdf', 
             default_value=urdf_path,
@@ -64,13 +81,13 @@ def generate_launch_description():
 
         DeclareLaunchArgument(
             name='spawn_x', 
-            default_value='0.0',
+            default_value='4.0',
             description='Robot spawn position in X axis'
         ),
 
         DeclareLaunchArgument(
             name='spawn_y', 
-            default_value='0.0',
+            default_value='-2.0',
             description='Robot spawn position in Y axis'
         ),
 
@@ -82,7 +99,7 @@ def generate_launch_description():
             
         DeclareLaunchArgument(
             name='spawn_yaw', 
-            default_value='0.0',
+            default_value='-1.7',
             description='Robot spawn heading'
         ),
 
@@ -106,11 +123,48 @@ def generate_launch_description():
             ]
         ),
 
-        Node(
-            package='linorobot2_gazebo',
-            executable='command_timeout.py',
-            name='command_timeout'
+        TimerAction(
+            period=5.0,
+            actions=[
+                ExecuteProcess(
+                    condition=IfCondition(LaunchConfiguration('paused')),
+                    cmd=['ros2', 'service', 'call', '/pause_physics', 'std_srvs/srv/Empty', '{}'],
+                    output='screen'
+                )
+            ]
         ),
+
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            arguments=[
+                LaunchConfiguration('spawn_x'),   # X
+                LaunchConfiguration('spawn_y'),   # Y
+                LaunchConfiguration('spawn_z'),   # Z
+                LaunchConfiguration('spawn_yaw'), # Yaw
+                '0',                             # Pitch
+                '0',                             # Roll
+                'world',                         # Parent Frame
+                'odom'                           # Child Frame
+            ],
+            parameters=[{'use_sim_time': use_sim_time}]
+        ),
+
+        Node(
+            package='rviz2',
+            executable='rviz2',
+            name='rviz2',
+            output='screen',
+            arguments=['-d', rviz_config_path],
+            condition=IfCondition(LaunchConfiguration("rviz")), # <--- QUAN TRỌNG NHẤT
+            parameters=[{'use_sim_time': use_sim_time}]
+        ),
+
+        # Node(
+        #     package='linorobot2_gazebo',
+        #     executable='command_timeout.py',
+        #     name='command_timeout'
+        # ),
 
         Node(
             package='robot_localization',
@@ -127,6 +181,7 @@ def generate_launch_description():
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(description_launch_path),
             launch_arguments={
+                'rviz': 'false',
                 'use_sim_time': str(use_sim_time),
                 'publish_joints': 'false',
                 'urdf': LaunchConfiguration('urdf')

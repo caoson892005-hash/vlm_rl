@@ -1,5 +1,4 @@
 image: playground.pgm
-mode: trinary
 resolution: 0.05
 origin: [-10.3, -10.5, 0]
 negate: 0
