@@ -1,0 +1,19 @@
+yolo_depth_people_detector:
+  ros__parameters:
+    use_sim_time: true
+    model_path: /home/son/social_vlm_camera/yolo11n.pt
+    rgb_topic: /overhead_camera/color/image_raw
+    depth_topic: /overhead_camera/depth/image_raw
+    camera_info_topic: /overhead_camera/color/camera_info
+    # The wall view sees people at roughly 3--8 m. A slightly lower threshold
+    # helps retain both moving people without changing YOLO's person-only
+    # class filter in the detector.
+    confidence: 0.25
+    # 640 is substantially faster on CPU; the published annotated image still
+    # keeps the camera's original 1280x720 resolution.
+    image_size: 640
+    target_frame: world
+    maximum_depth_age: 0.15
+    minimum_depth: 0.2
+    maximum_depth: 12.0
+    people_topic: /yolo/people

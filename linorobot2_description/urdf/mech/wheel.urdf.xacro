@@ -6,7 +6,7 @@
         <origin xyz="0 0 0" rpy="0 0 0"/>
         <geometry>
         <!--  <cylinder radius="0.03578" length="${width}"/> -->
-           <mesh filename="package://linorobot2_description/meshes/wheel_${side}.STL" scale="1 1 1"/> 
+           <mesh filename="file://$(find linorobot2_description)/meshes/wheel_${side}.STL" scale="1 1 1"/>
         </geometry>
         <material name="dark">
           <color rgba="0.9 0.5 0.3 1.0"/>

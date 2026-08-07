@@ -14,7 +14,9 @@
 
 import os
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, TimerAction
+from launch.actions import (DeclareLaunchArgument, ExecuteProcess,
+                            IncludeLaunchDescription, SetEnvironmentVariable,
+                            TimerAction)
 from launch.substitutions import LaunchConfiguration, Command, PathJoinSubstitution
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
@@ -27,15 +29,33 @@ from launch.conditions import IfCondition, UnlessCondition
 def generate_launch_description():
     use_sim_time = True
 
+    # Ignore accidental workspace-root entries (commonly exported from
+    # ~/.bashrc). Gazebo treats every direct child as a model and otherwise
+    # floods the console with "Missing model.config" errors.
+    gazebo_model_paths = []
+    for path in os.getenv('GAZEBO_MODEL_PATH', '').split(os.pathsep):
+        if not path or not os.path.isdir(path):
+            continue
+        try:
+            is_model_root = any(
+                os.path.isfile(os.path.join(path, child, 'model.config'))
+                for child in os.listdir(path))
+        except OSError:
+            is_model_root = False
+        if is_model_root:
+            gazebo_model_paths.append(path)
+
     ekf_config_path = PathJoinSubstitution(
         [FindPackageShare("linorobot2_base"), "config", "ekf.yaml"]
     )
 
     world_path = PathJoinSubstitution(
-        [FindPackageShare("linorobot2_gazebo"), "worlds", "map2.world"]
+        [FindPackageShare("linorobot2_gazebo"), "worlds", "tuong_san.world"]
     )
 
-    robot_base = os.getenv('LINOROBOT2_BASE')
+    # Keep Gazebo usable in a fresh terminal even when ~/.bashrc does not
+    # define the robot base. This matches description.launch.py's default.
+    robot_base = os.getenv('LINOROBOT2_BASE', '2wd')
     urdf_path = PathJoinSubstitution(
         [FindPackageShare("linorobot2_description"), "urdf/robots", f"{robot_base}.urdf.xacro"]
     )
@@ -49,6 +69,11 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        SetEnvironmentVariable(
+            name='GAZEBO_MODEL_PATH',
+            value=os.pathsep.join(gazebo_model_paths)
+        ),
+
         DeclareLaunchArgument(
             name='paused', 
             default_value='false',
@@ -137,15 +162,44 @@ def generate_launch_description():
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
+            name='world_to_map',
             arguments=[
-                LaunchConfiguration('spawn_x'),   # X
-                LaunchConfiguration('spawn_y'),   # Y
-                LaunchConfiguration('spawn_z'),   # Z
-                LaunchConfiguration('spawn_yaw'), # Yaw
-                '0',                             # Pitch
-                '0',                             # Roll
-                'world',                         # Parent Frame
-                'odom'                           # Child Frame
+                '0', '0', '0',                  # Kept only for Gazebo visualization
+                '0', '0', '0',
+                'world',
+                'map'
+            ],
+            parameters=[{'use_sim_time': use_sim_time}]
+        ),
+
+        # Fixed transform matching the north-wall RGB-D camera in
+        # tuong_san.world. Keep the established frame/topic names so the
+        # detector and existing RViz configurations remain compatible.
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='world_to_overhead_camera',
+            arguments=[
+                '--x', '2.7', '--y', '7.25', '--z', '2.2',
+                '--roll', '0.0', '--pitch', '0.1831108173',
+                '--yaw', '-1.57079632679',
+                '--frame-id', 'world',
+                '--child-frame-id', 'overhead_camera_link'
+            ],
+            parameters=[{'use_sim_time': use_sim_time}]
+        ),
+
+        # ROS optical convention: +Z forward, +X right, +Y down.
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='overhead_camera_to_optical',
+            arguments=[
+                '--x', '0.0', '--y', '0.0', '--z', '0.0',
+                '--roll', '-1.57079632679', '--pitch', '0.0',
+                '--yaw', '-1.57079632679',
+                '--frame-id', 'overhead_camera_link',
+                '--child-frame-id', 'overhead_camera_optical_frame'
             ],
             parameters=[{'use_sim_time': use_sim_time}]
         ),

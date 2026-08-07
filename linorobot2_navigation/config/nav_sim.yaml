@@ -2,7 +2,12 @@
 amcl:
   ros__parameters:
     set_initial_pose: true  # Nếu bạn muốn đặt vị trí ban đầu cho robot, hãy đặt giá trị này thành true
-    initial_pose: [4.0, -2.0, 0.0, -1.7]
+    initial_pose:
+      # map_san was created with the robot start pose as the map origin.
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0
     use_sim_time: true
     alpha1: 0.2
     alpha2: 0.2
@@ -57,12 +62,13 @@ bt_navigator:
     robot_base_frame: base_link
     odom_topic: /odom
     
-    # Đã comment lại đường dẫn cứng này vì chạy mô phỏng có thể không tìm thấy thư mục của máy dell
-    default_nav_to_pose_bt_xml: "/home/hung/ninorobot2/linorobot2_navigation/config/compute_path_only.xml"
-    # ====================================================
+    # Dùng behavior tree mặc định của Nav2. Không dùng đường dẫn tuyệt đối theo máy.
+    # navigation.launch.py replaces this placeholder with the installed 2 Hz
+    # social-replanning behavior tree.
+    default_nav_to_pose_bt_xml: SOCIAL_REPLANNING_BT_XML
 
     bt_loop_duration: 10
-    default_server_timeout: 20
+    default_server_timeout: 200
     enable_groot_monitoring: true
     groot_zmq_publisher_port: 1666
     groot_zmq_server_port: 1667
@@ -107,11 +113,12 @@ bt_navigator_rclcpp_node:
 controller_server:
   ros__parameters:
     use_sim_time: true
-    controller_frequency: 40.0
+    controller_frequency: 20.0
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.5
     min_theta_velocity_threshold: 0.001
-    failure_tolerance: 0.3
+    # Allow time for the next global detour instead of aborting after 0.3 s.
+    failure_tolerance: 2.0
     progress_checker_plugin: "progress_checker"
     goal_checker_plugins: ["general_goal_checker"] # "precise_goal_checker"
     controller_plugins: ["FollowPath"]
@@ -119,8 +126,8 @@ controller_server:
     # Progress checker parameters
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.5
-      movement_time_allowance: 10.0
+      required_movement_radius: 0.2
+      movement_time_allowance: 15.0
 
     # Goal checker parameters
     general_goal_checker:
@@ -130,21 +137,15 @@ controller_server:
       yaw_goal_tolerance: 0.25
     # DWB parameters
     FollowPath:
-      plugin: "nav2_rotation_shim_controller::RotationShimController"   #can phai sua 
-      angular_dist_threshold: 0.785
-      forward_sampling_distance: 0.5
-      rotate_to_heading_angular_vel: 1.8
-      max_angular_accel: 3.2
-      simulate_ahead_time: 1.0
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: true
       min_vel_x: 0.0
       min_vel_y: 0.0
-      max_vel_x: 0.4
+      max_vel_x: 0.5
       max_vel_y: 0.0
       max_vel_theta: 0.75
-      min_speed_xy: 0.0
-      max_speed_xy: 0.4
+      min_speed_xy: 0.08
+      max_speed_xy: 0.5
       min_speed_theta: 0.0
       # Add high threshold velocity for turtlebot 3 issue.
       # https://github.com/ROBOTIS-GIT/turtlebot3_simulations/issues/75
@@ -154,25 +155,28 @@ controller_server:
       decel_lim_x: -2.5
       decel_lim_y: 0.0
       decel_lim_theta: -3.2
-      vx_samples: 20
-      vy_samples: 5
-      vtheta_samples: 20
-      sim_time: 1.7
+      vx_samples: 12
+      # Differential drive has no lateral velocity; extra Y samples only repeat
+      # identical trajectories and waste the control-loop budget.
+      vy_samples: 1
+      vtheta_samples: 16
+      sim_time: 1.8
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 0.2
       xy_goal_tolerance: 0.25
-      trans_stopped_velocity: 0.25
+      trans_stopped_velocity: 0.05
       short_circuit_trajectory_evaluation: true
       stateful: true
-      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
-      BaseObstacle.scale: 0.02
-      PathAlign.scale: 32.0
+      critics: ["RotateToGoal", "Oscillation", "ObstacleFootprint", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
+      ObstacleFootprint.scale: 5.0
+      ObstacleFootprint.sum_scores: false
+      PathAlign.scale: 12.0
       PathAlign.forward_point_distance: 0.1
-      GoalAlign.scale: 24.0
+      GoalAlign.scale: 8.0
       GoalAlign.forward_point_distance: 0.1
-      PathDist.scale: 32.0
-      GoalDist.scale: 24.0
+      PathDist.scale: 24.0
+      GoalDist.scale: 20.0
       RotateToGoal.scale: 32.0
       RotateToGoal.slowing_factor: 5.0
       RotateToGoal.lookahead_time: -1.0
@@ -187,11 +191,12 @@ global_costmap:
     ros__parameters:
       use_sim_time: true
       footprint_padding: 0.03
-      update_frequency: 1.0
-      publish_frequency: 1.0
+      update_frequency: 4.0
+      publish_frequency: 2.0
       global_frame: map
       robot_base_frame: base_link
-      robot_radius: 0.1 # radius set and used, so no footprint points
+      # Include a 6 cm safety margin around the physical robot.
+      robot_radius: 0.26
       resolution: 0.05
 
       # ========== THÊM PHẦN NÀY ==========
@@ -201,7 +206,7 @@ global_costmap:
       origin_y: -25.0    # Tâm costmap (dưới robot)
       # ===================================
 
-      plugins: ["static_layer", "obstacle_layer", "voxel_layer", "inflation_layer"]
+      plugins: ["static_layer", "obstacle_layer", "voxel_layer", "social_layer", "inflation_layer"]
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
@@ -264,11 +269,34 @@ global_costmap:
         enabled: true
         subscribe_to_updates: true
         transform_tolerance: 0.1
+      social_layer:
+        plugin: "social_navigation::SocialLayer"
+        enabled: true
+        people_topic: /people
+        groups_topic: /people_groups
+        individual_o_radius: 0.45
+        individual_p_front_radius: 1.1
+        individual_p_side_radius: 0.8
+        individual_p_rear_radius: 0.7
+        individual_r_front_radius: 1.5
+        individual_r_side_radius: 1.0
+        individual_r_rear_radius: 0.75
+        prediction_time: 1.5
+        moving_prediction_time: 2.5
+        moving_speed_threshold: 0.05
+        overlap_escape_clearance: 0.32
+        prediction_steps: 3
+        o_space_cost: 254
+        p_space_cost: 250
+        r_space_cost: 100
+        moving_p_space_cost: 252
+        moving_r_space_cost: 140
+        data_timeout: 1.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
-        inflation_radius: 0.05
-        cost_scaling_factor: 1.0
+        inflation_radius: 0.35
+        cost_scaling_factor: 4.0
         inflate_unknown: false
         inflate_around_unknown: true
       always_send_full_costmap: true
@@ -277,17 +305,18 @@ local_costmap:
   local_costmap:
     ros__parameters:
       use_sim_time: true
-      update_frequency: 1.0
-      publish_frequency: 1.0
+      update_frequency: 15.0
+      publish_frequency: 8.0
       global_frame: odom
       robot_base_frame: base_link
       rolling_window: true
-      width: 3
-      height: 3
+      width: 7
+      height: 7
       resolution: 0.05
-      robot_radius: 0.1  #0.22 radius set and used, so no footprint points
+      # Include a 6 cm safety margin around the physical robot.
+      robot_radius: 0.26
       resolution: 0.05
-      plugins: ["obstacle_layer", "voxel_layer", "inflation_layer"]
+      plugins: ["obstacle_layer", "voxel_layer", "social_layer", "inflation_layer"]
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
@@ -303,7 +332,7 @@ local_costmap:
           raytrace_min_range: 0.0
           max_obstacle_height: 2.0
           min_obstacle_height: 0.0
-          clearing: false
+          clearing: true
           marking: true
           data_type: "LaserScan"
           inf_is_valid: false
@@ -315,7 +344,7 @@ local_costmap:
           raytrace_min_range: 0.0
           max_obstacle_height: 2.0
           min_obstacle_height: 0.0
-          clearing: false
+          clearing: true
           marking: true
           data_type: "LaserScan"
           inf_is_valid: false
@@ -344,11 +373,34 @@ local_costmap:
           clearing: true
           marking: true
           data_type: "PointCloud2"
+      social_layer:
+        plugin: "social_navigation::SocialLayer"
+        enabled: true
+        people_topic: /people
+        groups_topic: /people_groups
+        individual_o_radius: 0.45
+        individual_p_front_radius: 1.1
+        individual_p_side_radius: 0.8
+        individual_p_rear_radius: 0.7
+        individual_r_front_radius: 1.5
+        individual_r_side_radius: 1.0
+        individual_r_rear_radius: 0.75
+        prediction_time: 1.5
+        moving_prediction_time: 2.0
+        moving_speed_threshold: 0.05
+        overlap_escape_clearance: 0.32
+        prediction_steps: 3
+        o_space_cost: 254
+        p_space_cost: 250
+        r_space_cost: 100
+        moving_p_space_cost: 252
+        moving_r_space_cost: 140
+        data_timeout: 1.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
-        inflation_radius: 0.05
-        cost_scaling_factor: 1.0
+        inflation_radius: 0.35
+        cost_scaling_factor: 4.0
         inflate_unknown: false
         inflate_around_unknown: true
 
@@ -369,7 +421,7 @@ map_saver:
 #Tim duong tu A den B: planner server 
 planner_server:
   ros__parameters:
-    expected_planner_frequency: 20.0
+    expected_planner_frequency: 2.0
     use_sim_time: true
     planner_plugins: ["GridBased"]
     GridBased:
@@ -419,7 +471,7 @@ waypoint_follower:
 
 velocity_smoother:
   ros__parameters:
-    smoothing_frequency: 20.0
+    smoothing_frequency: 15.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
     max_velocity: [0.5, 0.0, 2.5]

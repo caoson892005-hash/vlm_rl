@@ -24,7 +24,7 @@
       <visual>
         <origin xyz="0 0 ${caster_wheel_z}" rpy="0 0 0"/>  <!-- ✅ Để ở (0,0,0) -->
         <geometry>
-            <mesh filename="package://linorobot2_description/meshes/${caster_mesh_file}" scale="1 1 1"/>
+            <mesh filename="file://$(find linorobot2_description)/meshes/${caster_mesh_file}" scale="1 1 1"/>
         </geometry>
         <material name="white">
           <color rgba="1.0 1.0 1.0 1.0"/>

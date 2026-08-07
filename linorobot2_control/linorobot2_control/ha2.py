@@ -24,14 +24,14 @@ CHANGELOG v2 (MIT Trajectory Lab tuning):
 import csv
 import datetime
 import math
+from pathlib import Path as FilePath
 
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile
-from rcl_interfaces.msg import (FloatingPointRange, ParameterDescriptor,
-                                 SetParametersResult)
+from rcl_interfaces.msg import (FloatingPointRange, IntegerRange,
+                                 ParameterDescriptor, SetParametersResult)
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry, Path
 
@@ -235,43 +235,68 @@ class HAController:
 # ===========================================================================
 class Figure8Trajectory:
 
-    def __init__(self, A, off_x, off_y, L_loop=30.0):
+    def __init__(self, A, off_x, off_y, lut_size=5000):
         self.A      = A
         self.off_x  = off_x
         self.off_y  = off_y
-        self.L_loop = L_loop
-        self.freq   = 2.0 * math.pi / L_loop
+        self.lut_size = lut_size
+        self._build_arc_length_lut()
+
+    def _build_arc_length_lut(self):
+        """Tạo ánh xạ độ dài cung s [m] -> tham số hình học u [rad]."""
+        self._u_lut = np.linspace(0.0, 2.0 * math.pi, self.lut_size + 1)
+        dx_du = self.A * np.cos(self._u_lut)
+        dy_du = 2.0 * self.A * np.cos(2.0 * self._u_lut)
+        speed = np.hypot(dx_du, dy_du)
+        du = self._u_lut[1] - self._u_lut[0]
+        increments = 0.5 * (speed[:-1] + speed[1:]) * du
+        self._s_lut = np.concatenate(([0.0], np.cumsum(increments)))
+        self.loop_length = float(self._s_lut[-1])
+
+    def update_geometry(self, A=None, off_x=None, off_y=None):
+        rebuild = A is not None and A != self.A
+        if A is not None:
+            self.A = A
+        if off_x is not None:
+            self.off_x = off_x
+        if off_y is not None:
+            self.off_y = off_y
+        if rebuild:
+            self._build_arc_length_lut()
+
+    def _u_from_s(self, s):
+        s_loop = float(s) % self.loop_length
+        return float(np.interp(s_loop, self._s_lut, self._u_lut))
 
     def pos(self, s):
-        f = self.freq
-        return (self.off_x + self.A*math.sin(f*s),
-                self.off_y + self.A*math.sin(2*f*s))
+        u = self._u_from_s(s)
+        return (self.off_x + self.A*math.sin(u),
+                self.off_y + self.A*math.sin(2.0*u))
 
     def curvature(self, s):
-        f, A = self.freq, self.A
-        dx   =  A*f    * math.cos(f*s)
-        dy   =  2*A*f  * math.cos(2*f*s)
-        ddx  = -A*f**2 * math.sin(f*s)
-        ddy  = -4*A*f**2 * math.sin(2*f*s)
+        u, A = self._u_from_s(s), self.A
+        dx   =  A * math.cos(u)
+        dy   =  2*A * math.cos(2*u)
+        ddx  = -A * math.sin(u)
+        ddy  = -4*A * math.sin(2*u)
         return abs(dx*ddy - dy*ddx) / ((dx**2+dy**2)**1.5 + 1e-9)
 
     def ref_kinematics(self, s, v_s, a_s):
-        f, A   = self.freq, self.A
-        dx_ds  =  A*f    * math.cos(f*s)
-        dy_ds  =  2*A*f  * math.cos(2*f*s)
-        ddx_ds = -A*f**2 * math.sin(f*s)
-        ddy_ds = -4*A*f**2 * math.sin(2*f*s)
-        dx_dt  = dx_ds*v_s;  dy_dt  = dy_ds*v_s
-        ddx_dt = ddx_ds*v_s**2 + dx_ds*a_s
-        ddy_dt = ddy_ds*v_s**2 + dy_ds*a_s
-        phi_ref = math.atan2(dy_dt, dx_dt)
-        v_ref   = math.hypot(dx_dt, dy_dt)
-        denom   = dx_dt**2 + dy_dt**2 + 1e-9
-        w_ref   = (dx_dt*ddy_dt - dy_dt*ddx_dt) / denom
+        del a_s  # Gia tốc dọc không làm thay đổi hướng tiếp tuyến.
+        u, A = self._u_from_s(s), self.A
+        dx = A * math.cos(u)
+        dy = 2.0 * A * math.cos(2.0*u)
+        ddx = -A * math.sin(u)
+        ddy = -4.0 * A * math.sin(2.0*u)
+        norm = math.hypot(dx, dy) + 1e-9
+        phi_ref = math.atan2(dy, dx)
+        signed_kappa = (dx*ddy - dy*ddx) / (norm**3)
+        v_ref = v_s
+        w_ref = signed_kappa * v_s
         return phi_ref, v_ref, w_ref
 
     def sample_path(self, n_pts=600):
-        return [self.pos(i/n_pts*self.L_loop) for i in range(n_pts+1)]
+        return [self.pos(i/n_pts*self.loop_length) for i in range(n_pts+1)]
 
 
 # ===========================================================================
@@ -279,21 +304,13 @@ class Figure8Trajectory:
 # ===========================================================================
 class Figure8HANode(Node):
 
-    L_LOOP = 30.0
-
     def __init__(self):
-        super().__init__(
-            'ha_figure8',
-            parameter_overrides=[
-                Parameter('use_sim_time', Parameter.Type.BOOL, True)
-            ]
-        )
+        super().__init__('ha_figure8')
         self._declare_params()
         p = self._read_params()
 
         self.traj = Figure8Trajectory(
-            A=p['A'], off_x=p['offset_x'], off_y=p['offset_y'],
-            L_loop=self.L_LOOP)
+            A=p['A'], off_x=p['offset_x'], off_y=p['offset_y'])
         self.ha   = HedgeAlgebra()
         self.ctrl = HAController(
             ha=self.ha,
@@ -313,7 +330,9 @@ class Figure8HANode(Node):
         self.look_ahead_dist = p['look_ahead_dist']
         self.curve_beta      = p['curve_beta']
         self.num_curve_samp  = int(p['num_curve_samples'])
-        self.s_end           = self.L_LOOP * p['num_loops']
+        self.num_loops       = int(p['num_loops'])
+        self.s_end           = self.traj.loop_length * self.num_loops
+        self.max_path_poses  = int(p['max_path_poses'])
 
         self.s           = 0.0
         self.v_s         = 0.02
@@ -327,11 +346,14 @@ class Figure8HANode(Node):
         self.count      = 0
         self.last_log_t = -1
         self.data_log   = []
+        self.csv_saved  = False
         ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.csv_file = f'ha_figure8_{ts}.csv'
+        log_dir = FilePath(p['log_directory']).expanduser()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        self.csv_file = log_dir / f'ha_figure8_{ts}.csv'
 
         qos_latch = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self.cmd_pub      = self.create_publisher(Twist, '/cmd_vel',    10)
+        self.cmd_pub      = self.create_publisher(Twist, p['cmd_vel_topic'], 10)
         self.ref_path_pub = self.create_publisher(Path,  '/ref_path',   qos_latch)
         self.act_path_pub = self.create_publisher(Path,  '/robot_path', 10)
         self.odom_sub     = self.create_subscription(Odometry, '/odom', self._odom_cb, 10)
@@ -430,7 +452,12 @@ class Figure8HANode(Node):
         ps.header.stamp    = now.to_msg()
         ps.pose.position.x = self.curr_q[0]
         ps.pose.position.y = self.curr_q[1]
+        half_yaw = 0.5 * self.curr_q[2]
+        ps.pose.orientation.z = math.sin(half_yaw)
+        ps.pose.orientation.w = math.cos(half_yaw)
         self.actual_path.poses.append(ps)
+        if len(self.actual_path.poses) > self.max_path_poses:
+            del self.actual_path.poses[:-self.max_path_poses]
         self.actual_path.header.stamp = now.to_msg()
         self.act_path_pub.publish(self.actual_path)
 
@@ -460,6 +487,7 @@ class Figure8HANode(Node):
             ps.header.frame_id = 'world'
             ps.pose.position.x = px
             ps.pose.position.y = py
+            ps.pose.orientation.w = 1.0
             path.poses.append(ps)
         self.ref_path_pub.publish(path)
 
@@ -468,14 +496,16 @@ class Figure8HANode(Node):
         self.get_logger().info('=== ROBOT DUNG ===', once=True)
 
     def _save_csv(self):
-        if not self.data_log: return
+        if self.csv_saved or not self.data_log:
+            return
         with open(self.csv_file, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(['time(s)', 'es(m)', 'RMSE(m)', 'e1_long(m)', 'e2_lat(m)', 'e3_head(rad)',
                              'v_cmd(m/s)', 'w_cmd(rad/s)', 'v_ref(m/s)', 'w_ref(rad/s)',
                              'v_adaptive(m/s)', 'kappa(1/m)', 'fb1_v(m/s)', 'fb2_w(rad/s)', 'fb3_w(rad/s)'])
             writer.writerows(self.data_log)
-        self.get_logger().info('Saved CSV.')
+        self.csv_saved = True
+        self.get_logger().info(f'Saved CSV: {self.csv_file}')
 
     def _declare_params(self):
         def fp(desc, lo, hi):
@@ -484,8 +514,14 @@ class Figure8HANode(Node):
                 floating_point_range=[FloatingPointRange(
                     from_value=float(lo), to_value=float(hi), step=0.0)])
 
+        def ip(desc, lo, hi):
+            return ParameterDescriptor(
+                description=desc,
+                integer_range=[IntegerRange(
+                    from_value=int(lo), to_value=int(hi), step=1)])
+
         self.declare_parameter('A',           0.70, fp('Bien do [m]',    0.10, 3.0))
-        self.declare_parameter('num_loops',   5,    ParameterDescriptor(description='So vong'))
+        self.declare_parameter('num_loops',   5,    ip('So vong', 1, 1000))
         self.declare_parameter('offset_x',    1.10, fp('Tam X [m]',     -5.0, 5.0))
         self.declare_parameter('offset_y',    0.90, fp('Tam Y [m]',     -5.0, 5.0))
         self.declare_parameter('offset_phi',  0.00, fp('Huong [rad]',   -math.pi, math.pi))
@@ -511,19 +547,29 @@ class Figure8HANode(Node):
         self.declare_parameter('odom_timeout',0.50, fp('Timeout odom',   0.10, 5.00))
         self.declare_parameter('look_ahead_dist', 0.50, fp('Look-ahead', 0.10, 2.00))  # cũ 0.40
         self.declare_parameter('curve_beta',      0.06, fp('Beta cua',   0.00, 0.20))  # cũ 0.02 ← KEY
-        self.declare_parameter('num_curve_samples', 8, ParameterDescriptor(description='So mau k'))  # cũ 6
+        self.declare_parameter('num_curve_samples', 8, ip('So mau k', 1, 1000))
+        self.declare_parameter('max_path_poses', 2000, ip('So pose toi da cua robot_path', 10, 100000))
+        self.declare_parameter('cmd_vel_topic', '/cmd_vel')
+        self.declare_parameter('log_directory', '.')
 
     def _read_params(self):
         names = ['A','num_loops','offset_x','offset_y','offset_phi',
                  'v_path_max','a_path_max','Ts',
                  'gain_e1','gain_e2','gain_e3',
                  'v_max','w_max','dv_max','dw_max','lpf_alpha',
-                 'odom_timeout','look_ahead_dist','curve_beta','num_curve_samples']
+                 'odom_timeout','look_ahead_dist','curve_beta','num_curve_samples',
+                 'max_path_poses','cmd_vel_topic','log_directory']
         return {n: self.get_parameter(n).value for n in names}
 
     def _on_param_change(self, params):
         cur = self._read_params()
         new = {p.name: p.value for p in params}
+        read_only = {'cmd_vel_topic', 'log_directory'}
+        changed_read_only = read_only.intersection(new)
+        if changed_read_only:
+            names = ', '.join(sorted(changed_read_only))
+            return SetParametersResult(
+                successful=False, reason=f'{names} chi thay doi khi khoi dong node.')
         if 'Ts' in new: return SetParametersResult(successful=False, reason='Ts chi doc.')
         if new.get('v_path_max', cur['v_path_max']) > new.get('v_max', cur['v_max']):
             return SetParametersResult(successful=False, reason='v_path_max phai <= v_max')
@@ -539,8 +585,29 @@ class Figure8HANode(Node):
         )
         for attr in ('v_path_max','a_path_max','odom_timeout','look_ahead_dist','curve_beta'):
             if attr in new: setattr(self, attr, new[attr])
-        if 'num_curve_samples' in new: self.num_curve_samp = int(new['num_curve_samples'])
-        if 'A' in new: self.traj.A = new['A']
+        if 'num_curve_samples' in new:
+            self.num_curve_samp = int(new['num_curve_samples'])
+        if 'max_path_poses' in new:
+            self.max_path_poses = int(new['max_path_poses'])
+
+        geometry_changed = any(k in new for k in ('A', 'offset_x', 'offset_y'))
+        if geometry_changed:
+            old_progress = self.s / max(self.traj.loop_length, 1e-9)
+            self.traj.update_geometry(
+                A=new.get('A'),
+                off_x=new.get('offset_x'),
+                off_y=new.get('offset_y'))
+            self.off_x = new.get('offset_x', self.off_x)
+            self.off_y = new.get('offset_y', self.off_y)
+            self.s = old_progress * self.traj.loop_length
+
+        if 'offset_phi' in new:
+            self.off_phi = new['offset_phi']
+        if 'num_loops' in new:
+            self.num_loops = int(new['num_loops'])
+        if geometry_changed or 'num_loops' in new:
+            self.s_end = self.traj.loop_length * self.num_loops
+
         return SetParametersResult(successful=True)
 
     def _startup_banner(self, p):

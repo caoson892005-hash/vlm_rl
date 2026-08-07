@@ -21,6 +21,7 @@ from launch.conditions import IfCondition
 from launch_ros.substitutions import FindPackageShare
 from launch_ros.actions import Node
 from launch.conditions import IfCondition, UnlessCondition
+from nav2_common.launch import RewrittenYaml
 
 
 MAP_NAME='playground' #change to the name of your own map here
@@ -46,6 +47,19 @@ def generate_launch_description():
 
     nav2_sim_config_path = PathJoinSubstitution(
         [FindPackageShare('linorobot2_navigation'), 'config', 'nav_sim.yaml']
+    )
+
+    social_replanning_bt_path = PathJoinSubstitution(
+        [FindPackageShare('linorobot2_navigation'), 'behavior_trees',
+         'navigate_to_pose_social_replanning.xml']
+    )
+
+    nav2_sim_params = RewrittenYaml(
+        source_file=nav2_sim_config_path,
+        param_rewrites={
+            'default_nav_to_pose_bt_xml': social_replanning_bt_path,
+        },
+        convert_types=True,
     )
 
 
@@ -84,7 +98,7 @@ def generate_launch_description():
             launch_arguments={
                 'map': LaunchConfiguration("map"),
                 'use_sim_time': LaunchConfiguration("sim"),
-                'params_file': nav2_sim_config_path
+                'params_file': nav2_sim_params
             }.items()
         ),
 
