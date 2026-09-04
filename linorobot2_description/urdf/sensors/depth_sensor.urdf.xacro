@@ -38,7 +38,7 @@
           <emissive>0.416 0.051 0.047 1.0</emissive>  
         </material>
       </visual> 
-    </gazebo>rgb(213,28,40)
+    </gazebo>
 
     <joint name="camera_to_base_link" type="fixed">
       <parent link="base_link"/>

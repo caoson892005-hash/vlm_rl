@@ -9,7 +9,7 @@
         <geometry> 
           <!-- <box size="${length} ${width} ${height}"/> -->
           <!-- <mesh filename="" scale="0.001 0.001 0.001"/> -->
-          <mesh filename="file://$(find linorobot2_description)/meshes/base_link.STL" scale="1 1 1"/>
+          <mesh filename="package://linorobot2_description/meshes/base_link.STL" scale="1 1 1"/>
         </geometry>
         <material name="light_black">
           <color rgba="0.4 0.4 0.4 1.0"/>

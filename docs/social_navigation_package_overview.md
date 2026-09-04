@@ -1,5 +1,10 @@
 # Tổng quan package `social_navigation`
 
+> Lưu ý kiến trúc hiện tại: phần camera, tracking và nhận diện hội thoại đã
+> được tách sang package `social_perception`. Tài liệu bên dưới giữ phần mô
+> phỏng cũ để tham khảo; `social_navigation` hiện chỉ tiêu thụ kết quả nhận thức
+> để tạo costmap.
+
 ## 1. Mục đích
 
 Package `social_navigation` cung cấp một pipeline điều hướng xã hội cho ROS 2 Humble, Gazebo Classic và Nav2. Package có các chức năng chính:
@@ -28,7 +33,7 @@ people_motion_controller.py
        ▼
 gazebo_people_tracker.py
        │
-       │  /people (social_navigation/msg/People)
+       │  /people (social_perception/msg/People)
        ├───────────────────────────────┐
        ▼                               ▼
 people_group_detector.py          SocialLayer
@@ -226,7 +231,7 @@ Topic đầu ra:
 
 ```text
 /people
-social_navigation/msg/People
+social_perception/msg/People
 ```
 
 Header của message được để timestamp bằng 0, có nghĩa là các thành phần dùng TF sẽ lấy transform mới nhất. Điều này giúp tránh hiện tượng marker chớp tắt do Gazebo state và odometry TF lệch nhau một vài mili giây.
@@ -247,7 +252,7 @@ Biểu diễn một người gồm ID, pose và vận tốc.
 
 ```text
 std_msgs/Header header
-social_navigation/Person[] people
+social_perception/Person[] people
 ```
 
 Chứa danh sách người. `header.frame_id` cho biết pose của các phần tử đang thuộc hệ tọa độ nào.
@@ -269,7 +274,7 @@ Biểu diễn một nhóm, danh sách thành viên, tâm nhóm và bán kính ba
 
 ```text
 std_msgs/Header header
-social_navigation/Group[] groups
+social_perception/Group[] groups
 ```
 
 Chứa danh sách các nhóm được phát hiện.
@@ -287,7 +292,7 @@ Node subscribe:
 và publish:
 
 ```text
-/people_groups   social_navigation/msg/Groups
+/people_groups   social_perception/msg/Groups
 /social_spaces   visualization_msgs/msg/MarkerArray
 ```
 
@@ -543,9 +548,9 @@ Global planner sử dụng social cost để chọn đường tổng thể. Loca
 
 | Topic | Kiểu message | Publisher | Subscriber | Mục đích |
 |---|---|---|---|---|
-| `/people` | `social_navigation/msg/People` | `gazebo_people_tracker` | Group detector, SocialLayer | Pose và vận tốc người |
-| `/people_groups` | `social_navigation/msg/Groups` | Group detector | SocialLayer | Tâm và vùng O–P–R nhóm |
-| `/social_spaces` | `visualization_msgs/msg/MarkerArray` | Group detector | RViz | Hiển thị người và vùng xã hội |
+| `/people` | `social_perception/msg/People` | `social_vlm_perception` | SocialLayer | Pose và vận tốc người |
+| `/people_groups` | `social_perception/msg/Groups` | `social_vlm_perception` | SocialLayer | Tâm và vùng O–P–R được VLM xác nhận |
+| `/social_spaces` | `visualization_msgs/msg/MarkerArray` | `social_vlm_perception` | RViz | Hiển thị vùng xã hội |
 
 ### Service Gazebo
 

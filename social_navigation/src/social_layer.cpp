@@ -71,10 +71,10 @@ void SocialLayer::onInitialize()
 
   rclcpp::SubscriptionOptions options;
   options.callback_group = callback_group_;
-  people_sub_ = node->create_subscription<msg::People>(
+  people_sub_ = node->create_subscription<social_perception::msg::People>(
     people_topic, rclcpp::QoS(10),
     std::bind(&SocialLayer::peopleCallback, this, std::placeholders::_1), options);
-  groups_sub_ = node->create_subscription<msg::Groups>(
+  groups_sub_ = node->create_subscription<social_perception::msg::Groups>(
     groups_topic, rclcpp::QoS(10),
     std::bind(&SocialLayer::groupsCallback, this, std::placeholders::_1), options);
   current_ = true;
@@ -82,7 +82,8 @@ void SocialLayer::onInitialize()
   RCLCPP_INFO(logger_, "SocialLayer listening on %s and %s", people_topic.c_str(), groups_topic.c_str());
 }
 
-void SocialLayer::peopleCallback(const msg::People::SharedPtr message)
+void SocialLayer::peopleCallback(
+  const social_perception::msg::People::SharedPtr message)
 {
   std::lock_guard<std::mutex> lock(data_mutex_);
   people_ = *message;
@@ -90,7 +91,8 @@ void SocialLayer::peopleCallback(const msg::People::SharedPtr message)
   have_people_message_ = true;
 }
 
-void SocialLayer::groupsCallback(const msg::Groups::SharedPtr message)
+void SocialLayer::groupsCallback(
+  const social_perception::msg::Groups::SharedPtr message)
 {
   std::lock_guard<std::mutex> lock(data_mutex_);
   groups_ = *message;
@@ -120,8 +122,8 @@ void SocialLayer::updateBounds(
   robot_x_ = robot_x;
   robot_y_ = robot_y;
   have_robot_pose_ = true;
-  msg::People people;
-  msg::Groups groups;
+  social_perception::msg::People people;
+  social_perception::msg::Groups groups;
   {
     std::lock_guard<std::mutex> lock(data_mutex_);
     people = people_;
@@ -208,8 +210,8 @@ void SocialLayer::updateCosts(
   nav2_costmap_2d::Costmap2D & master, int min_i, int min_j, int max_i, int max_j)
 {
   if (!enabled_) {return;}
-  msg::People people;
-  msg::Groups groups;
+  social_perception::msg::People people;
+  social_perception::msg::Groups groups;
   {
     std::lock_guard<std::mutex> lock(data_mutex_);
     people = people_;

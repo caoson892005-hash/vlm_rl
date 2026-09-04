@@ -241,11 +241,23 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /social_spaces
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Tracked People
+      Namespaces:
+        {}
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /social_perception/person_markers
+      Value: true
     - Class: rviz_common/Group
       Displays:
         - Alpha: 0.20000000298023224
           Class: rviz_default_plugins/Map
-          Color Scheme: map
+          Color Scheme: costmap
           Draw Behind: false
           Enabled: true
           Name: Global Costmap

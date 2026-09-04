@@ -38,10 +38,112 @@ The same changes must be made on the host machine's <robot_type>.properties.urdf
 
 #### 1.1b Using Gazebo:
     
+    # Mặc định chạy worlds/lirs_test.world (map trống, chưa có người).
+    # Muốn dùng map cũ thì vẫn truyền world:=... như trước.
+    # Robot mặc định xuất hiện tại x=-3.0, y=-2.0, z=0.35.
     ros2 launch linorobot2_gazebo gazebo.launch.py
 
+    # CHỈ khi thu dữ liệu RGB-D và KHÔNG chạy Nav2 thì mới tắt EKF:
+    ros2 launch linorobot2_gazebo gazebo.launch.py run_ekf:=false
 
-    
+    # Vì sao không được dùng cờ đó khi có Nav2: plugin diff_drive đặt
+    # <publish_odom_tf>false</publish_odom_tf>, nên EKF là thứ DUY NHẤT phát
+    # transform odom -> base_footprint. Tắt EKF thì frame `odom` không tồn
+    # tại, local_costmap kẹt ở 'Timed out waiting for transform from
+    # base_link to odom', AMCL vứt sạch scan và robot không điều hướng được.
+
+    # gpu_render:=true (mặc định) render gzserver trên card rời, gui:=false tắt
+    # cửa sổ 3D Gazebo. Cả hai đều để giảm tải CPU cho VLM — xem mục
+    # "TỐC ĐỘ SUY LUẬN VLM" trong social_navigation/RUN_SCENARIOS.txt.
+
+    # Terminal thứ hai: CHỈ perception — nạp YOLO/depth/VLM và xử lý ảnh.
+    # Xuất /people (mọi người nhìn thấy) và /people_groups (vùng hội thoại
+    # do VLM xác nhận). Cả hai đều được SocialLayer đưa vào costmap.
+    # Không thả người; đợi log "SẴN SÀNG: camera + YOLO hoạt động, VLM đã nạp xong".
+    ros2 launch social_navigation social_bringup.launch.py
+
+    # Terminal thứ ba: thả người vào map, chạy khi bạn muốn.
+    # Ctrl+C ở đây gỡ người ra mà perception vẫn chạy, nên đổi kịch bản
+    # không phải nạp lại VLM.
+    ros2 launch social_navigation social_sim.launch.py scenario:=talking
+
+    # Kịch bản động: hai người đi tới, đứng nói chuyện, rồi tản ra và lặp lại.
+    # Dùng để kiểm tra costmap vừa TẠO được vùng xã hội vừa XOÁ được nó.
+    ros2 launch social_navigation social_sim.launch.py scenario:=gathering
+
+Chu kỳ mặc định của `scenario:=gathering` là 96 giây: đi tới 8s, nói chuyện 60s,
+tản ra 8s, khuất camera 20s. Sửa trong `lirs_test.world` nếu VLM của bạn cần
+lâu hơn để trả lời:
+
+    <plugin name="animated_people_factory" filename="libanimated_people_release.so">
+      <approach_duration>8</approach_duration>
+      <talk_duration>60</talk_duration>
+      <disperse_duration>8</disperse_duration>
+      <away_duration>20</away_duration>
+    </plugin>
+
+#### 1.1c Chạy thật: camera + VLM trên máy trạm, robot chỉ điều hướng
+
+Camera cắm vào máy trạm và đứng cố định quan sát hiện trường, giống hệt
+`/dataset_camera` trong mô phỏng. Robot không chạy gì của pipeline này.
+
+    # Máy trạm, terminal 1: driver camera RGB-D của bạn, ví dụ RealSense
+    ros2 launch realsense2_camera rs_launch.py align_depth.enable:=true
+
+    # Máy trạm, terminal 2: perception + TF vị trí camera.
+    # 6 số dưới đây là vị trí/hướng thật của camera đo trong frame map.
+    ros2 launch social_navigation social_bringup.launch.py sim:=false \
+        camera_x:=-3.0 camera_y:=0.0 camera_z:=2.0 \
+        camera_roll:=0.0 camera_pitch:=0.35 camera_yaw:=0.0
+
+`sim:=false` tự động: chọn `social_vlm_perception_real.yaml`, bỏ qua actor,
+và phát TF `map -> camera_link`. Đổi tên frame bằng `camera_frame:=...` nếu
+driver của bạn đặt tên khác. Topic đầu ra vẫn là `/people` và `/people_groups`
+y như mô phỏng, nên `social_navigation` không phải sửa gì.
+
+Trên robot chỉ cần bringup phần cứng và Nav2:
+
+    ros2 launch linorobot2_bringup bringup.launch.py
+    ros2 launch linorobot2_navigation navigation.launch.py map:=<map.yaml>
+
+    # Terminal thứ tư: Nav2 + social costmap layer.
+    # KHÔNG cần rviz:=true, social_bringup đã mở RViz rồi.
+    ros2 launch linorobot2_navigation navigation.launch.py sim:=true \
+        map:=<đường dẫn tới map.yaml>
+
+Muốn xem trực quan thì thêm `rviz:=true` vào `social_bringup` (mặc định tắt):
+
+    ros2 launch social_navigation social_bringup.launch.py sim:=true rviz:=true
+
+Đổi giao diện bằng `rviz_config:=<đường dẫn .rviz>`. Chỉ nên bật RViz ở **một**
+chỗ — hoặc `social_bringup`, hoặc `navigation.launch.py`, không cả hai.
+
+Các display có sẵn và ý nghĩa:
+
+| Display | Topic | Thấy gì |
+|---|---|---|
+| Social O-P-R Regions | `/social_spaces` | Đĩa vàng mờ + 3 vòng O/P/R + nhãn chữ nổi |
+| Tracked People | `/social_perception/person_markers` | Trụ xanh lá tại mỗi người |
+| Global Costmap | `/global_costmap/costmap` | Chi phí thật planner dùng (Color Scheme = costmap) |
+| YOLO Annotated | `/social_perception/annotated_image` | Ảnh camera kèm bbox |
+| Depth View | `/social_perception/depth_visualization` | Ảnh độ sâu (mặc định tắt) |
+
+Fixed Frame là `map` cho cả hai môi trường. Trong Gazebo node nhận thức phát ở
+frame `world`, và `gazebo.launch.py` đã phát TF tĩnh `world -> map` nên hiển thị
+đúng; chạy thật thì nó phát thẳng ở `map`.
+
+Bộ lọc vận tốc `social_velocity_filter` do `gazebo.launch.py` tự khởi động
+(`social_safety:=false` để tắt), nên không cần terminal riêng.
+
+### Kiểm tra vùng xã hội có vào costmap chưa
+
+    ros2 param list /global_costmap/global_costmap | grep social   # plugin đã nạp
+    ros2 topic echo /people_groups --once                          # VLM thấy hội thoại
+    ros2 topic hz /people                                          # người được bám vết
+
+Trong RViz: `Social O-P-R Spaces` vẽ 3 vòng tròn, `Tracked People` vẽ từng người,
+`Global Costmap` (Color Scheme = costmap) hiện vùng chi phí thật mà planner dùng.
+
 ### 
     ros2 launch linorobot2_gazebo gazebo.launch.py world:=worlds/empty.world
 

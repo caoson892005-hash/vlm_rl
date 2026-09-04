@@ -1,24 +1,12 @@
-gazebo_people_tracker:
-  ros__parameters:
-    use_sim_time: true
-    people_names: [person_1, person_2, person_3, person_4, person_5, person_6]
-    # Read each person relative to the Gazebo robot and publish in the matching
-    # ROS robot frame. This avoids any dependency on map/world calibration.
-    gazebo_reference_frame: linorobot2
-    output_frame: base_link
-    publish_rate: 30.0
-
-people_motion_controller:
-  ros__parameters:
-    face_group_members: true
-    group_distance: 1.5
-    use_sim_time: true
-    update_rate: 20.0
-    loop: true
-
+# Safety tuning for the only node this package still runs. People localization
+# and social-region detection belong to social_perception.
+#
+# This file holds tuning that is identical on Gazebo and on hardware. Anything
+# that differs between the two (use_sim_time and the cmd_vel topic names) is a
+# launch argument of social_safety.launch.py, so one profile never silently
+# leaks into the other.
 social_velocity_filter:
   ros__parameters:
-    use_sim_time: true
     slow_distance: 2.2
     stop_distance: 0.65
     resume_distance: 0.85
@@ -28,24 +16,3 @@ social_velocity_filter:
     collision_clearance: 0.7
     predicted_stop_clearance: 0.48
     people_timeout: 0.35
-
-people_group_detector:
-  ros__parameters:
-    use_sim_time: true
-    group_distance: 1.5
-    formation_prediction_horizon: 9.0
-    formation_distance: 1.6
-    minimum_closing_speed: 0.1
-    forming_p_radius: 0.9
-    forming_r_radius: 1.7
-    minimum_group_size: 2
-    o_space_min_radius: 0.45
-    p_space_margin: 0.45
-    r_space_margin: 1.0
-    individual_o_radius: 0.45
-    individual_p_front_radius: 1.1
-    individual_p_side_radius: 0.8
-    individual_p_rear_radius: 0.7
-    individual_r_front_radius: 1.5
-    individual_r_side_radius: 1.0
-    individual_r_rear_radius: 0.75

@@ -138,12 +138,11 @@ Group[]
 
   Kết quả 2D được xuất qua topic:
 
-  /people/detections_2d
+  /social_perception/detections_2d
 
   Ảnh đã vẽ khung người được xuất qua:
 
-  /people/yolo_image
+  /social_perception/annotated_image
 
-  Phần này được thực hiện trong social_navigation/scripts/yolo_depth_people_detector.py.
-
+  Phần này được thực hiện trong social_perception/scripts/social_vlm_perception.py.
 

@@ -200,6 +200,8 @@ The agent needs a few seconds to get reconnected (less than 30 seconds). Unplug 
     
     ros2 launch linorobot2_gazebo gazebo.launch.py
 
+    # Default map: worlds/lirs_test.world (no people are preloaded).
+
 linorobot2_bringup.launch.py or gazebo.launch.py must always be run on a separate terminal before creating a map or robot navigation when working on a real robot or gazebo simulation respectively.
 
 ### 2. Controlling the robot

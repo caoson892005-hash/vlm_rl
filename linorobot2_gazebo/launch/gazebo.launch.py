@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, ExecuteProcess,
                             IncludeLaunchDescription, SetEnvironmentVariable,
@@ -45,12 +46,25 @@ def generate_launch_description():
         if is_model_root:
             gazebo_model_paths.append(path)
 
+    # sdformat rewrites the URDF's `package://<pkg>/...` mesh URIs to
+    # `model://<pkg>/...`, so the parent of each package's share directory has
+    # to stay on the path or every STL in the robot ends up "No mesh specified".
+    for pkg in ('linorobot2_description',):
+        share_parent = os.path.dirname(get_package_share_directory(pkg))
+        if share_parent not in gazebo_model_paths:
+            gazebo_model_paths.append(share_parent)
+
     ekf_config_path = PathJoinSubstitution(
         [FindPackageShare("linorobot2_base"), "config", "ekf.yaml"]
     )
 
     world_path = PathJoinSubstitution(
-        [FindPackageShare("linorobot2_gazebo"), "worlds", "tuong_san.world"]
+        [FindPackageShare("linorobot2_gazebo"), "worlds", "lirs_test.world"]
+    )
+
+    # Models used by the animated-people plugin in lirs_test.world.
+    social_models_path = PathJoinSubstitution(
+        [FindPackageShare("social_navigation"), "models"]
     )
 
     # Keep Gazebo usable in a fresh terminal even when ~/.bashrc does not
@@ -64,6 +78,14 @@ def generate_launch_description():
         [FindPackageShare('linorobot2_description'), 'launch', 'description.launch.py']
     )
 
+    # The simulated diff-drive plugin only subscribes to /cmd_vel_safe, so this
+    # filter is the single bridge from /cmd_vel to the wheels. Starting it here
+    # keeps plain teleop and SLAM working without an extra terminal; it passes
+    # commands through untouched whenever /people is absent.
+    social_safety_launch_path = PathJoinSubstitution(
+        [FindPackageShare('social_navigation'), 'launch', 'social_safety.launch.py']
+    )
+
     rviz_config_path = PathJoinSubstitution(
             [FindPackageShare("linorobot2_gazebo"), "rviz", "trajectory_view.rviz"]
     )
@@ -71,7 +93,8 @@ def generate_launch_description():
     return LaunchDescription([
         SetEnvironmentVariable(
             name='GAZEBO_MODEL_PATH',
-            value=os.pathsep.join(gazebo_model_paths)
+            value=[os.pathsep.join(gazebo_model_paths), os.pathsep,
+                   social_models_path]
         ),
 
         DeclareLaunchArgument(
@@ -81,9 +104,33 @@ def generate_launch_description():
         ),
 
         DeclareLaunchArgument(
-            name='rviz', 
+            name='rviz',
             default_value='false', # Mặc định là bật, đổi thành 'false' nếu muốn mặc định tắt
             description='Launch RViz'
+        ),
+
+        DeclareLaunchArgument(
+            name='gui',
+            default_value='true',
+            description='Open the Gazebo 3D window (gzclient). false runs headless'
+        ),
+
+        DeclareLaunchArgument(
+            name='gpu_render',
+            default_value='true',
+            description='Render gzserver on the discrete GPU via PRIME offload'
+        ),
+
+        DeclareLaunchArgument(
+            name='run_ekf',
+            default_value='true',
+            description='Run EKF localization'
+        ),
+
+        DeclareLaunchArgument(
+            name='social_safety',
+            default_value='true',
+            description='Bridge /cmd_vel to /cmd_vel_safe and limit speed near people'
         ),
 
         DeclareLaunchArgument(
@@ -106,7 +153,7 @@ def generate_launch_description():
 
         DeclareLaunchArgument(
             name='spawn_x', 
-            default_value='4.0',
+            default_value='-3.0',
             description='Robot spawn position in X axis'
         ),
 
@@ -118,33 +165,74 @@ def generate_launch_description():
 
         DeclareLaunchArgument(
             name='spawn_z', 
-            default_value='0.0',
+            # The cafe floor top is at about z=0.19. Spawn clear of it and let
+            # physics settle the wheels onto the floor.
+            default_value='0.35',
             description='Robot spawn position in Z axis'
         ),
             
         DeclareLaunchArgument(
             name='spawn_yaw', 
-            default_value='-1.7',
+            default_value='0.0',
             description='Robot spawn heading'
         ),
 
+        # gzserver and gzclient are started separately rather than through the
+        # `gazebo` wrapper so the PRIME offload below can apply to the server
+        # alone. The server is what rasterises the observer camera that feeds
+        # YOLO and the VLM; the client only draws a window a human looks at.
         ExecuteProcess(
-            cmd=['gazebo', '--verbose', '-s', 'libgazebo_ros_factory.so',  '-s', 'libgazebo_ros_init.so', LaunchConfiguration('world')],
-            output='screen'
+            cmd=['gzserver', '--verbose', '-s', 'libgazebo_ros_factory.so',
+                 '-s', 'libgazebo_ros_init.so', LaunchConfiguration('world')],
+            output='screen',
+            # This machine is `prime-select on-demand`, so OpenGL defaults to
+            # the Intel iGPU and the camera is rasterised on the CPU side while
+            # the Quadro sits idle between inferences. Offloading just the
+            # server moves that onto the Quadro for ~100 MiB of the 4 GiB card,
+            # which the 2 GiB left over after the VLM absorbs. Set
+            # gpu_render:=false to measure the difference.
+            additional_env={
+                '__NV_PRIME_RENDER_OFFLOAD': '1',
+                '__GLX_VENDOR_LIBRARY_NAME': 'nvidia',
+            },
+            condition=IfCondition(LaunchConfiguration('gpu_render'))
         ),
 
-        Node(
-            package='gazebo_ros',
-            executable='spawn_entity.py',
-            name='urdf_spawner',
+        ExecuteProcess(
+            cmd=['gzserver', '--verbose', '-s', 'libgazebo_ros_factory.so',
+                 '-s', 'libgazebo_ros_init.so', LaunchConfiguration('world')],
             output='screen',
-            arguments=[
-                '-topic', 'robot_description', 
-                '-entity', 'linorobot2', 
-                '-x', LaunchConfiguration('spawn_x'),
-                '-y', LaunchConfiguration('spawn_y'),
-                '-z', LaunchConfiguration('spawn_z'),
-                '-Y', LaunchConfiguration('spawn_yaw'),
+            condition=UnlessCondition(LaunchConfiguration('gpu_render'))
+        ),
+
+        # The 3D window is the single largest CPU consumer in the sim and
+        # nothing in the pipeline reads from it. gui:=false when measuring.
+        ExecuteProcess(
+            cmd=['gzclient'],
+            output='screen',
+            condition=IfCondition(LaunchConfiguration('gui'))
+        ),
+
+        # Gazebo and robot_state_publisher start in parallel. Wait until the
+        # world and robot_description are ready before inserting the robot.
+        TimerAction(
+            period=5.0,
+            actions=[
+                Node(
+                    package='gazebo_ros',
+                    executable='spawn_entity.py',
+                    name='urdf_spawner',
+                    output='screen',
+                    arguments=[
+                        '-topic', 'robot_description',
+                        '-entity', 'linorobot2',
+                        '-timeout', '30',
+                        '-x', LaunchConfiguration('spawn_x'),
+                        '-y', LaunchConfiguration('spawn_y'),
+                        '-z', LaunchConfiguration('spawn_z'),
+                        '-Y', LaunchConfiguration('spawn_yaw'),
+                    ]
+                )
             ]
         ),
 
@@ -159,32 +247,40 @@ def generate_launch_description():
             ]
         ),
 
+        # The saved map is built by SLAM, whose origin is wherever the robot
+        # started, not the Gazebo world origin. Publishing this edge as identity
+        # silently shifts everything anchored in `world` -- above all the
+        # observer camera below -- by the spawn offset once it is drawn on the
+        # map. Only z stays 0: the map is 2D and the layers ignore height.
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
             name='world_to_map',
             arguments=[
-                '0', '0', '0',                  # Kept only for Gazebo visualization
-                '0', '0', '0',
-                'world',
-                'map'
+                '--x', LaunchConfiguration('spawn_x'),
+                '--y', LaunchConfiguration('spawn_y'),
+                '--z', '0.0',
+                '--roll', '0.0', '--pitch', '0.0',
+                '--yaw', LaunchConfiguration('spawn_yaw'),
+                '--frame-id', 'world',
+                '--child-frame-id', 'map'
             ],
             parameters=[{'use_sim_time': use_sim_time}]
         ),
 
-        # Fixed transform matching the north-wall RGB-D camera in
-        # tuong_san.world. Keep the established frame/topic names so the
-        # detector and existing RViz configurations remain compatible.
+        # Fixed transform matching the RGB-D camera embedded in lirs_test.world.
+        # The frame is named after the model on purpose: `camera_link` is taken
+        # by the depth sensor in the robot URDF, and a frame cannot have two
+        # parents.
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
-            name='world_to_overhead_camera',
+            name='world_to_dataset_camera',
             arguments=[
-                '--x', '2.7', '--y', '7.25', '--z', '2.2',
-                '--roll', '0.0', '--pitch', '0.1831108173',
-                '--yaw', '-1.57079632679',
+                '--x', '-3.0', '--y', '0.0', '--z', '2.0',
+                '--roll', '0.0', '--pitch', '0.35', '--yaw', '0.0',
                 '--frame-id', 'world',
-                '--child-frame-id', 'overhead_camera_link'
+                '--child-frame-id', 'dataset_camera_link'
             ],
             parameters=[{'use_sim_time': use_sim_time}]
         ),
@@ -193,13 +289,13 @@ def generate_launch_description():
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
-            name='overhead_camera_to_optical',
+            name='dataset_camera_to_optical',
             arguments=[
                 '--x', '0.0', '--y', '0.0', '--z', '0.0',
                 '--roll', '-1.57079632679', '--pitch', '0.0',
                 '--yaw', '-1.57079632679',
-                '--frame-id', 'overhead_camera_link',
-                '--child-frame-id', 'overhead_camera_optical_frame'
+                '--frame-id', 'dataset_camera_link',
+                '--child-frame-id', 'dataset_camera_optical_frame'
             ],
             parameters=[{'use_sim_time': use_sim_time}]
         ),
@@ -225,6 +321,7 @@ def generate_launch_description():
             executable='ekf_node',
             name='ekf_filter_node',
             output='screen',
+            condition=IfCondition(LaunchConfiguration('run_ekf')),
             parameters=[
                 {'use_sim_time': use_sim_time}, 
                 ekf_config_path
@@ -240,6 +337,12 @@ def generate_launch_description():
                 'publish_joints': 'false',
                 'urdf': LaunchConfiguration('urdf')
             }.items()
+        ),
+
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(social_safety_launch_path),
+            condition=IfCondition(LaunchConfiguration('social_safety')),
+            launch_arguments={'sim': 'true'}.items()
         )
     ])
 

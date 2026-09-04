@@ -14,8 +14,16 @@
         <max_wheel_acceleration>40.0</max_wheel_acceleration>
         <robot_base_frame>base_footprint</robot_base_frame>
         <publish_odom>true</publish_odom>
+        <!-- False on purpose: odometry goes out on /odom/unfiltered and the
+             EKF in gazebo.launch.py is what fuses it and publishes
+             odom -> base_footprint. Launching with run_ekf:=false therefore
+             leaves nothing publishing that transform, the `odom` frame never
+             comes into existence, and Nav2 cannot start: local_costmap times
+             out on base_link -> odom and AMCL drops every scan. Set this to
+             true only if you also intend to run without the EKF. -->
         <publish_odom_tf>false</publish_odom_tf>
-        <publish_wheel_tf>true</publish_wheel_tf>  #da sua thanh true ---> false
+        <!-- ghi chú cũ giữ lại: "da sua thanh true, roi doi thanh false" -->
+        <publish_wheel_tf>true</publish_wheel_tf>
         <odometry_frame>odom</odometry_frame>
       </plugin>
     </gazebo>

@@ -242,7 +242,7 @@ Nếu model của nhóm đã nhận RGB-D và xuất trực tiếp vị trí 3D 
 
 ## 8. Tracking người
 
-`social_navigation/msg/Person.msg` hiện cần:
+`social_perception/msg/Person.msg` hiện cung cấp:
 
 ```text
 string id
@@ -253,7 +253,7 @@ geometry_msgs/Twist velocity
 Detector theo từng frame thường không có ID ổn định hoặc velocity. Vì vậy cần node:
 
 ```text
-social_navigation/scripts/people_tracker.py
+social_perception/scripts/social_vlm_perception.py
 ```
 
 Node thực hiện:
@@ -275,7 +275,7 @@ Output:
 với kiểu:
 
 ```text
-social_navigation/msg/People
+social_perception/msg/People
 ```
 
 Node này sẽ thay vai trò đầu vào điều hướng của `gazebo_people_tracker.py`.
@@ -315,7 +315,7 @@ Nếu yaw sai, ellipse O-P-R sẽ quay sai và robot có thể tránh phía sau 
 Model nhận `/people` và xuất `/people_groups` theo message hiện tại:
 
 ```text
-social_navigation/msg/Groups
+social_perception/msg/Groups
 ```
 
 Mỗi group chứa:
@@ -635,4 +635,3 @@ Chỉ cần thay đổi message và `SocialLayer` nếu model tính O-P-R độn
 - [ ] Cost cũ được xóa khi người di chuyển hoặc biến mất.
 - [ ] VoxelLayer vẫn ngăn va chạm với thân người.
 - [ ] Planner ưu tiên tránh P/R-space và không đi vào O-space.
-

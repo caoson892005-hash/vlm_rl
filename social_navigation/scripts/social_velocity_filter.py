@@ -6,7 +6,7 @@ import math
 import rclpy
 from geometry_msgs.msg import Twist
 from rclpy.node import Node
-from social_navigation.msg import People
+from social_perception.msg import People
 
 
 class SocialVelocityFilter(Node):
@@ -21,6 +21,13 @@ class SocialVelocityFilter(Node):
         self.declare_parameter('collision_clearance', 0.65)
         self.declare_parameter('predicted_stop_clearance', 0.48)
         self.declare_parameter('people_timeout', 0.5)
+        # Wiring is a deployment choice, not a tuning choice. Gazebo's diff-drive
+        # plugin listens on /cmd_vel_safe, while micro-ROS firmware on the real
+        # base listens on the fixed topic /cmd_vel. Only these two names differ
+        # between the two targets.
+        self.declare_parameter('people_topic', '/people')
+        self.declare_parameter('input_topic', '/cmd_vel')
+        self.declare_parameter('output_topic', '/cmd_vel_safe')
         self.slow_distance = float(self.get_parameter('slow_distance').value)
         self.stop_distance = float(self.get_parameter('stop_distance').value)
         self.resume_distance = max(
@@ -39,9 +46,23 @@ class SocialVelocityFilter(Node):
         self.people = []
         self.people_received_at = None
         self.emergency_stop = False
-        self.people_sub = self.create_subscription(People, '/people', self.people_callback, 10)
-        self.cmd_sub = self.create_subscription(Twist, '/cmd_vel', self.cmd_callback, 10)
-        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel_safe', 10)
+        people_topic = str(self.get_parameter('people_topic').value)
+        input_topic = str(self.get_parameter('input_topic').value)
+        output_topic = str(self.get_parameter('output_topic').value)
+        if input_topic == output_topic:
+            raise ValueError(
+                f'input_topic and output_topic are both "{input_topic}". The '
+                'filter would consume its own output and feed back forever.')
+        self.people_sub = self.create_subscription(
+            People, people_topic, self.people_callback, 10)
+        self.cmd_sub = self.create_subscription(
+            Twist, input_topic, self.cmd_callback, 10)
+        self.cmd_pub = self.create_publisher(Twist, output_topic, 10)
+        # Printed so a wrong deployment profile is visible immediately instead
+        # of showing up as a robot that silently refuses to move.
+        self.get_logger().info(
+            f'Velocity filter active: {input_topic} -> {output_topic} '
+            f'(people on {people_topic}, stop at {self.stop_distance:.2f} m)')
 
     def people_callback(self, message):
         self.people = list(message.people)

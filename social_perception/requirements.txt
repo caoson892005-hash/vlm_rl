@@ -1,0 +1,8 @@
+accelerate>=0.30
+bitsandbytes>=0.43; platform_system == "Linux"
+Jinja2>=3.1.0,<4
+peft>=0.19.1,<0.21
+Pillow>=9.1
+qwen-vl-utils>=0.0.8
+transformers>=4.45,<4.58
+ultralytics>=8.0

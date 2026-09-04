@@ -1,0 +1,134 @@
+social_vlm_perception:
+  ros__parameters:
+    use_sim_time: true
+
+    # Relative paths are resolved from the workspace root and package share.
+    yolo_model_path: yolov8n.pt
+    rgb_topic: /dataset_camera/rgbd/image_raw
+    depth_topic: /dataset_camera/rgbd/depth/image_raw
+    camera_info_topic: /dataset_camera/rgbd/camera_info
+    yolo_confidence: 0.25
+    yolo_image_size: 640
+    # Keeping YOLO on the CPU to leave the small GPU to the VLM backfires: both
+    # run in this one process, so YOLO's per-frame CPU work contends with the
+    # decode loop and stretched a measured inference from 2.85 s standalone to
+    # 10.1 s in the node. Moving it onto the GPU costs ~50 MiB of the 4 GiB card
+    # (2.1 GiB total in use) and brought the same inference back to 3.6 s.
+    yolo_device: cuda:0
+    # Same contract as the real profile: a person is measured in the depth
+    # camera's optical frame and TF carries that point into the navigation
+    # frame. Targeting `world` instead published people in the Gazebo frame,
+    # which the map is offset from by the robot spawn pose.
+    target_frame: map
+    # Scaled to the camera, not guessed: rgbd_sensor in lirs_test.world runs at
+    # <update_rate>8</update_rate>, and the arrival interval measured on the
+    # running simulation was 0.114-0.249 s rather than a clean 0.125 s. RGB and
+    # depth leave the same Gazebo sensor with the same stamp, but this node
+    # compares an RGB frame against the newest depth message it happens to
+    # hold, so depth being one frame behind is normal and costs up to a full
+    # interval. At 0.15 the measured worst case already exceeded the threshold,
+    # which is what logged "RGB and depth timestamps are not synchronized" and
+    # dropped the frame outright -- with the VLM idle, so the lock was not
+    # involved. 0.3 covers a one-frame lag with margin.
+    #
+    # The cost of raising it is that a person's distance may be read from depth
+    # up to 0.3 s old: ~30 cm of error for someone walking at 1 m/s. Losing the
+    # frame entirely is worse, since then they are not in /people at all. Lower
+    # it again if update_rate is raised.
+    maximum_depth_age: 0.3
+    # How late a camera frame may be picked up and still be published on
+    # /people. Past this it is dropped, because the costmap layer would look
+    # its stamp up in a TF buffer that has already dropped it. Raise it only
+    # after checking why frames are arriving late.
+    maximum_frame_age: 0.5
+    minimum_depth: 0.2
+    maximum_depth: 12.0
+    tracking_max_distance: 1.0
+    # Two tracks this close are one person counted twice. Must stay
+    # well under the spacing of two people holding a conversation.
+    duplicate_merge_distance: 0.6
+    # The robot driving across the observer camera's view hides a
+    # person for seconds at a time. Dropping the track that fast
+    # reissued their id, which deleted the social region keyed on it.
+    tracking_timeout: 6.0
+    # How long a vanished person can reclaim their old id on reappearing.
+    # Their id is the key every VLM decision is cached under, so losing it
+    # deletes the social region and costs a whole inference to rebuild.
+    reidentify_timeout: 30.0
+    velocity_smoothing: 0.35
+
+    # These two topics are the stable contract consumed by social_navigation.
+    people_topic: /people
+    social_regions_topic: /people_groups
+    interactions_topic: /social_perception/talking_interactions
+    # The simulation publishes here before hiding its actors, allowing stale
+    # VLM decisions to be cleared immediately. Set to "" for a real camera.
+    clear_interactions_topic: /animated_people/hide
+
+    enable_vlm: true
+    vlm_adapter_path: Saved_Model
+    # Preferred when present: the LoRA already folded into the base weights, so
+    # startup skips both the `peft` import (~17 s of the import tree, and not
+    # trimmable -- peft/__init__.py always pulls in the AutoModel registry) and
+    # the adapter-attach step. Verified 22/22 identical answers against
+    # base+adapter, at 3.01 s per inference versus 3.57 s. Rebuild it with
+    # social_perception/scripts/merge_vlm_adapter.py after retraining the
+    # adapter, or set this to "" to go back to base+adapter.
+    vlm_merged_path: Saved_Model_merged
+    vlm_base_model: unsloth/Qwen2-VL-2B-Instruct-bnb-4bit
+    vlm_load_in_4bit: true
+    # Fail only the VLM worker instead of silently running the 2B model on CPU.
+    vlm_require_cuda: true
+    # Load the checkpoint straight from ~/.cache/huggingface instead of asking
+    # huggingface.co whether the cached copy is still current. The model is
+    # pinned, so that check can only cost time -- it is skipped entirely when
+    # the cache is warm, and a machine with an empty cache still downloads once
+    # (with a warning) rather than failing.
+    vlm_offline: true
+    # Decoding, not the image, is what costs time on a small GPU: ~1.8 s of
+    # prefill plus ~0.36 s for every token generated. Teacher-forcing the
+    # `{"talking":"` prefix leaves only the decisive word to generate and cut a
+    # measured inference from 3.97 s to 2.51 s, while also ruling out the
+    # malformed JSON the model used to emit. Set false to compare the
+    # unconstrained answer.
+    vlm_force_answer_prefix: true
+    # Only used when vlm_force_answer_prefix is false. A small cap prevents an
+    # off-format response from occupying the GPU for several minutes.
+    vlm_max_new_tokens: 12
+    # Qwen2-VL uses 28x28 input pixels per merged visual token. Capping the
+    # pair crop at 256 tokens substantially reduces vision-encoder latency.
+    vlm_min_pixels: 3136       # 56 * 56
+    vlm_max_pixels: 200704     # 256 * 28 * 28
+    # A floor on how often work is queued, not a target rate. The worker is
+    # serial, so one inference (~2.5 s) is the real rate limit; this only stops
+    # a failed or unusually fast run from spinning the GPU. At the old 5.0 it
+    # was the binding constraint instead, leaving the GPU idle ~2.5 s per cycle.
+    vlm_inference_interval: 2.0
+    # Re-run sooner only for a new/moved pair; otherwise refresh periodically.
+    vlm_refresh_interval: 15.0
+    vlm_position_change_threshold: 0.25
+    vlm_crop_margin: 0.05
+    maximum_talking_distance: 3.0
+    maximum_vlm_pairs: 1
+    # The VLM does not answer in one stable format, so a single
+    # unreadable or contrary reply must not delete a confirmed region
+    # while the two people are still standing there talking.
+    negative_answers_to_clear: 2
+    # 0 = a confirmed conversation ends only when the model says it ended.
+    # Any positive value is a stopwatch that deletes the region out from under
+    # two people who are simply still talking. Regions are still emitted only
+    # while both tracked people remain visible, which is what bounds this.
+    interaction_timeout: 0.0
+    log_vlm_results: true
+    # Draw the inference stopwatch on /social_perception/annotated_image. The
+    # per-inference times are logged either way; this only controls the overlay.
+    show_vlm_latency_overlay: true
+    talking_prompt: >-
+      Quan sát hai người trong ảnh. Họ có đang nói chuyện trực tiếp với nhau
+      không? Chỉ trả lời đúng một JSON: {"talking":"có"} hoặc
+      {"talking":"không"}.
+
+    # Radii published with each VLM-confirmed social region for the Nav2 layer.
+    group_o_space_min_radius: 0.45
+    group_p_space_margin: 0.45
+    group_r_space_margin: 1.0

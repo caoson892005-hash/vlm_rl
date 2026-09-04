@@ -1,0 +1,107 @@
+social_vlm_perception:
+  ros__parameters:
+    # Real deployment: the RGB-D camera is plugged into the workstation, the VLM
+    # runs on the workstation GPU, and the robot only navigates. Nothing in this
+    # pipeline runs on the robot computer.
+    use_sim_time: false
+
+    yolo_model_path: yolov8n.pt
+
+    # Defaults below match librealsense (realsense2_camera). Point them at
+    # whatever your driver publishes; the depth image must be aligned to the
+    # colour image, otherwise a bounding box samples the wrong distance.
+    rgb_topic: /camera/color/image_raw
+    depth_topic: /camera/aligned_depth_to_color/image_raw
+    camera_info_topic: /camera/color/camera_info
+    yolo_confidence: 0.25
+    yolo_image_size: 640
+    # The GPU has headroom for both: YOLOv8n adds ~50 MiB next to the VLM's
+    # ~2.0 GiB on a 4 GiB card. Leaving YOLO on the CPU instead makes it
+    # contend with the VLM decode loop inside this one process, which measured
+    # 10.1 s per inference against 3.6 s with both on the GPU. Only fall back
+    # to cpu if the deployed card cannot hold both.
+    yolo_device: cuda:0
+
+    # People are published straight into the navigation frame. This requires a
+    # map -> camera_link transform: social_bringup.launch.py publishes it from
+    # the camera_x/camera_y/... arguments when sim:=false.
+    target_frame: map
+    # Deliberately tighter than the simulation profile, which sits at 0.3. This
+    # threshold is a multiple of the camera's frame interval, not a fixed
+    # number: a RealSense at 30 Hz delivers every 0.033 s, so 0.15 still allows
+    # depth to be four frames behind, whereas the simulated camera runs at 8 Hz
+    # and needed 0.3 for the same slack. Rescale this if the driver is
+    # configured for a lower frame rate -- and prefer that to loosening it
+    # blindly, because a stale depth reading puts a person at the wrong
+    # distance rather than simply losing them.
+    maximum_depth_age: 0.15
+    # How late a camera frame may be picked up and still be published on
+    # /people. Past this it is dropped, because the costmap layer would look
+    # its stamp up in a TF buffer that has already dropped it. Raise it only
+    # after checking why frames are arriving late.
+    maximum_frame_age: 0.5
+    minimum_depth: 0.2
+    maximum_depth: 12.0
+    tracking_max_distance: 1.0
+    # Two tracks this close are one person counted twice. Must stay
+    # well under the spacing of two people holding a conversation.
+    duplicate_merge_distance: 0.6
+    # The robot driving across the observer camera's view hides a
+    # person for seconds at a time. Dropping the track that fast
+    # reissued their id, which deleted the social region keyed on it.
+    tracking_timeout: 6.0
+    # How long a vanished person can reclaim their old id on reappearing.
+    # Their id is the key every VLM decision is cached under, so losing it
+    # deletes the social region and costs a whole inference to rebuild.
+    reidentify_timeout: 30.0
+    velocity_smoothing: 0.35
+
+    # Same contract as the simulation, so social_navigation needs no changes.
+    people_topic: /people
+    social_regions_topic: /people_groups
+    interactions_topic: /social_perception/talking_interactions
+    # No Gazebo actors exist here, so there is nothing to clear on hide.
+    clear_interactions_topic: ""
+
+    enable_vlm: true
+    vlm_adapter_path: Saved_Model
+    vlm_base_model: unsloth/Qwen2-VL-2B-Instruct-bnb-4bit
+    vlm_load_in_4bit: true
+    vlm_require_cuda: true
+    # Never wait on huggingface.co to re-validate a pinned checkpoint; see the
+    # simulation config. This matters more on the robot, which may be on a
+    # captive Wi-Fi or offline entirely, where the check waits for a timeout.
+    vlm_offline: true
+    # Generate only the decisive word; see the simulation config for the
+    # measurement behind this.
+    vlm_force_answer_prefix: true
+    vlm_max_new_tokens: 12
+    vlm_min_pixels: 3136       # 56 * 56
+    vlm_max_pixels: 200704     # 256 * 28 * 28
+    vlm_inference_interval: 2.0
+    vlm_refresh_interval: 15.0
+    vlm_position_change_threshold: 0.25
+    vlm_crop_margin: 0.05
+    maximum_talking_distance: 3.0
+    maximum_vlm_pairs: 1
+    # The VLM does not answer in one stable format, so a single
+    # unreadable or contrary reply must not delete a confirmed region
+    # while the two people are still standing there talking.
+    negative_answers_to_clear: 2
+    # 0 = a confirmed conversation ends only when the model says it ended.
+    # Any positive value is a stopwatch that deletes the region out from under
+    # two people who are simply still talking. Regions are still emitted only
+    # while both tracked people remain visible, which is what bounds this.
+    interaction_timeout: 0.0
+    log_vlm_results: true
+    # Draw the inference stopwatch on /social_perception/annotated_image. The
+    # per-inference times are logged either way; this only controls the overlay.
+    show_vlm_latency_overlay: true
+    talking_prompt: >-
+      Quan sát hai người trong ảnh. Họ có đang nói chuyện trực tiếp với nhau
+      không? Chỉ trả lời đúng một JSON: {"talking":"có"} hoặc
+      {"talking":"không"}.
+
+    group_o_space_min_radius: 0.45
+    group_p_space_margin: 0.45
+    group_r_space_margin: 1.0

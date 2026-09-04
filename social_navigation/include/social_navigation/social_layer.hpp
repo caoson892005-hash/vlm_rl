@@ -6,8 +6,8 @@
 
 #include "nav2_costmap_2d/costmap_layer.hpp"
 #include "rclcpp/rclcpp.hpp"
-#include "social_navigation/msg/groups.hpp"
-#include "social_navigation/msg/people.hpp"
+#include "social_perception/msg/groups.hpp"
+#include "social_perception/msg/people.hpp"
 
 namespace social_navigation
 {
@@ -25,13 +25,13 @@ public:
   bool isClearable() override {return true;}
 
 private:
-  void peopleCallback(const msg::People::SharedPtr message);
-  void groupsCallback(const msg::Groups::SharedPtr message);
+  void peopleCallback(const social_perception::msg::People::SharedPtr message);
+  void groupsCallback(const social_perception::msg::Groups::SharedPtr message);
 
-  rclcpp::Subscription<msg::People>::SharedPtr people_sub_;
-  rclcpp::Subscription<msg::Groups>::SharedPtr groups_sub_;
-  msg::People people_;
-  msg::Groups groups_;
+  rclcpp::Subscription<social_perception::msg::People>::SharedPtr people_sub_;
+  rclcpp::Subscription<social_perception::msg::Groups>::SharedPtr groups_sub_;
+  social_perception::msg::People people_;
+  social_perception::msg::Groups groups_;
   rclcpp::Time people_received_at_{0, 0, RCL_ROS_TIME};
   rclcpp::Time groups_received_at_{0, 0, RCL_ROS_TIME};
   bool have_people_message_{false};
