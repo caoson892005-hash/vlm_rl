@@ -57,7 +57,13 @@
     <gazebo reference="camera_link">
       <sensor name="camera" type="depth">
         <always_on>true</always_on>
-        <update_rate>30.0</update_rate>
+        <!-- Rendering RGB *and* depth at 640x480 is the steadiest CPU load in
+             the whole sim, and the VLM worker is serial at one inference per
+             ~2 s (vlm_inference_interval), so frames past ~8 Hz are rendered
+             only to be dropped. YOLO tracking still updates every frame.
+             maximum_depth_age in social_vlm_perception.yaml is scaled to this
+             rate, so raise both together or neither. -->
+        <update_rate>8.0</update_rate>
         <camera name="camera">
           <horizontal_fov>1.50098</horizontal_fov>
           <image>
@@ -65,6 +71,12 @@
             <height>480</height>
             <format>R8G8B8</format>
           </image>
+          <!-- People are tracked out to maximum_depth = 12.0 m. The default
+               far plane would render scenery no one measures. -->
+          <clip>
+            <near>0.1</near>
+            <far>12.0</far>
+          </clip>
         </camera>
         <plugin name="depth_camera_controller" filename="libgazebo_ros_camera.so">
           <ros>
@@ -81,7 +93,10 @@
             </qos>
           </ros>
           <min_depth>0.015</min_depth>
-          <max_depth>3.0</max_depth>
+          <!-- Was 3.0, which clamped every person past 3 m to the same reading
+               and made them unusable to the tracker. Matches maximum_depth in
+               social_vlm_perception.yaml. -->
+          <max_depth>12.0</max_depth>
           <hack_baseline>0.07</hack_baseline>
           <frame_name>camera_depth_link</frame_name>
           <distortion_k1>0.00000001</distortion_k1>

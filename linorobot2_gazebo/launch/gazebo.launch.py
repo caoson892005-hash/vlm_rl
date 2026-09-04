@@ -62,7 +62,8 @@ def generate_launch_description():
         [FindPackageShare("linorobot2_gazebo"), "worlds", "lirs_test.world"]
     )
 
-    # Models used by the animated-people plugin in lirs_test.world.
+    # Character meshes the animated-people plugin loads for the actors in
+    # lirs_test.world.
     social_models_path = PathJoinSubstitution(
         [FindPackageShare("social_navigation"), "models"]
     )
@@ -249,9 +250,9 @@ def generate_launch_description():
 
         # The saved map is built by SLAM, whose origin is wherever the robot
         # started, not the Gazebo world origin. Publishing this edge as identity
-        # silently shifts everything anchored in `world` -- above all the
-        # observer camera below -- by the spawn offset once it is drawn on the
-        # map. Only z stays 0: the map is 2D and the layers ignore height.
+        # silently shifts everything anchored in `world` by the spawn offset
+        # once it is drawn on the map. Only z stays 0: the map is 2D and the
+        # layers ignore height.
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
@@ -268,37 +269,11 @@ def generate_launch_description():
             parameters=[{'use_sim_time': use_sim_time}]
         ),
 
-        # Fixed transform matching the RGB-D camera embedded in lirs_test.world.
-        # The frame is named after the model on purpose: `camera_link` is taken
-        # by the depth sensor in the robot URDF, and a frame cannot have two
-        # parents.
-        Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            name='world_to_dataset_camera',
-            arguments=[
-                '--x', '-3.0', '--y', '0.0', '--z', '2.0',
-                '--roll', '0.0', '--pitch', '0.35', '--yaw', '0.0',
-                '--frame-id', 'world',
-                '--child-frame-id', 'dataset_camera_link'
-            ],
-            parameters=[{'use_sim_time': use_sim_time}]
-        ),
-
-        # ROS optical convention: +Z forward, +X right, +Y down.
-        Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            name='dataset_camera_to_optical',
-            arguments=[
-                '--x', '0.0', '--y', '0.0', '--z', '0.0',
-                '--roll', '-1.57079632679', '--pitch', '0.0',
-                '--yaw', '-1.57079632679',
-                '--frame-id', 'dataset_camera_link',
-                '--child-frame-id', 'dataset_camera_optical_frame'
-            ],
-            parameters=[{'use_sim_time': use_sim_time}]
-        ),
+        # The camera used to be a static model in the world and needed two
+        # static transforms here to place it on the map. It is now a link of
+        # the robot, so robot_state_publisher owns
+        # base_link -> camera_link -> camera_depth_link and nothing about the
+        # camera is published from this launch any more.
 
         Node(
             package='rviz2',

@@ -42,6 +42,7 @@ install(DIRECTORY launch config models rviz DESTINATION share/${PROJECT_NAME}
 install(PROGRAMS
   scripts/release_animated_people.py
   scripts/social_velocity_filter.py
+  scripts/social_safety_shield.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_export_include_directories(include)

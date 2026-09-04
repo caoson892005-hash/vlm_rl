@@ -64,9 +64,17 @@ This package publishes nothing on `/people`; terminal 2 is what produces it.
 On real hardware terminal 3 disappears and terminal 2 becomes
 `social_bringup.launch.py sim:=false` plus the camera's pose in the map frame.
 
-`lirs_test.world` provides the `/dataset_camera` RGB-D camera for the
-`social_perception` node, and defines each actor's pose and animation. Edit that
-world file to add people or change where they stand.
+The RGB-D camera feeding `social_perception` rides on the robot: the
+`depth_sensor` macro in `linorobot2_description/urdf/robots/2wd.urdf.xacro`,
+publishing `/camera/color/image_raw` and `/camera/depth/image_rect_raw` in
+frame `camera_depth_link`. It replaced the static `/dataset_camera` model that
+used to sit on the wall in `lirs_test.world`; that world file now only defines
+each actor's pose and animation. Edit it to add people or change where they
+stand.
+
+Because the camera moves with the robot, people are only detected while the
+robot is facing them, and `target_frame: map` needs the `map -> odom` edge that
+AMCL publishes — run `navigation.launch.py` alongside perception.
 
 In RViz add a `MarkerArray` display with topic `/social_spaces`. The actual planning
 cost is part of `/global_costmap/costmap` and `/local_costmap/costmap`.
@@ -80,3 +88,17 @@ cost is part of `/global_costmap/costmap` and `/local_costmap/costmap`.
 Only regions confirmed as conversations by `social_perception` are emitted on
 `/people_groups`. The costmap applies each region's supplied center and O/P/R
 radii directly.
+
+## Automatic Nav2/RL handoff
+
+For “select a Nav2 goal, let RL drive, and avoid any tracked people”, launch
+`social_rl/nav2_rl_handoff.launch.py` instead of plain navigation. It isolates
+Nav2's final smoother output on `/cmd_vel_nav_filtered`, goal-tagged RL commands
+on `/cmd_vel_rl_stamped`, then puts the goal-triggered selector before this
+package's velocity filter. A fresh `/people` stream is required even when its
+list is empty. The filter remains the only final bridge to `/cmd_vel_safe` in
+Gazebo or `/cmd_vel` on hardware. Nav2 recovery commands are routed through the
+same smoother and selector, so `Spin`/`BackUp` cannot bypass that ownership.
+
+The filter also publishes zero if its input disappears for 0.35 s, so a dead
+mux cannot leave the base executing its last non-zero command.

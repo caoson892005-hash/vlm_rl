@@ -21,8 +21,9 @@ Real robot
             input_topic:=/cmd_vel_nav_filtered output_topic:=/cmd_vel
 
     Moving Nav2 off /cmd_vel additionally requires launching nav2_bringup with
-    use_composition:=False inside a GroupAction that applies
-    SetRemap('cmd_vel_smoothed', '/cmd_vel_nav_filtered'). See README.md.
+    use_composition:=False inside a GroupAction that remaps cmd_vel to
+    /cmd_vel_nav and cmd_vel_smoothed to /cmd_vel_nav_filtered. The first remap
+    also captures behavior_server Spin/BackUp commands. See README.md.
 """
 
 from launch import LaunchDescription

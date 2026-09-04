@@ -28,6 +28,62 @@ Perception xuất ra hai topic mà SocialLayer dùng để dựng costmap:
     /people_groups   vùng hội thoại do VLM xác nhận
 
 -------------------------------------------------------------------------------
+ CAMERA NẰM TRÊN ROBOT (đã đổi, trước đây gắn cố định trên tường)
+-------------------------------------------------------------------------------
+
+Camera RGB-D không còn là model tĩnh `dataset_camera` trong lirs_test.world nữa.
+Nó là một link của robot, khai trong
+
+    linorobot2_description/urdf/sensors/depth_sensor.urdf.xacro
+    linorobot2_description/urdf/2wd_properties.urdf.xacro   (depth_sensor_pose)
+
+đặt ở mép trước nắp base: x = 0.10, z = 0.2225 trong `base_link` (0.255 m so với
+mặt đất), ngẩng lên 0.20 rad. Chọn z như vậy để hộp camera nằm HẲN TRÊN mặt
+phẳng lidar (z = 0.19526); đặt ngang lidar thì chính camera thành vật cản vĩnh
+viễn trong /scan.
+
+    topic     /camera/color/image_raw
+              /camera/depth/image_rect_raw
+              /camera/color/camera_info
+    frame     camera_depth_link  (base_link -> camera_link -> camera_depth_link,
+                                  do robot_state_publisher phát)
+
+Ba hệ quả phải nhớ, khác hẳn thời camera treo tường:
+
+  1. NAV2 LÀ BẮT BUỘC, không còn là tuỳ chọn. Perception publish người trong
+     frame `map` (target_frame), chuỗi TF bây giờ là
+     map -> odom -> base_footprint -> ... -> camera_depth_link. Cạnh map -> odom
+     do AMCL phát, tức terminal 4. Thiếu nó thì mọi khung hình bị bỏ kèm log lỗi
+     tra cứu TF, /people rỗng.
+
+  2. ROBOT PHẢI HƯỚNG VỀ PHÍA NGƯỜI thì mới thấy. FOV 87 x 70 độ, người ở
+     world (0, +0.8) và (0, -0.8) còn robot spawn ở (-3, -2) quay yaw 0 -> cặp
+     người nằm sát rìa khung hình. Cách quay robot về phía họ là GỬI GOAL, chạy
+     ở terminal thứ 5 sau khi Nav2 đã lên (toạ độ trong frame `map`, tức là đã
+     trừ đi chỗ spawn: cặp người ở map (3, 2.8) và (3, 1.2)):
+
+         ros2 topic pub --once /goal_pose geometry_msgs/msg/PoseStamped \
+           "{header: {frame_id: map},
+             pose: {position: {x: 1.2, y: 0.8, z: 0.0},
+                    orientation: {z: 0.291, w: 0.957}}}"
+
+     Đích này cách trung điểm cặp người 2.16 m và quay mặt về phía họ
+     (yaw = 0.59 rad = atan2(2, 3)).
+
+     ĐỪNG dùng `spawn_yaw:=...` để làm việc này. gazebo.launch.py phát TF
+     world -> map với đúng yaw đó, mà cafe_vlm.pgm lại được dựng từ chỗ robot
+     xuất phát với yaw 0. Đổi spawn_yaw là xoay cả bản đồ so với thế giới, AMCL
+     hết khớp scan và robot tự định vị sai.
+
+  3. GẦN QUÁ THÌ MẤT ĐẦU. Camera cao 0.255 m ngẩng 11.5 độ: ở 3 m khung hình phủ
+     từ mặt đất tới 3.4 m, ở 1.5 m chỉ tới 1.83 m (ngang cổ), dưới ~1.0 m thì
+     đầu người ra khỏi khung và VLM mất căn cứ để trả lời. Giữ cặp hội thoại ở
+     1.5 m trở lên khi tinh chỉnh.
+
+Bản CHẠY THẬT không đổi: camera vẫn cắm vào máy trạm và đứng cố định
+(social_vlm_perception_real.yaml + TF map -> camera_link). Xem mục CHẠY THẬT.
+
+-------------------------------------------------------------------------------
  THỨ TỰ CHẠY CHUNG (4 TERMINAL)
 -------------------------------------------------------------------------------
 
@@ -59,6 +115,11 @@ Perception xuất ra hai topic mà SocialLayer dùng để dựng costmap:
     # Terminal 4 - Nav2 + social costmap layer (KHÔNG bật rviz ở đây)
     ros2 launch linorobot2_navigation navigation.launch.py sim:=true \
         map:=/home/son/ninorobot2/linorobot2_navigation/maps/cafe_vlm.yaml
+
+    #    BẮT BUỘC từ khi camera chuyển lên robot: AMCL trong terminal này là
+    #    thứ duy nhất phát TF map -> odom, mà camera bây giờ treo dưới
+    #    base_link. Không chạy terminal 4 thì perception không đổi được toạ độ
+    #    người sang frame map và /people rỗng.
 
 -------------------------------------------------------------------------------
  TRƯỜNG HỢP 1 - NGƯỜI ĐỨNG NÓI CHUYỆN  (terminal 3)
@@ -130,6 +191,54 @@ Terminal 1, 2, 4 giữ nguyên, VLM không phải nạp lại.
 Chỉ bật RViz ở MỘT chỗ - hoặc social_bringup, hoặc navigation.launch.py.
 
 -------------------------------------------------------------------------------
+ TÁCH VLM SANG MÁY TRẠM (camera + YOLO trên robot, model trên laptop)
+-------------------------------------------------------------------------------
+
+Robot mang camera nhưng không mang GPU. Đặt `vlm_remote: true` trong profile
+(social_vlm_perception_real.yaml đã đặt sẵn) thì node perception không nạp
+model nữa: nó cắt ảnh cặp người rồi hỏi máy trạm.
+
+    robot     -> /social_perception/vlm_request        VlmRequest  (crop+prompt)
+    máy trạm  -> /social_perception/vlm_response       VlmResponse (câu trả lời)
+    máy trạm  -> /social_perception/vlm_worker_ready   latched, chốt "SẴN SÀNG"
+
+    # MÁY TRẠM - nạp model, đợi ảnh cắt (nạp ~10-40s tuỳ page cache)
+    ros2 launch social_perception social_vlm_worker.launch.py
+
+    # -> ĐỢI "SẴN SÀNG: VLM đã nạp xong, đang đợi ảnh cắt từ robot"
+
+    # ROBOT - camera + YOLO + depth + tracking + vùng O/P/R
+    ros2 launch social_perception social_vlm_perception.launch.py \
+        config_file:=<...>/social_vlm_perception_real.yaml
+
+Node perception KHÔNG bỏ cuộc nếu máy trạm chưa lên: nó in
+"Đang đợi social_vlm_worker.py trên máy trạm (Ns)" mỗi 5 giây rồi chạy tiếp khi
+máy trạm sẵn sàng. Chờ mãi mà không thấy thì kiểm tra ROS_DOMAIN_ID hai máy có
+giống nhau không, và ROS_LOCALHOST_ONLY đã bỏ chưa.
+
+Chỉ ảnh cắt đi qua mạng - đo được 12.7-13.9 KB mỗi lần suy luận, so với ~12 MB/s
+nếu đẩy RGB-D thô ở 8 Hz. Mọi quyết định VỀ Ý NGHĨA câu trả lời vẫn nằm ở node
+perception (chọn cặp nào để hỏi, khung hình mới huỷ kết quả cũ ra sao, một câu
+phủ định đáng giá bao nhiêu). Worker không giữ trạng thái gì: khởi động lại nó
+chỉ tốn đúng một lần suy luận.
+
+Đo trên máy này (một laptop chạy cả hai node, Gazebo + Nav2 cùng chạy):
+
+    chế độ                      tb mỗi lần suy luận    số lần
+    vlm_remote: false           9.35 s                 4
+    vlm_remote: true            2.72 s                 10
+
+Chênh lệch này ĐO SƠ BỘ, chưa truy đến cùng nguyên nhân. Nghi là tranh chấp GIL
+và ml_execution_lock giữa YOLO và VLM khi ở chung một tiến trình Python - tách
+tiến trình bỏ được cả hai. Đừng trích số này như kết luận cho tới khi đo lại có
+kiểm soát.
+
+Ở chế độ tách, log chia đôi: máy trạm in ">>> VLM BẮT ĐẦU ... (13.9 KB qua
+mạng)" và thời gian model, robot in "<<< VLM XONG ... (từ lúc bắt đầu tới khi
+có kết quả)". Hiệu hai số đó chính là chi phí mạng + JPEG (đo trên loopback:
+2.82 - 2.79 = 0.03 s).
+
+-------------------------------------------------------------------------------
  CHẠY THẬT (camera cố định trên máy trạm, robot chỉ điều hướng)
 -------------------------------------------------------------------------------
 
@@ -161,6 +270,13 @@ node khác phát TF đó rồi.
     ros2 topic echo /social_perception/ready --once               # perception sẵn sàng
     ros2 topic echo /people_groups --once                         # VLM thấy hội thoại
     ros2 topic hz /people                                         # người được bám vết
+
+Camera trên robot - kiểm tra theo đúng thứ tự này, sai ở đâu dừng ở đó:
+
+    ros2 topic hz /camera/color/image_raw          # ~8 Hz, camera có render
+    ros2 topic hz /camera/depth/image_rect_raw     # ~8 Hz, cùng nhịp với RGB
+    ros2 run tf2_ros tf2_echo base_link camera_depth_link   # URDF đã nạp
+    ros2 run tf2_ros tf2_echo map camera_depth_link         # AMCL đã lên chưa
 
 Trong RViz:
     Social O-P-R Regions  /social_spaces                          3 vòng O/P/R
@@ -194,9 +310,11 @@ trễ thấp trung bình.
 
 Hai thay đổi tạo ra kết quả đó:
 
-  1. lirs_test.world: <update_rate> của rgbd_sensor 15 -> 8. Worker VLM chạy
-     tuần tự một lần mỗi ~2 s (vlm_inference_interval), nên khung hình quá 8 Hz
-     chỉ được render ra để bị bỏ. Đây là phần lớn hiệu quả (-43%).
+  1. <update_rate> của camera RGB-D 15 -> 8. Worker VLM chạy tuần tự một lần
+     mỗi ~2 s (vlm_inference_interval), nên khung hình quá 8 Hz chỉ được render
+     ra để bị bỏ. Đây là phần lớn hiệu quả (-43%). Số đo trên lấy hồi camera
+     còn nằm trong lirs_test.world; giá trị 8 Hz nay ở
+     linorobot2_description/urdf/sensors/depth_sensor.urdf.xacro.
 
   2. gazebo.launch.py: tách `gazebo` wrapper thành gzserver + gzclient riêng, và
      chỉ offload gzserver sang card rời qua PRIME (-13.6%). Tốn 448 MiB VRAM,
@@ -271,3 +389,60 @@ linorobot2_gazebo/src/animated_people_release.cpp (hàm SpawnPeople) đang bị
 comment. Muốn có người đi ngang qua thuần tuý thì bỏ comment khối đó rồi:
 
     colcon build --packages-select linorobot2_gazebo
+
+-------------------------------------------------------------------------------
+ HUẤN LUYỆN RL (package social_rl) DÙNG LẠI ĐÚNG 4 TERMINAL Ở TRÊN
+-------------------------------------------------------------------------------
+
+Package social_rl train policy "thấy người thì né" bằng Recurrent PPO + LSTM.
+Nó KHÔNG đụng gì tới luồng trong file này và cũng KHÔNG dùng lại đủ 4 terminal:
+vòng RL cố ý chạy độc lập, không VLM và không Nav2.
+
+    Terminal 1  ros2 launch linorobot2_gazebo gazebo.launch.py gui:=false
+    Terminal 2  ros2 launch social_rl rl_perception.launch.py
+                (cùng node perception, nhưng enable_vlm:=false và
+                 target_frame:=odom, nên không nạp VLM và không cần AMCL)
+    Terminal 3  ros2 launch social_navigation social_sim.launch.py \
+                    scenario:=gathering        <- vẫn dùng nguyên của package này
+    Terminal 4  ros2 launch social_rl rl_train.launch.py [render:=true]
+
+Cách chạy đầy đủ, cách xem robot trong Gazebo lúc train, cách đọc tensorboard và
+các lỗi hay gặp nằm ở social_rl/RUN_RL.txt.
+
+Policy đã train còn có chế độ deployment kết hợp: chọn Nav2 Goal trên map thì
+mux bật RL cho cả hành trình; /people rỗng hay có track đều không đổi controller,
+track người chỉ đi vào observation để policy né. Nếu stream /people chết thì
+mux fault_stop. Không chạy hai agent cùng ghi /cmd_vel. Dùng đúng launch:
+
+    ros2 launch social_rl nav2_rl_handoff.launch.py \
+        model_path:=/home/son/social_rl_runs/<run>/final_model.zip \
+        sim:=true map:=.../maps/cafe_vlm.yaml
+
+Chi tiết topic, watchdog và cách kiểm tra mode nằm ở mục
+"CHỌN GOAL TRÊN MAP..." trong social_rl/RUN_RL.txt.
+
+-------------------------------------------------------------------------------
+ KHỐI F - LÁ CHẮN CBF/QP  (thêm 28-08-2026)
+-------------------------------------------------------------------------------
+
+Hai lá chắn, CHỌN MỘT - cả hai đều ghi /cmd_vel_safe:
+
+    ros2 launch social_navigation social_safety.launch.py    # filter cũ
+    ros2 launch social_navigation social_shield.launch.py    # khối F, CBF/QP
+
+social_velocity_filter SCALE lệnh xuống theo khoảng cách tới người: nó chỉ đi
+chậm lại trên đúng đường đang đi. social_safety_shield ràng buộc tốc độ thay
+đổi của hàm rào nên LÁI được, và nó đọc vùng của khối D nên biết phân biệt giữa
+hai người đang nói chuyện với sau lưng một người.
+
+WATCHDOG DỪNG CÓ HẠN (01-09-2026): cả hai lá chắn khi mất đầu vào đều phát
+lệnh 0 rồi NGỪNG sau `stop_broadcast_time: 1.0` giây, thay vì phát mãi mãi.
+Bản cũ của khối F phát 0 ở 20.3 Hz NGAY TỪ LÚC KHỞI ĐỘNG dù chưa ai lái, nên
+bật nó trong lúc train là đè lệnh của trainer. Chi tiết và số đo: RUN_RL.txt
+mục "BẪY: CHẠY rl_agent RỒI TẮT".
+
+Khối F cần /social_rl/constraint_field - do agent_node (hoặc trainer) publish.
+Không có field thì nó vẫn ràng buộc lidar và cho lệnh đi qua, và ghi log; đó là
+suy giảm thật, không phải im lặng bỏ qua.
+
+Chi tiết tham số, cách giải QP và số đo: social_rl/RUN_RL.txt mục KHỐI F.

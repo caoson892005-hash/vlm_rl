@@ -8,13 +8,15 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(gazebo REQUIRED)
 find_package(gazebo_ros REQUIRED)
+find_package(social_perception REQUIRED)
 
 add_library(animated_people_release SHARED
   src/animated_people_release.cpp)
 target_include_directories(animated_people_release PRIVATE
   ${GAZEBO_INCLUDE_DIRS})
 target_link_libraries(animated_people_release ${GAZEBO_LIBRARIES})
-ament_target_dependencies(animated_people_release rclcpp std_msgs gazebo_ros)
+ament_target_dependencies(animated_people_release
+  rclcpp std_msgs gazebo_ros social_perception)
 
 execute_process(
   COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/scripts/map2gazebo.py

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <unordered_set>
 #include <vector>
 
 #include "geometry_msgs/msg/point_stamped.hpp"
@@ -36,10 +37,13 @@ void SocialLayer::onInitialize()
   declareParameter("prediction_time", rclcpp::ParameterValue(1.5));
   declareParameter("moving_prediction_time", rclcpp::ParameterValue(3.0));
   declareParameter("moving_speed_threshold", rclcpp::ParameterValue(0.05));
-  declareParameter("overlap_escape_clearance", rclcpp::ParameterValue(0.32));
+  declareParameter("overlap_escape_clearance", rclcpp::ParameterValue(0.55));
   declareParameter("prediction_steps", rclcpp::ParameterValue(4));
   declareParameter("o_space_cost", rclcpp::ParameterValue(254));
   declareParameter("p_space_cost", rclcpp::ParameterValue(250));
+  declareParameter("group_p_space_cost", rclcpp::ParameterValue(253));
+  declareParameter("group_escape_cost", rclcpp::ParameterValue(200));
+  declareParameter("group_escape_corridor_half_width", rclcpp::ParameterValue(0.55));
   declareParameter("r_space_cost", rclcpp::ParameterValue(100));
   declareParameter("moving_p_space_cost", rclcpp::ParameterValue(252));
   declareParameter("moving_r_space_cost", rclcpp::ParameterValue(140));
@@ -64,6 +68,10 @@ void SocialLayer::onInitialize()
   node->get_parameter(name_ + ".prediction_steps", prediction_steps_);
   node->get_parameter(name_ + ".o_space_cost", o_cost_);
   node->get_parameter(name_ + ".p_space_cost", p_cost_);
+  node->get_parameter(name_ + ".group_p_space_cost", group_p_cost_);
+  node->get_parameter(name_ + ".group_escape_cost", group_escape_cost_);
+  node->get_parameter(
+    name_ + ".group_escape_corridor_half_width", group_escape_corridor_half_width_);
   node->get_parameter(name_ + ".r_space_cost", r_cost_);
   node->get_parameter(name_ + ".moving_p_space_cost", moving_p_cost_);
   node->get_parameter(name_ + ".moving_r_space_cost", moving_r_cost_);
@@ -107,12 +115,13 @@ void SocialLayer::reset()
   groups_.groups.clear();
   have_people_message_ = false;
   have_groups_message_ = false;
+  group_escape_states_.clear();
   have_last_bounds_ = false;
   current_ = true;
 }
 
 void SocialLayer::updateBounds(
-  double robot_x, double robot_y, double,
+  double robot_x, double robot_y, double robot_yaw,
   double * min_x, double * min_y, double * max_x, double * max_y)
 {
   if (!enabled_) {return;}
@@ -121,6 +130,7 @@ void SocialLayer::updateBounds(
   // lethal ring.
   robot_x_ = robot_x;
   robot_y_ = robot_y;
+  robot_yaw_ = robot_yaw;
   have_robot_pose_ = true;
   social_perception::msg::People people;
   social_perception::msg::Groups groups;
@@ -226,7 +236,15 @@ void SocialLayer::updateCosts(
   }
 
   struct PersonInMap {double x; double y; double vx; double vy; double speed;};
-  struct GroupInMap {double x; double y; double o; double p; double r;};
+  struct GroupInMap
+  {
+    std::string id;
+    double x;
+    double y;
+    double o;
+    double p;
+    double r;
+  };
   std::vector<PersonInMap> mapped_people;
   std::vector<GroupInMap> mapped_groups;
   const std::string target = layered_costmap_->getGlobalFrameID();
@@ -250,7 +268,7 @@ void SocialLayer::updateCosts(
       input.header = groups.header;
       input.point = group.center;
       const auto output = tf_->transform(input, target, tf2::durationFromSec(0.1));
-      mapped_groups.push_back({output.point.x, output.point.y,
+      mapped_groups.push_back({group.id, output.point.x, output.point.y,
         group.o_radius, group.p_radius, group.r_radius});
     }
   } catch (const tf2::TransformException & error) {
@@ -262,6 +280,42 @@ void SocialLayer::updateCosts(
   const int begin_j = std::max(0, min_j);
   const int end_i = std::min(static_cast<int>(master.getSizeInCellsX()), max_i);
   const int end_j = std::min(static_cast<int>(master.getSizeInCellsY()), max_j);
+
+  // Latch the escape direction when a late group first surrounds the robot.
+  // Without this state, the centre fallback would rotate together with the
+  // robot while DWB turns around, leaving the exit perpetually behind it.
+  std::unordered_set<std::string> current_group_ids;
+  for (const auto & group : mapped_groups) {
+    current_group_ids.insert(group.id);
+    const double robot_distance = have_robot_pose_ ?
+      std::hypot(robot_x_ - group.x, robot_y_ - group.y) :
+      std::numeric_limits<double>::infinity();
+    if (group.p > 0.0 && robot_distance <= group.p) {
+      if (group_escape_states_.find(group.id) == group_escape_states_.end()) {
+        GroupEscapeState state;
+        if (robot_distance > 0.10) {
+          state.direction_x = (robot_x_ - group.x) / robot_distance;
+          state.direction_y = (robot_y_ - group.y) / robot_distance;
+        } else {
+          state.direction_x = -std::cos(robot_yaw_);
+          state.direction_y = -std::sin(robot_yaw_);
+        }
+        group_escape_states_.emplace(group.id, state);
+      }
+    } else if (robot_distance > group.p + overlap_escape_clearance_) {
+      // Keep the corridor until the complete footprint and inflation margin
+      // have crossed the P-space boundary, then seal it behind the robot.
+      group_escape_states_.erase(group.id);
+    }
+  }
+  for (auto state = group_escape_states_.begin(); state != group_escape_states_.end();) {
+    if (current_group_ids.find(state->first) == current_group_ids.end()) {
+      state = group_escape_states_.erase(state);
+    } else {
+      ++state;
+    }
+  }
+
   resetMap(begin_i, begin_j, end_i, end_j);
   for (int j = begin_j; j < end_j; ++j) {
     for (int i = begin_i; i < end_i; ++i) {
@@ -321,14 +375,37 @@ void SocialLayer::updateCosts(
 
       for (const auto & group : mapped_groups) {
         const double distance = std::hypot(wx - group.x, wy - group.y);
-        const double robot_distance = have_robot_pose_ ?
-          std::hypot(robot_x_ - group.x, robot_y_ - group.y) :
-          std::numeric_limits<double>::infinity();
-        const bool escaping_overlap = group.o > 0.0 && robot_distance <= group.o &&
-          distance >= std::max(0.0, robot_distance - overlap_escape_clearance_);
+        const auto escape_state = group_escape_states_.find(group.id);
+        const bool escape_active = escape_state != group_escape_states_.end();
+
+        // A confirmed conversation is not merely an expensive shortcut: its
+        // P-space is impassable. If VLM reports it after the robot has already
+        // entered, expose exactly one traversable corridor back toward the side
+        // from which the robot approached. The O/P costs on every other side
+        // remain collision costs, so the replanner cannot continue through the
+        // people and call that an "escape".
+        double escape_x = 0.0;
+        double escape_y = 0.0;
+        if (escape_active) {
+          escape_x = escape_state->second.direction_x;
+          escape_y = escape_state->second.direction_y;
+        }
+        const double from_robot_x = wx - robot_x_;
+        const double from_robot_y = wy - robot_y_;
+        const double escape_forward =
+          from_robot_x * escape_x + from_robot_y * escape_y;
+        const double escape_side = std::abs(
+          -from_robot_x * escape_y + from_robot_y * escape_x);
+        const bool in_escape_corridor = escape_active &&
+          escape_forward >= -overlap_escape_clearance_ &&
+          escape_side <= group_escape_corridor_half_width_;
         int cost = 0;
-        if (distance <= group.o) {cost = escaping_overlap ? p_cost_ : o_cost_;}
-        else if (distance <= group.p) {cost = p_cost_;}
+        if (distance <= group.o) {
+          cost = in_escape_corridor ? group_escape_cost_ : o_cost_;
+        }
+        else if (distance <= group.p) {
+          cost = in_escape_corridor ? group_escape_cost_ : group_p_cost_;
+        }
         else if (distance <= group.r) {
           const double width = std::max(1e-6, group.r - group.p);
           const double edge_factor = std::clamp((group.r - distance) / width, 0.0, 1.0);

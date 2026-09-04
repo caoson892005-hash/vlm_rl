@@ -4,9 +4,14 @@ social_vlm_perception:
 
     # Relative paths are resolved from the workspace root and package share.
     yolo_model_path: yolov8n.pt
-    rgb_topic: /dataset_camera/rgbd/image_raw
-    depth_topic: /dataset_camera/rgbd/depth/image_raw
-    camera_info_topic: /dataset_camera/rgbd/camera_info
+    # The camera rides on the robot (depth_sensor macro in 2wd.urdf.xacro).
+    # These are the names libgazebo_ros_camera is remapped to there; they
+    # deliberately mirror the RealSense names in the real profile, except for
+    # depth: Gazebo renders RGB and depth from one sensor, so the depth image
+    # is already aligned to colour and there is no aligned_depth_to_color.
+    rgb_topic: /camera/color/image_raw
+    depth_topic: /camera/depth/image_rect_raw
+    camera_info_topic: /camera/color/camera_info
     yolo_confidence: 0.25
     yolo_image_size: 640
     # Keeping YOLO on the CPU to leave the small GPU to the VLM backfires: both
@@ -16,12 +21,15 @@ social_vlm_perception:
     # (2.1 GiB total in use) and brought the same inference back to 3.6 s.
     yolo_device: cuda:0
     # Same contract as the real profile: a person is measured in the depth
-    # camera's optical frame and TF carries that point into the navigation
-    # frame. Targeting `world` instead published people in the Gazebo frame,
-    # which the map is offset from by the robot spawn pose.
+    # camera's optical frame (camera_depth_link, a link of the robot) and TF
+    # carries that point into the navigation frame. With a camera that moves,
+    # the chain is map -> odom -> base_footprint -> ... -> camera_depth_link,
+    # so the map -> odom edge from AMCL is now required: run Nav2 as well, or
+    # every frame is dropped with a TF lookup failure.
     target_frame: map
-    # Scaled to the camera, not guessed: rgbd_sensor in lirs_test.world runs at
-    # <update_rate>8</update_rate>, and the arrival interval measured on the
+    # Scaled to the camera, not guessed: the depth sensor in
+    # linorobot2_description/urdf/sensors/depth_sensor.urdf.xacro runs at
+    # <update_rate>8.0</update_rate>, and the arrival interval measured on the
     # running simulation was 0.114-0.249 s rather than a clean 0.125 s. RGB and
     # depth leave the same Gazebo sensor with the same stamp, but this node
     # compares an RGB frame against the newest depth message it happens to
@@ -47,15 +55,37 @@ social_vlm_perception:
     # Two tracks this close are one person counted twice. Must stay
     # well under the spacing of two people holding a conversation.
     duplicate_merge_distance: 0.6
-    # The robot driving across the observer camera's view hides a
-    # person for seconds at a time. Dropping the track that fast
-    # reissued their id, which deleted the social region keyed on it.
+    # The camera now turns with the robot, so a person leaves the frame every
+    # time it rotates away and comes back seconds later. Dropping the track
+    # that fast reissued their id, which deleted the social region keyed on it.
     tracking_timeout: 6.0
     # How long a vanished person can reclaim their old id on reappearing.
     # Their id is the key every VLM decision is cached under, so losing it
     # deletes the social region and costs a whole inference to rebuild.
     reidentify_timeout: 30.0
+    # How many frames a track must be SEEN in before it is published as a
+    # person or allowed to coast. One stray box at 7.6 m used to become 49
+    # messages of /people -- six seconds of coasting from a single frame -- and
+    # its score was 0.87, so no confidence threshold separates it from a real
+    # person. Measured 01-09-2026. The cost is that somebody entering frame is
+    # published two frames late, 0.25 s at the 8 Hz measured here; a track that
+    # reclaims its id after being lost keeps its count and pays nothing.
+    minimum_track_hits: 3
     velocity_smoothing: 0.35
+
+    # --- block B: quỹ đạo dự báo ngắn ---
+    # 0.0 -> 2.0 s, bước 0.5 s => 5 mẫu, mẫu đầu là hiện tại.
+    # PHẢI khớp observation.constraint_field.prediction_times trong
+    # social_rl/config/rl_train.yaml của run đã train ra policy đang chạy - đó
+    # là thứ quyết định số kênh CNN. Lệch thì khối D báo lỗi lúc nhận message
+    # đầu tiên chứ không im lặng dùng bừa.
+    prediction_horizon: 2.0
+    prediction_dt: 0.5
+    # Dưới tốc độ này coi như đứng yên, không ngoại suy. Bằng
+    # observation.constraint_field.still_speed.
+    prediction_still_speed: 0.1
+    # Gốc để đo radial_velocity và motion_type. Tra trong target_frame.
+    robot_frame: base_link
 
     # These two topics are the stable contract consumed by social_navigation.
     people_topic: /people
@@ -66,6 +96,21 @@ social_vlm_perception:
     clear_interactions_topic: /animated_people/hide
 
     enable_vlm: true
+    # false runs the model inside this node, which is what the simulation wants:
+    # one process, one machine, nothing on the network. true sends each pair
+    # crop to social_vlm_worker.py instead (see the block at the end of this
+    # file) and is what the robot uses when it carries the camera but not the
+    # GPU. Everything else about the pipeline is identical either way -- the
+    # same crop, the same prompt, the same parsing of the reply.
+    vlm_remote: false
+    # Only used when vlm_remote is true. Generous on purpose: it must outlast a
+    # normal inference (~3 s) plus a WiFi hiccup, because expiring here throws
+    # the answer away and the pair has to be asked about all over again.
+    vlm_request_timeout: 30.0
+    # Only used when vlm_remote is true. The crop is the model's only evidence,
+    # so treat this as an accuracy knob, not just a bandwidth one: at 90 a
+    # typical pair crop is ~20-40 KB.
+    vlm_crop_jpeg_quality: 90
     vlm_adapter_path: Saved_Model
     # Preferred when present: the LoRA already folded into the base weights, so
     # startup skips both the `peft` import (~17 s of the import tree, and not
@@ -132,3 +177,25 @@ social_vlm_perception:
     group_o_space_min_radius: 0.45
     group_p_space_margin: 0.45
     group_r_space_margin: 1.0
+
+# Read by social_vlm_worker.py, and only when vlm_remote above is true. Here in
+# the simulation profile so both halves can be run on this one machine to prove
+# the split behaves like the single node before a robot is involved.
+#
+# Deliberately the same checkpoint values as the block above: the worker is the
+# same model in a different process, so a difference between the two would show
+# up as the simulation and the robot disagreeing about identical people.
+social_vlm_worker:
+  ros__parameters:
+    use_sim_time: true
+    vlm_adapter_path: Saved_Model
+    vlm_merged_path: Saved_Model_merged
+    vlm_base_model: unsloth/Qwen2-VL-2B-Instruct-bnb-4bit
+    vlm_load_in_4bit: true
+    vlm_require_cuda: true
+    vlm_offline: true
+    vlm_force_answer_prefix: true
+    vlm_max_new_tokens: 12
+    vlm_min_pixels: 3136       # 56 * 56
+    vlm_max_pixels: 200704     # 256 * 28 * 28
+    log_vlm_results: true

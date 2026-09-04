@@ -16,3 +16,25 @@ social_velocity_filter:
     collision_clearance: 0.7
     predicted_stop_clearance: 0.48
     people_timeout: 0.35
+    # If VLM confirms a social region after the robot has already entered it,
+    # permit only a slow command that increases clearance from every nearby
+    # person. Rotation is always retained so a differential robot can first
+    # face the open side.
+    robot_frame: base_link
+    transform_timeout: 0.05
+    escape_evaluation_time: 0.6
+    # Zero permits the initially tangential motion needed when the robot is
+    # exactly between two people; the predicted distance still may not shrink.
+    escape_minimum_progress: 0.0
+    escape_maximum_speed: 0.12
+    # The base must not keep the last non-zero command if the upstream mux,
+    # Nav2 or teleop process dies. The filter republishes zero while stale.
+    input_command_timeout: 0.35
+    watchdog_rate: 10.0
+    # ...and then stops republishing. This many seconds of zeros (10 messages
+    # at watchdog_rate) is what brings the wheels to a stop; they stay stopped
+    # because zero is the last command they received. Staying an active
+    # publisher beyond that is what silently overwrote the RL trainer on
+    # /cmd_vel_safe once rl_agent had been started and closed in the same
+    # Gazebo session -- two commands out of three replaced by zero.
+    stop_broadcast_time: 1.0

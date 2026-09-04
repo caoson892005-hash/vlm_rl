@@ -14,7 +14,9 @@ The detector runs independently of the VLM worker. If the VLM dependencies or
 base model are unavailable, `/people` continues to be published and the node
 logs the VLM error instead of stopping camera perception.
 
-The default latency profile keeps YOLO on the CPU and Qwen2-VL on CUDA. VLM
+Both profiles run YOLO and Qwen2-VL on CUDA: sharing the card costs ~50 MiB
+next to the VLM's ~2.0 GiB, while leaving YOLO on the CPU makes it contend with
+the decode loop in this one process (10.1 s per inference against 3.6 s). VLM
 pair crops are capped at 256 merged visual tokens, only the nearest pair is
 processed, and an unchanged pair is refreshed every 15 seconds. A new pair or
 a position change of at least 0.25 m triggers an earlier inference. Each run
@@ -83,6 +85,54 @@ source install/setup.bash
 ros2 launch social_perception social_vlm_perception.launch.py
 ```
 
+## Splitting the model off onto another machine
+
+The robot carries the camera but not the GPU, so the model can run elsewhere.
+Set `vlm_remote: true` in the profile (already the case in
+`social_vlm_perception_real.yaml`) and start the other half on the workstation:
+
+```bash
+# workstation
+ros2 launch social_perception social_vlm_worker.launch.py
+
+# robot
+ros2 launch social_perception social_vlm_perception.launch.py \
+    config_file:=<...>/social_vlm_perception_real.yaml
+```
+
+Only the crop of a candidate pair crosses the network, measured at 13-14 KB per
+inference, against the ~12 MB/s that shipping raw RGB-D at 8 Hz would cost:
+
+```text
+robot        /social_perception/vlm_request   (VlmRequest: crop + prompt)
+workstation  /social_perception/vlm_response  (VlmResponse: raw answer)
+workstation  /social_perception/vlm_worker_ready  (latched, gates "SẴN SÀNG")
+```
+
+The split is deliberately lopsided. Every rule about what an answer *means* —
+which pair is worth asking about, what a newer camera frame invalidates, how
+much a contrary reply weighs against a region already on the costmap — stays in
+the perception node. The worker is stateless: it holds no track ids and no
+cache, so restarting it costs one inference rather than a rebuilt world model.
+`vlm_backend.py` is imported by whichever side loads the model, so the robot
+never needs `transformers`/`peft` and the workstation never needs
+`ultralytics`.
+
+With `vlm_remote: false` the model runs inside the perception node exactly as
+before; that is what the simulation profile does.
+
+## Parameters
+
+`config/social_vlm_perception.yaml` (simulation) and
+`config/social_vlm_perception_real.yaml` (camera on the workstation) are the
+only place parameters are defined; the node carries no defaults of its own and
+declares whatever the profile it was launched with contains. A parameter
+missing from the profile therefore raises at startup instead of running on a
+hidden value. Consequently the node must always be started with a profile —
+`social_vlm_perception.launch.py` passes one through its `config_file`
+argument, and `social_bringup.launch.py` picks the right one from `sim:=`.
+Keep the two profiles in step: a setting added to one belongs in the other.
+
 ## Topics
 
 - `/people` (`social_perception/msg/People`): localized people and velocity.
@@ -92,6 +142,9 @@ ros2 launch social_perception social_vlm_perception.launch.py
   (`social_perception/msg/TalkingInteractions`): `talking`/`not_talking`
   decision, member IDs, each person's pose and velocity, center, confidence,
   source-image timestamp, inference-completion timestamp, and raw VLM response.
+- `/social_perception/vlm_request` (`social_perception/msg/VlmRequest`) and
+  `/social_perception/vlm_response` (`social_perception/msg/VlmResponse`): the
+  JPEG pair crop and the model's raw answer, only when `vlm_remote: true`.
 - `/social_perception/detections_2d`: YOLO boxes.
 - `/social_perception/annotated_image`: RGB image with detections and track IDs.
 - `/social_perception/depth_visualization`: colored depth image.

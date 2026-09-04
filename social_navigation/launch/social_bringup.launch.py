@@ -6,8 +6,9 @@ command (social_sim.launch.py), because on real hardware there is nothing to
 spawn, and in simulation the moment people walk in is a decision worth keeping
 in your own hands rather than tying it to model loading.
 
-The pipeline is identical in both cases, because the camera is a fixed observer
-of the scene in both cases:
+The pipeline is identical in both cases; only where the camera sits differs. In
+Gazebo it is a link of the robot and moves with it; on real hardware it is still
+a fixed observer plugged into the workstation:
 
     RGB-D  ->  YOLO + depth  ->  /people                    (every person seen)
                     |
@@ -22,10 +23,13 @@ Gazebo:
 
     ros2 launch social_navigation social_bringup.launch.py sim:=true
 
-    The RGB-D camera is the one embedded in lirs_test.world, and
-    gazebo.launch.py already publishes world -> dataset_camera_link ->
-    dataset_camera_optical_frame, plus the world -> map offset that puts the
-    two on the same map as the robot. Wait for the "SẴN SÀNG" line in this
+    The RGB-D camera is the one on the robot (the depth_sensor macro in
+    2wd.urdf.xacro), so robot_state_publisher already carries
+    base_link -> camera_link -> camera_depth_link. What it does NOT carry is
+    map -> odom: that edge comes from AMCL, so navigation.launch.py has to be
+    running as well or every frame is dropped on a TF lookup. The camera also
+    only sees what the robot is pointed at -- drive it towards the people
+    before expecting anything on /people. Wait for the "SẴN SÀNG" line in this
     terminal, then release the actors from another one:
 
     ros2 launch social_navigation social_sim.launch.py scenario:=talking

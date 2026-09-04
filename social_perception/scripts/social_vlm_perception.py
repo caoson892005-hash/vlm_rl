@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Localize people with RGB-D and use a Qwen2-VL LoRA to detect conversations."""
 
+import array
 import copy
 import contextlib
 import json
@@ -25,7 +26,7 @@ import cv2
 import numpy as np
 import rclpy
 from ament_index_python.packages import get_package_share_directory
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, Pose
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
@@ -48,6 +49,8 @@ from social_perception.msg import (
     Groups,
     People,
     Person,
+    VlmRequest,
+    VlmResponse,
     TalkingInteraction,
     TalkingInteractions,
 )
@@ -69,6 +72,97 @@ def rotate_vector(vector, quaternion):
         y + qw * ty + qz * tx - qx * tz,
         z + qw * tz + qx * ty - qy * tx,
     )
+
+
+# cos(45 degrees), the half-angle of the head-on cone. Must stay equal to
+# kHeadOnCosine in linorobot2_gazebo/src/animated_people_release.cpp: a policy
+# trained on one definition of "walking towards the robot" and run on another
+# is being lied to about the situation it is in.
+HEAD_ON_COSINE = 0.7071067811865476
+
+
+def fill_prediction(person, times, still_speed):
+    """Block B's short-horizon trajectory, constant velocity.
+
+    Mirrors FillPrediction in the Gazebo plugin. The first sample is t = 0.0
+    and repeats the present pose, so block D reads the instant it charges the
+    reward at out of the same array as the instants it rasterises.
+    """
+    vx = person.velocity.linear.x
+    vy = person.velocity.linear.y
+    moving = math.hypot(vx, vy) >= still_speed
+    # Direction of travel once somebody is walking; whatever facing the
+    # producer reported while they stand still. This node has no facing
+    # estimate, so a standing person keeps orientation 0 -- see the comment on
+    # facing in the detection loop.
+    heading = (math.atan2(vy, vx) if moving
+               else quaternion_yaw(person.pose.orientation))
+    for horizon in times:
+        pose = Pose()
+        pose.position.x = person.pose.position.x + (vx * horizon if moving else 0.0)
+        pose.position.y = person.pose.position.y + (vy * horizon if moving else 0.0)
+        pose.orientation.z = math.sin(heading / 2.0)
+        pose.orientation.w = math.cos(heading / 2.0)
+        person.prediction_times.append(float(horizon))
+        person.predicted_poses.append(pose)
+
+
+def fill_relative_motion(person, robot, still_speed):
+    """Block B's motion labels, measured against the robot.
+
+    Mirrors FillRelativeMotion in the Gazebo plugin. `robot` is (x, y, yaw) in
+    the same frame the person is expressed in.
+    """
+    vx = person.velocity.linear.x
+    vy = person.velocity.linear.y
+    speed = math.hypot(vx, vy)
+    if speed < still_speed:
+        person.radial_velocity = 0.0
+        person.motion_type = 'static'
+        return
+
+    robot_x, robot_y, robot_yaw = robot
+    dx = person.pose.position.x - robot_x
+    dy = person.pose.position.y - robot_y
+    # A person on top of the robot has no defined direction; the guard keeps
+    # the division finite, and at that range there is nothing to decide.
+    distance = max(math.hypot(dx, dy), 1e-6)
+    radial = (vx * dx + vy * dy) / distance
+    person.radial_velocity = float(radial)
+
+    along = radial / speed
+    if along < -HEAD_ON_COSINE:
+        person.motion_type = 'head_on'
+    elif along > HEAD_ON_COSINE:
+        person.motion_type = 'receding'
+    else:
+        # Sideways component in the ROBOT's frame, where +y is its left.
+        sideways = -math.sin(robot_yaw) * vx + math.cos(robot_yaw) * vy
+        person.motion_type = 'left_to_right' if sideways < 0.0 else 'right_to_left'
+
+
+def apply_scene_ruling(person, rulings):
+    """Write block C's verdict onto a person, or leave the neutral default.
+
+    Absent ruling means block C said nothing about this person, which is not
+    the same as it saying "nothing social is happening" -- both land on an
+    empty scene_type, but only the second is a measurement, and neither gives
+    block D anything but its neutral region shape.
+    """
+    ruling = rulings.get(person.id)
+    if ruling is None:
+        return
+    person.scene_type = ruling[0]
+    person.scene_confidence = ruling[1]
+    # Copied, not referenced: assigning a message field stores the object
+    # itself, and this stamp belongs to a cached decision later frames read.
+    person.scene_stamp = copy.deepcopy(ruling[2])
+
+
+def quaternion_yaw(orientation):
+    return math.atan2(
+        2.0 * (orientation.w * orientation.z + orientation.x * orientation.y),
+        1.0 - 2.0 * (orientation.y ** 2 + orientation.z ** 2))
 
 
 def normalized_text(value):
@@ -130,365 +224,98 @@ def talking_from_response(response):
     return False, 0.0
 
 
-class VlmProgress:
-    """Log stage-based VLM progress while blocking native operations run.
+class RemoteVlmBackend:
+    """Ask another machine the question a local VlmBackend would answer.
 
-    Transformers does not expose byte-level progress callbacks for cached
-    checkpoints. Percentages therefore describe completed initialization
-    stages. A heartbeat repeats the current stage and elapsed time so a long
-    ``from_pretrained`` call is visibly alive without pretending to know its
-    remaining duration.
+    Deliberately the same call signature as VlmBackend.infer, and blocking in
+    the same way, because vlm_worker is what enforces every rule around the
+    answer: which pair is worth asking about, what a newer camera frame
+    invalidates, how much a contrary reply is worth against a region already on
+    the costmap. None of that may be duplicated on the other machine, so only
+    the sentence "run the model on this crop" crosses the network.
+
+    The exchange is deliberately one question at a time. vlm_worker is a single
+    thread that blocks here until the answer arrives, so a request id is enough
+    to recognise a late reply to a question already given up on.
     """
 
-    def __init__(self, logger, label, initial_stage,
-                 heartbeat_seconds=10.0, bar_width=20):
-        self.logger = logger
-        self.label = label
-        self.heartbeat_seconds = heartbeat_seconds
-        self.bar_width = bar_width
-        self.started_at = time.monotonic()
-        self.percent = 0
-        self.stage = initial_stage
+    def __init__(self, node, request_pub, timeout, jpeg_quality):
+        self.node = node
+        self.request_pub = request_pub
+        self.timeout = timeout
+        self.jpeg_quality = jpeg_quality
+        # Read by the camera thread for the latency overlay, exactly as the
+        # local backend's is. The three parts are measured on the workstation;
+        # the gap between their sum and the round trip vlm_worker measures is
+        # what the network and the JPEG cost.
+        self.last_timing = (0.0, 0.0, 0.0, 0)
         self.lock = threading.Lock()
-        self.stop_event = threading.Event()
-        self.thread = None
+        self.pending_id = None
+        self.pending_response = None
+        self.answered = threading.Event()
+        self.sequence = 0
 
-    def start(self):
-        self._log()
-        self.thread = threading.Thread(
-            target=self._heartbeat,
-            name='vlm-load-progress',
-            daemon=True,
-        )
-        self.thread.start()
-
-    def update(self, percent, stage):
+    def handle_response(self, message):
         with self.lock:
-            self.percent = max(self.percent, min(100, int(percent)))
-            self.stage = stage
-        self._log()
-
-    def complete(self, stage):
-        self.update(100, stage)
-        self.stop_event.set()
-        if self.thread is not None:
-            self.thread.join(timeout=1.0)
-
-    def fail(self, error):
-        with self.lock:
-            self.stage = f'FAILED: {type(error).__name__}: {error}'
-        self._log()
-        self.stop_event.set()
-        if self.thread is not None:
-            self.thread.join(timeout=1.0)
-
-    def _heartbeat(self):
-        while not self.stop_event.wait(self.heartbeat_seconds):
-            self._log()
-
-    def _log(self):
-        with self.lock:
-            percent = self.percent
-            stage = self.stage
-        completed = int(round(self.bar_width * percent / 100.0))
-        bar = '#' * completed + '-' * (self.bar_width - completed)
-        elapsed = time.monotonic() - self.started_at
-        try:
-            self.logger.info(
-                f'{self.label} [{bar}] {percent:3d}% | {stage} | '
-                f'elapsed={elapsed:.0f}s')
-        except Exception:
-            # Shutdown may invalidate the ROS context while a native model
-            # loader is still returning from a background thread.
-            pass
-
-
-class VlmBackend:
-    """Standard Transformers/PEFT loader for the supplied Qwen2-VL adapter."""
-
-    # Generation, not the image, dominates latency on a small GPU: measured on
-    # a Quadro T1000 the prefill costs ~1.8 s and every further decode step
-    # ~0.36 s, so the 7-token answer `{"talking":"Không"}` spent ~2.2 s writing
-    # punctuation the prompt already dictates. Teacher-forcing that punctuation
-    # leaves only the decisive word to generate.
-    ANSWER_PREFIX = '{"talking":"'
-    # Enough for the longest tokenization of either word ('KH','Ô','NG'); the
-    # shorter ones simply run into the closing quote, which is cut off below.
-    PREFIX_ANSWER_TOKENS = 3
-
-    def __init__(self, adapter_path, base_model, load_in_4bit, require_cuda,
-                 max_new_tokens, min_pixels, max_pixels, logger,
-                 execution_lock=None, force_answer_prefix=True, offline=True,
-                 merged_path=None):
-        self.logger = logger
-        self.execution_lock = execution_lock
-        self.force_answer_prefix = force_answer_prefix
-        progress = VlmProgress(
-            logger, 'VLM LOAD', 'Starting VLM initialization')
-        progress.start()
-        try:
-            if offline:
-                # The 2.1 GiB checkpoint is already in ~/.cache/huggingface, but
-                # every from_pretrained still asks huggingface.co whether the
-                # cached etag is current before using it. That round trip buys
-                # nothing on a robot running a pinned model and blocks startup
-                # for as long as the network takes to answer -- on a captive
-                # Wi-Fi portal or an offline robot, until the HTTP timeout.
-                # The env vars cover libraries that resolve files themselves;
-                # local_files_only below is what makes the guarantee, since it
-                # does not depend on huggingface_hub being imported after this.
-                os.environ['HF_HUB_OFFLINE'] = '1'
-                os.environ['TRANSFORMERS_OFFLINE'] = '1'
-            progress.update(5, 'Checking Pillow compatibility')
-            # Ubuntu 22.04 provides Pillow 9.0.1, whose resampling constants
-            # live directly on PIL.Image. New Transformers expects the enum
-            # introduced in Pillow 9.1. This alias is API-compatible and
-            # avoids a misleading downstream PEFT import error.
-            from PIL import Image as PilImageModule
-            if not hasattr(PilImageModule, 'Resampling'):
-                class PillowResampling(IntEnum):
-                    NEAREST = PilImageModule.NEAREST
-                    LANCZOS = PilImageModule.LANCZOS
-                    BILINEAR = PilImageModule.BILINEAR
-                    BICUBIC = PilImageModule.BICUBIC
-                    BOX = PilImageModule.BOX
-                    HAMMING = PilImageModule.HAMMING
-
-                PilImageModule.Resampling = PillowResampling
-
-            progress.update(10, 'Importing PyTorch')
-            import torch
-            # A merged checkpoint needs no PEFT at all, and skipping that import
-            # is most of the win: `peft` costs ~17 s of the import tree on this
-            # machine and cannot be trimmed, because `peft/__init__.py` pulls in
-            # the whole AutoModel registry via `from .auto import ...` no matter
-            # which submodule is requested. Built by merge_vlm_adapter.py.
-            use_merged = merged_path is not None
-            progress.update(
-                20, 'Importing Transformers' if use_merged
-                else 'Importing PEFT and Transformers')
-            if not use_merged:
-                from peft import PeftModel
-            from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
-            from transformers.utils import logging as transformers_logging
-            transformers_logging.set_verbosity_error()
-            progress.update(30, 'ML libraries imported')
-
-            self.torch = torch
-            self.max_new_tokens = max_new_tokens
-            self.min_pixels = min_pixels
-            self.max_pixels = max_pixels
-            use_cuda = torch.cuda.is_available()
-            progress.update(
-                32, f'Runtime ready: CUDA={use_cuda}, CUDA runtime={torch.version.cuda}')
-            if require_cuda and not use_cuda:
-                raise RuntimeError(
-                    'CUDA is required for VLM inference but is unavailable')
-            model_kwargs = {
-                'device_map': 'auto' if use_cuda else None,
-                'torch_dtype': torch.float16 if use_cuda else torch.float32,
-                'local_files_only': offline,
-            }
-            if load_in_4bit and use_cuda:
-                from transformers import BitsAndBytesConfig
-                model_kwargs['quantization_config'] = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.float16,
-                )
-            elif load_in_4bit:
-                logger.warn(
-                    'CUDA is unavailable; VLM will attempt a local CPU fallback, '
-                    'which can be very slow for Qwen2-VL')
-
-            if use_merged:
-                # The merged checkpoint carries its own quantization_config,
-                # and for an already-quantised model that config wins over
-                # anything passed here -- compute_dtype included. Dropping ours
-                # keeps the code honest about who decides: merge_vlm_adapter.py.
-                model_kwargs.pop('quantization_config', None)
-                if use_cuda:
-                    # 'auto' sizes the split against free VRAM at this moment,
-                    # and by now YOLO holds some of the card (plus ~450 MiB if
-                    # gzserver is PRIME-offloaded onto it). That made accelerate
-                    # try to put layers on the CPU, which bitsandbytes rejects
-                    # outright. The merged checkpoint is 1.56 GiB and is meant
-                    # to sit entirely on the card, so say so: an honest OOM here
-                    # beats a partial dispatch that cannot run anyway.
-                    model_kwargs['device_map'] = {'': 0}
-                progress.update(35, f'Loading merged Qwen2-VL: {merged_path}')
-                self.model = Qwen2VLForConditionalGeneration.from_pretrained(
-                    str(merged_path), **model_kwargs)
-                self.model.eval()
-                self._warn_if_offloaded(self.model, logger)
-                progress.update(88, 'Merged model loaded; loading processor')
-                processor_sources = (str(merged_path), base_model)
-            else:
-                progress.update(
-                    35,
-                    f'Loading Qwen2-VL base model: {base_model}'
-                    f'{" (cache only)" if offline else ""}')
-                try:
-                    base = Qwen2VLForConditionalGeneration.from_pretrained(
-                        base_model, **model_kwargs)
-                except OSError as error:
-                    # Only reachable the first time a machine runs this model,
-                    # or after the cache is cleared. One download is worth more
-                    # than a dead VLM, so pay for it once and stay on the cache.
-                    if not offline:
-                        raise
-                    logger.warn(
-                        f'{base_model} is not in the local Hugging Face cache '
-                        f'({type(error).__name__}); downloading it once. '
-                        'Subsequent launches will load from the cache offline.')
-                    progress.update(35, f'Downloading base model: {base_model}')
-                    self._disable_offline(model_kwargs)
-                    base = Qwen2VLForConditionalGeneration.from_pretrained(
-                        base_model, **model_kwargs)
-                    offline = False
-                self._warn_if_offloaded(base, logger)
-                progress.update(75, 'Base model loaded; attaching LoRA adapter')
-                self.model = PeftModel.from_pretrained(base, str(adapter_path))
-                self.model.eval()
-                progress.update(88, 'LoRA adapter attached; loading processor')
-                processor_sources = (str(adapter_path), base_model)
-
-            processor_kwargs = {
-                'min_pixels': self.min_pixels,
-                'max_pixels': self.max_pixels,
-                'local_files_only': offline,
-            }
-            primary_source, fallback_source = processor_sources
-            try:
-                self.processor = AutoProcessor.from_pretrained(
-                    primary_source, **processor_kwargs)
-            except (OSError, ValueError):
-                # The adapter directory ships no preprocessor_config.json, so
-                # this fallback is the normal path, not an error case: it is a
-                # second trip to the hub unless it is pinned to the cache. The
-                # merged directory does ship one, so it does not come here.
-                progress.update(92, 'Loading processor from base model')
-                self.processor = AutoProcessor.from_pretrained(
-                    fallback_source, **processor_kwargs)
-            progress.update(97, 'Processor loaded; selecting inference device')
-            self.input_device = next(self.model.parameters()).device
-            progress.update(98, 'Warming up CUDA kernels')
-            self._warm_up()
-            progress.complete(
-                f'VLM READY: {"merged model" if use_merged else "adapter"} '
-                f'loaded on {self.input_device}')
-        except Exception as error:
-            progress.fail(error)
-            raise
-
-    @staticmethod
-    def _warn_if_offloaded(model, logger):
-        """Say so when the card was too small to hold the whole model."""
-        device_map = getattr(model, 'hf_device_map', {})
-        offloaded_devices = sorted({
-            str(device) for device in device_map.values()
-            if str(device) in ('cpu', 'disk')
-        })
-        if offloaded_devices:
-            logger.warn(
-                'Part of the VLM was offloaded to '
-                f'{", ".join(offloaded_devices)}; inference will be slower')
-
-    @staticmethod
-    def _disable_offline(model_kwargs):
-        """Reopen the network after a cache miss, for this process only."""
-        os.environ.pop('HF_HUB_OFFLINE', None)
-        os.environ.pop('TRANSFORMERS_OFFLINE', None)
-        model_kwargs['local_files_only'] = False
-        try:
-            import huggingface_hub.constants as hub_constants
-            # Already imported by this point, so it captured the offline flag
-            # set above; the env var alone will not take it back.
-            hub_constants.HF_HUB_OFFLINE = False
-        except Exception:  # A layout change here must not block the download.
-            pass
-
-    def _warm_up(self):
-        """Pay the one-off CUDA/bitsandbytes kernel cost before the first pair.
-
-        The first generate() call measured 9.4 s against 4.1 s for every call
-        after it. Spending that here means the first real conversation is
-        judged at the steady-state latency instead of waiting out kernel
-        autotuning while two people stand in front of the camera.
-        """
-        started_at = time.monotonic()
-        try:
-            blank = np.full((256, 384, 3), 127, dtype=np.uint8)
-            self.infer(blank, 'warm-up')
-        except Exception as error:  # A failed warm-up must not block startup.
-            self.logger.warn(
-                f'VLM warm-up failed ({type(error).__name__}: {error}); '
-                'the first inference will be slower')
-            return
-        self.logger.info(
-            f'VLM warm-up finished in {time.monotonic() - started_at:.2f}s')
+            if message.request_id != self.pending_id:
+                # A reply to a question this side already timed out on. Acting
+                # on it would attach an answer to whatever pair is being asked
+                # about now.
+                return
+            self.pending_response = message
+        self.answered.set()
 
     def infer(self, bgr_image, prompt, pair=None):
-        from PIL import Image as PilImage
-
-        started_at = time.monotonic()
-        image = PilImage.fromarray(cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB))
-        messages = [{
-            'role': 'user',
-            'content': [
-                {'type': 'image', 'image': image},
-                {'type': 'text', 'text': prompt},
-            ],
-        }]
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True)
-        max_new_tokens = self.max_new_tokens
-        if self.force_answer_prefix:
-            # Start the assistant turn mid-answer so the model resumes from the
-            # forced prefix. It only has to produce the word, which also ends
-            # the malformed replies (`{"talking":"có}`, `{"talking":true}`)
-            # that used to cost a whole inference to recover from.
-            text += self.ANSWER_PREFIX
-            max_new_tokens = self.PREFIX_ANSWER_TOKENS
-        # This is a one-item batch, so padding is unnecessary and only causes
-        # a noisy Transformers max_length warning.
-        inputs = self.processor(
-            text=[text], images=[image], padding=False, return_tensors='pt')
-        inputs = {key: value.to(self.input_device) for key, value in inputs.items()}
-        lock_context = (self.execution_lock if self.execution_lock is not None
-                        else contextlib.nullcontext())
-        # Split the wait into preprocessing, waiting for the lock and the model
-        # itself. The same crop takes seconds standalone and far longer in the
-        # running node, and only a breakdown says which of the three grew.
-        prepared_at = time.monotonic()
-        with lock_context:
-            acquired_at = time.monotonic()
-            with self.torch.inference_mode():
-                output_ids = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                )
-        self.last_timing = (prepared_at - started_at,
-                            acquired_at - prepared_at,
-                            time.monotonic() - acquired_at,
-                            int(inputs['input_ids'].shape[1]))
-        generated_ids = output_ids[:, inputs['input_ids'].shape[1]:]
-        answer = self.processor.batch_decode(
-            generated_ids, skip_special_tokens=True,
-            clean_up_tokenization_spaces=False)[0].strip()
-        if self.force_answer_prefix:
-            # Reattach what was teacher-forced so the published response stays
-            # the same JSON object every consumer already parses and logs. The
-            # word is the model's; only the syntax around it was supplied.
-            word = answer.split('"')[0].strip()
-            answer = self.ANSWER_PREFIX + word + '"}'
-        return answer
+        encoded_ok, encoded = cv2.imencode(
+            '.jpg', bgr_image,
+            [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
+        if not encoded_ok:
+            raise RuntimeError('failed to JPEG-encode the pair crop')
+        request = VlmRequest()
+        request.header.stamp = self.node.get_clock().now().to_msg()
+        request.crop.header = request.header
+        request.crop.format = 'jpeg'
+        request.crop.data = encoded.tobytes()
+        # The prompt travels with the crop so the wording lives in exactly one
+        # config file. Two copies drift, and a drifted prompt is invisible: the
+        # model keeps answering, just to a different question.
+        request.prompt = prompt
+        request.member_ids = [str(member) for member in (pair or ())]
+        with self.lock:
+            self.sequence += 1
+            request.request_id = str(self.sequence)
+            self.pending_id = request.request_id
+            self.pending_response = None
+        self.answered.clear()
+        self.request_pub.publish(request)
+        if not self.answered.wait(self.timeout):
+            with self.lock:
+                self.pending_id = None
+            raise TimeoutError(
+                f'no VLM answer within {self.timeout:.1f}s; is '
+                'social_vlm_worker.py running on the workstation?')
+        with self.lock:
+            response = self.pending_response
+            self.pending_id = None
+        self.last_timing = (response.prepare_seconds, response.lock_seconds,
+                            response.generate_seconds, response.token_count)
+        if response.failed:
+            raise RuntimeError(f'remote VLM failed: {response.error}')
+        return response.raw_response
 
 
 class SocialVlmPerception(Node):
     def __init__(self):
-        super().__init__('social_vlm_perception')
-        self._declare_parameters()
+        # Every parameter comes from the profile passed on the command line
+        # (social_vlm_perception.yaml for the simulation,
+        # social_vlm_perception_real.yaml for the camera on the workstation).
+        # Declaring defaults here as well meant the same 46 values existed in
+        # two places, and they had already drifted apart: yolo_device read
+        # 'cpu' here while both profiles run it on cuda:0. A parameter left out
+        # of the profile now raises at startup instead of silently running on
+        # a value nobody can see in the config file.
+        super().__init__('social_vlm_perception',
+                         automatically_declare_parameters_from_overrides=True)
 
         self.confidence = float(self.get_parameter('yolo_confidence').value)
         self.image_size = int(self.get_parameter('yolo_image_size').value)
@@ -503,9 +330,45 @@ class SocialVlmPerception(Node):
         self.track_timeout = float(self.get_parameter('tracking_timeout').value)
         self.reidentify_timeout = float(
             self.get_parameter('reidentify_timeout').value)
+        self.minimum_track_hits = int(
+            self.get_parameter('minimum_track_hits').value)
+        # How many frames each live id has been SEEN in, as opposed to coasted.
+        # Kept beside self.tracks rather than inside it so the count survives a
+        # trip through lost_tracks: somebody who walks back into frame reclaims
+        # their id and their confirmation with it, and is published again the
+        # same frame instead of serving the waiting period twice.
+        self.track_hits = {}
         self.velocity_alpha = float(self.get_parameter('velocity_smoothing').value)
+        # Block B's prediction window. These have to agree with
+        # observation.constraint_field.prediction_times in the social_rl config
+        # that trained the policy, which is what sizes the CNN.
+        horizon = float(self.get_parameter('prediction_horizon').value)
+        step = float(self.get_parameter('prediction_dt').value)
+        self.prediction_times = [round(index * step, 6) for index
+                                 in range(int(round(horizon / step)) + 1)]
+        # Below this a person is standing, not walking. Extrapolating tracker
+        # noise on somebody standing still would drag their predicted position
+        # metres down the corridor by the end of the horizon.
+        self.prediction_still_speed = float(
+            self.get_parameter('prediction_still_speed').value)
+        # Whose pose radial_velocity and motion_type are measured against.
+        # Looked up in target_frame, so the same TF chain the people already
+        # travel through.
+        self.robot_frame = str(self.get_parameter('robot_frame').value)
         self.yolo_device = str(self.get_parameter('yolo_device').value)
         self.vlm_enabled = bool(self.get_parameter('enable_vlm').value)
+        # Where the model actually runs. false keeps it in this process, which
+        # is what the simulation and the workstation-camera setup do. true
+        # sends each crop to social_vlm_worker.py over
+        # /social_perception/vlm_request, so a robot carrying the camera needs
+        # ultralytics for YOLO but neither transformers nor a GPU.
+        self.vlm_remote = bool(self.get_parameter('vlm_remote').value)
+        self.vlm_request_timeout = float(
+            self.get_parameter('vlm_request_timeout').value)
+        # The crop is the model's only evidence, so this is a quality knob, not
+        # just a bandwidth one. Compare answers before lowering it.
+        self.vlm_crop_jpeg_quality = int(
+            self.get_parameter('vlm_crop_jpeg_quality').value)
         self.vlm_interval = float(self.get_parameter('vlm_inference_interval').value)
         self.vlm_refresh_interval = float(
             self.get_parameter('vlm_refresh_interval').value)
@@ -519,6 +382,11 @@ class SocialVlmPerception(Node):
         self.crop_margin = float(self.get_parameter('vlm_crop_margin').value)
         self.latency_overlay = bool(
             self.get_parameter('show_vlm_latency_overlay').value)
+        self.log_vlm_results = bool(self.get_parameter('log_vlm_results').value)
+        self.group_o_min_radius = float(
+            self.get_parameter('group_o_space_min_radius').value)
+        self.group_p_margin = float(self.get_parameter('group_p_space_margin').value)
+        self.group_r_margin = float(self.get_parameter('group_r_space_margin').value)
         self.last_vlm_enqueue = 0.0
         # Serializes VLM inferences against each other. It deliberately does
         # NOT cover YOLO.
@@ -627,6 +495,41 @@ class SocialVlmPerception(Node):
             str(self.get_parameter('interactions_topic').value), 10)
         self.social_markers_pub = self.create_publisher(
             MarkerArray, '/social_spaces', 10)
+
+        # The remote half of the pipeline, wired up here rather than inside the
+        # worker thread so every endpoint exists before the executor spins.
+        self.remote_backend = None
+        self.remote_worker_ready = threading.Event()
+        if self.vlm_enabled and self.vlm_remote:
+            # Its own group: an answer arriving must not queue behind a depth
+            # frame, and the depth path must not wait on network traffic.
+            self.remote_callback_group = MutuallyExclusiveCallbackGroup()
+            # Depth 1 and BEST_EFFORT: one question is in flight at a time, and
+            # a crop that could not be delivered is worthless a second later --
+            # the pair will simply be asked about again from a fresher frame.
+            request_pub = self.create_publisher(
+                VlmRequest, '/social_perception/vlm_request',
+                QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
+                           reliability=ReliabilityPolicy.BEST_EFFORT,
+                           durability=DurabilityPolicy.VOLATILE))
+            self.remote_backend = RemoteVlmBackend(
+                self, request_pub, self.vlm_request_timeout,
+                self.vlm_crop_jpeg_quality)
+            self.create_subscription(
+                VlmResponse, '/social_perception/vlm_response',
+                self.remote_backend.handle_response, 10,
+                callback_group=self.remote_callback_group)
+            # Latched on the worker's side, so this learns the model is up even
+            # if the workstation was started first.
+            self.create_subscription(
+                Bool, '/social_perception/vlm_worker_ready',
+                self.remote_worker_ready_callback,
+                QoSProfile(
+                    depth=1,
+                    history=HistoryPolicy.KEEP_LAST,
+                    reliability=ReliabilityPolicy.RELIABLE,
+                    durability=DurabilityPolicy.TRANSIENT_LOCAL),
+                callback_group=self.remote_callback_group)
         # Latched, so anything that starts later still learns the pipeline is
         # up. It fires once YOLO has processed a real frame and the VLM has
         # finished loading, which is the moment people can actually be seen.
@@ -654,61 +557,6 @@ class SocialVlmPerception(Node):
             f'Social perception ready: RGB={rgb_topic}, depth={depth_topic}, '
             f'target={self.target_frame}, YOLO={yolo_path} on {self.yolo_device}, '
             f'VLM={self.vlm_enabled}')
-
-    def _declare_parameters(self):
-        parameters = {
-            'yolo_model_path': 'yolov8n.pt',
-            'rgb_topic': '/camera/color/image_raw',
-            'depth_topic': '/camera/aligned_depth_to_color/image_raw',
-            'camera_info_topic': '/camera/color/camera_info',
-            'yolo_confidence': 0.25,
-            'yolo_image_size': 640,
-            'yolo_device': 'cpu',
-            'target_frame': 'map',
-            'maximum_depth_age': 0.15,
-            'maximum_frame_age': 0.5,
-            'minimum_depth': 0.2,
-            'maximum_depth': 12.0,
-            'tracking_max_distance': 1.0,
-            'duplicate_merge_distance': 0.6,
-            'tracking_timeout': 6.0,
-            'reidentify_timeout': 30.0,
-            'velocity_smoothing': 0.35,
-            'people_topic': '/people',
-            'social_regions_topic': '/people_groups',
-            'interactions_topic': '/social_perception/talking_interactions',
-            'clear_interactions_topic': '/animated_people/hide',
-            'enable_vlm': True,
-            'vlm_adapter_path': 'Saved_Model',
-            'vlm_merged_path': 'Saved_Model_merged',
-            'vlm_base_model': 'unsloth/Qwen2-VL-2B-Instruct-bnb-4bit',
-            'vlm_load_in_4bit': True,
-            'vlm_require_cuda': True,
-            'vlm_offline': True,
-            'vlm_max_new_tokens': 12,
-            'vlm_force_answer_prefix': True,
-            'vlm_min_pixels': 56 * 56,
-            'vlm_max_pixels': 256 * 28 * 28,
-            'vlm_inference_interval': 2.0,
-            'vlm_refresh_interval': 15.0,
-            'vlm_position_change_threshold': 0.25,
-            'vlm_crop_margin': 0.05,
-            'maximum_talking_distance': 3.0,
-            'maximum_vlm_pairs': 1,
-            'negative_answers_to_clear': 2,
-            'interaction_timeout': 0.0,
-            'log_vlm_results': True,
-            'show_vlm_latency_overlay': True,
-            'talking_prompt': (
-                'Quan sát hai người trong ảnh. Họ có đang nói chuyện trực tiếp '
-                'với nhau không? Chỉ trả lời đúng một JSON: '
-                '{"talking":"có"} hoặc {"talking":"không"}.'),
-            'group_o_space_min_radius': 0.45,
-            'group_p_space_margin': 0.45,
-            'group_r_space_margin': 1.0,
-        }
-        for name, default in parameters.items():
-            self.declare_parameter(name, default)
 
     def _warm_up_yolo(self):
         """Build the YOLO inference backend before the VLM thread can exist.
@@ -762,6 +610,30 @@ class SocialVlmPerception(Node):
             if path.exists():
                 return path.resolve()
         return None
+
+    def remote_worker_ready_callback(self, message):
+        if message.data:
+            self.remote_worker_ready.set()
+
+    def wait_for_remote_worker(self):
+        """Block until the workstation reports its model is loaded.
+
+        No deadline on purpose. The robot may well be powered on before the
+        workstation, and giving up would leave a node that looks alive while
+        silently never asking anything. The heartbeat is what tells an operator
+        which of the two machines they are still waiting for.
+        """
+        waited = 0.0
+        while not self.stop_event.is_set():
+            if self.remote_worker_ready.wait(5.0):
+                self.get_logger().info(
+                    f'VLM từ xa đã sẵn sàng sau {waited:.0f}s')
+                return True
+            waited += 5.0
+            self.get_logger().info(
+                f'Đang đợi social_vlm_worker.py trên máy trạm ({waited:.0f}s). '
+                'Kiểm tra ROS_DOMAIN_ID và ROS_LOCALHOST_ONLY nếu chờ quá lâu.')
+        return False
 
     def depth_callback(self, message):
         self.depth_msg = message
@@ -864,6 +736,10 @@ class SocialVlmPerception(Node):
     # floor seen past the feet.
     TORSO_SIDE, TORSO_TOP, TORSO_BOTTOM = 0.30, 0.20, 0.70
 
+    # Bề dày một thân người, dùng để tách người khỏi nền trong ROI. Rộng hơn
+    # thân thật (~0.30 m) để chừa chỗ cho người đứng chếch và cho nhiễu depth.
+    PERSON_DEPTH = 0.5
+
     @classmethod
     def torso_center(cls, box):
         """Pixel that median_depth's distance actually belongs to.
@@ -890,7 +766,25 @@ class SocialVlmPerception(Node):
                     max(0, int(rx1)):min(depth.shape[1], int(rx2))]
         valid = roi[np.isfinite(roi) & (roi >= self.min_depth) &
                     (roi <= self.max_depth)]
-        return float(np.median(valid)) if valid.size >= 8 else None
+        if valid.size < 8:
+            return None
+        # Trung vị của MẶT GẦN NHẤT, không phải của cả ROI.
+        #
+        # Trung vị cả ROI trả về bức tường ngay khi quá nửa ROI là nền - và
+        # điều đó xảy ra thường xuyên hơn ta tưởng: người đứng chếch, bị che
+        # một phần, hoặc khung YOLO rộng hơn thân. Đo 29-08-2026 trên
+        # lirs_test.world, 705 lần đo trong 80 s: 54 lần (8%) lệch quá 0.5 m,
+        # tệ nhất là 8.50 m thay vì 1.44 m khi 54% ROI là nền. Hậu quả không
+        # phải "mất người" mà là ĐẶT NGƯỜI SAI CHỖ - một chấm nổi trên tường,
+        # cùng phương vị nhưng xa gấp hơn hai lần, và khối D dựng nguyên một
+        # vùng xã hội quanh nó.
+        #
+        # Người LUÔN ở trước nền, nên mặt gần nhất trong ROI là người. Lấy
+        # phân vị 10 thay vì min để một vài điểm nhiễu quá gần không kéo lệch,
+        # rồi giữ mọi điểm trong một bề dày thân người tính từ đó.
+        nearest = float(np.percentile(valid, 10))
+        front = valid[valid <= nearest + self.PERSON_DEPTH]
+        return float(np.median(front))
 
     def point_in_target(self, u, v, depth, source_frame, stamp):
         info = self.camera_info
@@ -912,6 +806,59 @@ class SocialVlmPerception(Node):
         return (rotated[0] + translation.x,
                 rotated[1] + translation.y,
                 rotated[2] + translation.z)
+
+    def robot_pose(self, stamp):
+        """(x, y, yaw) of the robot in target_frame, or None if TF is not up.
+
+        Only radial_velocity and motion_type need this. A failure here must not
+        cost the frame: the positions and velocities are already valid without
+        it, and dropping them would be a worse trade than publishing two empty
+        labels -- which is exactly what an empty motion_type means.
+        """
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.target_frame, self.robot_frame,
+                rclpy.time.Time.from_msg(stamp), timeout=Duration(seconds=0.05))
+        except TransformException as error:
+            self.get_logger().warn(
+                f'TF {self.robot_frame} -> {self.target_frame}: {error}',
+                throttle_duration_sec=5.0)
+            return None
+        translation = transform.transform.translation
+        return (translation.x, translation.y,
+                quaternion_yaw(transform.transform.rotation))
+
+    def scene_rulings(self):
+        """Block C's verdict per person id: {id: (scene_type, confidence, stamp)}.
+
+        Reads the decision cache the social-region publisher already maintains
+        rather than asking the model again. The cache is keyed by pair and
+        refreshed every few seconds; this runs at frame rate, so re-deriving it
+        here would be asking the same question hundreds of times per answer.
+
+        Only a positive `talking` ruling produces a scene_type. "not_talking"
+        is a real answer, but block D carries no region for it -- its neutral
+        shape already IS "nothing known socially", so inventing a value its
+        table does not hold would fall back to that same shape while looking
+        like information. Which way somebody is moving is block B's half of the
+        judgement and arrives on motion_type either way.
+        """
+        rulings = {}
+        with self.state_lock:
+            cached = list(self.interaction_cache.items())
+        for pair, result in cached:
+            if result['state'] != 'talking':
+                continue
+            stamp = result['inference_stamp']
+            for member_id in pair:
+                previous = rulings.get(member_id)
+                # Somebody can sit in two confirmed pairs. The newest ruling is
+                # the one that says how recently this was reconfirmed.
+                if (previous is None or
+                        stamp_seconds(stamp) > stamp_seconds(previous[2])):
+                    rulings[member_id] = (
+                        'talking', float(result['confidence']), stamp)
+        return rulings
 
     def assign_track(self, point, stamp_value, used_ids):
         best_id, best_distance = None, self.track_distance
@@ -1032,14 +979,45 @@ class SocialVlmPerception(Node):
         people = People()
         people.header.stamp = rgb_msg.header.stamp
         people.header.frame_id = self.target_frame
+        # Block B's two robot-relative fields need the robot in the same frame
+        # the people end up in. None means the chain is not up yet, and
+        # radial_velocity/motion_type stay at their "not known" values rather
+        # than being filled with a guess that reads like a measurement.
+        robot = self.robot_pose(rgb_msg.header.stamp)
+        # Block C's standing verdicts, read once per frame rather than per
+        # person: the cache is shared and taking its lock inside the detection
+        # loop would serialise every box against the inference thread.
+        rulings = self.scene_rulings()
         markers = MarkerArray()
         annotated = image.copy()
         candidates = []
         new_tracks, used_ids = {}, set()
         stamp_value = stamp_seconds(rgb_msg.header.stamp)
+        # Every point already accepted for tracking this frame.
+        #
+        # YOLO's NMS only drops boxes that overlap heavily in the image; two
+        # boxes on the same person -- torso and whole body, say -- survive it
+        # and land within a few centimetres of each other once projected. Both
+        # reaching assign_track mints a SECOND id for that person, because
+        # used_ids forbids the later box from taking the id the first one just
+        # claimed, and the loser is then coasted for tracking_timeout seconds
+        # as a person in its own right. Measured 31-08-2026 with two people in
+        # the room: 28 ids in 40 s, up to 7 people in one message, and only
+        # 23.6% of messages reporting the right count.
+        #
+        # The coasting loop below already refuses to republish a track sitting
+        # on top of somebody published this frame. This is the same test, at
+        # the same distance, applied to the detections themselves.
+        frame_points = []
 
         if result.boxes is not None:
-            for box in result.boxes:
+            # Highest score first, so the box that survives a merge is the
+            # confident one. Ultralytics already returns NMS output in this
+            # order; sorting makes that a property of this code rather than of
+            # the version installed.
+            for box in sorted(result.boxes,
+                              key=lambda item: float(item.conf[0]),
+                              reverse=True):
                 bbox = tuple(float(value) for value in box.xyxy[0].cpu().tolist())
                 score = float(box.conf[0].cpu())
                 detection = self.make_detection(rgb_msg, bbox, score)
@@ -1059,12 +1037,46 @@ class SocialVlmPerception(Node):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 if point is None:
                     continue
+                if any(math.hypot(point[0] - x, point[1] - y)
+                       < self.duplicate_distance for x, y in frame_points):
+                    cv2.putText(annotated, 'merged',
+                                (int(x1), min(image.shape[0] - 8, int(y2) + 20)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+                    continue
+                frame_points.append((point[0], point[1]))
 
                 track_id, velocity = self.assign_track(
                     point, stamp_value, used_ids)
                 used_ids.add(track_id)
                 new_tracks[track_id] = {
                     'point': point, 'velocity': velocity, 'stamp': stamp_value}
+                # One frame of evidence is not a person.
+                #
+                # Measured 01-09-2026 with two people in the room: a spurious
+                # box seen ONCE at 7.6 m produced a track that was then coasted
+                # for the full tracking_timeout -- 49 messages of /people, six
+                # seconds, from a single frame -- and social_rl's own people
+                # memory held it for seconds longer still. A second phantom
+                # came from two consecutive frames and cost another 49. Raising
+                # yolo_confidence does not reach them: those boxes scored 0.87
+                # and 0.53/0.31, straddling any threshold a real person also
+                # has to pass.
+                #
+                # So gate on evidence rather than on score. An unconfirmed
+                # track stays in self.tracks and keeps counting, but reaches
+                # neither /people nor the coasting loop below. The cost is that
+                # somebody entering frame is published (minimum_track_hits - 1)
+                # frames late, 0.25 s at the 8 Hz measured here; a person who
+                # was already confirmed keeps their count through lost_tracks
+                # and pays it only once.
+                hits = self.track_hits.get(track_id, 0) + 1
+                self.track_hits[track_id] = hits
+                if hits < self.minimum_track_hits:
+                    cv2.putText(annotated,
+                                f'new {hits}/{self.minimum_track_hits}',
+                                (int(x1), min(image.shape[0] - 8, int(y2) + 20)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+                    continue
                 detection.id = f'person_{track_id}'
                 person = Person()
                 person.id = detection.id
@@ -1072,6 +1084,12 @@ class SocialVlmPerception(Node):
                 person.pose.orientation.w = 1.0
                 (person.velocity.linear.x, person.velocity.linear.y,
                  person.velocity.linear.z) = velocity
+                fill_prediction(person, self.prediction_times,
+                                self.prediction_still_speed)
+                if robot is not None:
+                    fill_relative_motion(person, robot,
+                                         self.prediction_still_speed)
+                apply_scene_ruling(person, rulings)
                 people.people.append(person)
                 candidates.append({'person': person, 'bbox': bbox})
                 markers.markers.append(self.person_marker(people.header, person, track_id))
@@ -1104,6 +1122,12 @@ class SocialVlmPerception(Node):
                 # a stranger the moment they are seen again.
                 self.lost_tracks[track_id] = state
                 continue
+            # Never confirmed, and now not seen either: the blip is over.
+            # Coasting it is what turns one stray box into six seconds of
+            # person. Park it where a reappearance can still reclaim the id.
+            if self.track_hits.get(track_id, 0) < self.minimum_track_hits:
+                self.lost_tracks[track_id] = state
+                continue
             # A track sitting on top of somebody already published this frame
             # is a second id for that same person, left over from a frame where
             # association picked the other one. Coasting it would put one
@@ -1122,10 +1146,21 @@ class SocialVlmPerception(Node):
             coasted.pose.orientation.w = 1.0
             (coasted.velocity.linear.x, coasted.velocity.linear.y,
              coasted.velocity.linear.z) = state['velocity']
+            fill_prediction(coasted, self.prediction_times,
+                            self.prediction_still_speed)
+            if robot is not None:
+                fill_relative_motion(coasted, robot,
+                                     self.prediction_still_speed)
+            apply_scene_ruling(coasted, rulings)
             people.people.append(coasted)
             markers.markers.append(
                 self.person_marker(people.header, coasted, track_id))
         self.tracks = new_tracks
+        # Hit counts outlive self.tracks but not lost_tracks, which is what a
+        # reclaimed id needs and all it needs.
+        self.track_hits = {track_id: hits
+                           for track_id, hits in self.track_hits.items()
+                           if track_id in new_tracks or track_id in self.lost_tracks}
         # `annotated` is finished at this point -- every box and label is drawn
         # by the two loops above, and nothing below touches the pixels. Sending
         # it now rather than at the end of the callback means the scene-cleared
@@ -1238,7 +1273,14 @@ class SocialVlmPerception(Node):
         output.encoding = 'bgr8'
         output.is_bigendian = 0
         output.step = output.width * 3
-        output.data = image.tobytes()
+        # array.array('B', ...) rather than bytes: the generated setter for a
+        # uint8[] field returns immediately for an array.array, but validates a
+        # bytes object element by element -- two Python loops over all 921 600
+        # bytes of a 640x480 frame. Measured on this machine: 257 ms per call
+        # against 0.34 ms. Two calls per frame (annotated view and depth
+        # colormap) were 880 ms of every 1215 ms rgb_callback spent, which held
+        # /people to 0.82 Hz and made its stamps older than people_timeout.
+        output.data = array.array('B', image.tobytes())
         return output
 
     def publish_camera_view(self, image, header):
@@ -1418,6 +1460,29 @@ class SocialVlmPerception(Node):
                     self.last_vlm_scenes.pop(pair, None)
 
     def vlm_worker(self):
+        backend = self.load_vlm_backend()
+        if backend is None:
+            return
+        prompt = str(self.get_parameter('talking_prompt').value)
+        self.run_vlm_loop(backend, prompt)
+
+    def load_vlm_backend(self):
+        """Return the object vlm_worker calls .infer() on, or None to give up.
+
+        Both answer the same call, so everything after this point is identical
+        whether the model sits in this process or on another machine.
+        """
+        if self.vlm_remote:
+            if not self.wait_for_remote_worker():
+                self.mark_vlm_load_done(False)
+                return None
+            self.mark_vlm_load_done(True)
+            return self.remote_backend
+
+        # Imported here, not at module scope, so a robot running vlm_remote
+        # never needs transformers, peft or bitsandbytes installed at all.
+        from vlm_backend import VlmBackend
+
         adapter_value = str(self.get_parameter('vlm_adapter_path').value)
         adapter_path = self._resolve_file(adapter_value)
 
@@ -1439,7 +1504,7 @@ class SocialVlmPerception(Node):
             self.get_logger().error(
                 f'VLM adapter not found at {adapter_value}; people localization remains active')
             self.mark_vlm_load_done(False)
-            return
+            return None
         try:
             backend = VlmBackend(
                 adapter_path,
@@ -1459,10 +1524,11 @@ class SocialVlmPerception(Node):
                 f'Unable to load VLM ({type(error).__name__}: {error}); '
                 'people localization remains active')
             self.mark_vlm_load_done(False)
-            return
+            return None
         self.mark_vlm_load_done(True)
+        return backend
 
-        prompt = str(self.get_parameter('talking_prompt').value)
+    def run_vlm_loop(self, backend, prompt):
         while not self.stop_event.is_set():
             try:
                 work = self.work_queue.get(timeout=0.25)
@@ -1585,7 +1651,7 @@ class SocialVlmPerception(Node):
                     # settled decision, not the raw answer: printing "KHÔNG NÓI
                     # CHUYỆN" for an answer that was overruled would contradict
                     # the region still on screen.
-                    if bool(self.get_parameter('log_vlm_results').value):
+                    if self.log_vlm_results:
                         self.log_vlm_result(pair, settled)
 
     def settled_result(self, previous, fresh):
@@ -1711,12 +1777,10 @@ class SocialVlmPerception(Node):
             group.id = f'vlm_social_region_{group_index}'
             group.member_ids = sorted(member_ids)
             group.center = center
-            o_min = float(self.get_parameter('group_o_space_min_radius').value)
-            p_margin = float(self.get_parameter('group_p_space_margin').value)
-            r_margin = float(self.get_parameter('group_r_space_margin').value)
-            group.o_radius = max(o_min, member_radius * 0.5)
-            group.p_radius = max(group.o_radius + 0.15, member_radius + p_margin)
-            group.r_radius = group.p_radius + r_margin
+            group.o_radius = max(self.group_o_min_radius, member_radius * 0.5)
+            group.p_radius = max(group.o_radius + 0.15,
+                                 member_radius + self.group_p_margin)
+            group.r_radius = group.p_radius + self.group_r_margin
             groups.groups.append(group)
             # A translucent disc first, so the region reads as an area from any
             # camera angle. The outlines on top keep the three radii readable.

@@ -1,0 +1,74 @@
+# Khối F: lá chắn an toàn CBF/QP, nằm giữa policy và bánh xe.
+#
+# KHÁC social_velocity_filter.yaml: filter cũ chỉ SCALE lệnh xuống theo khoảng
+# cách, nên nó chỉ biết đi chậm lại trên đúng đường robot đang đi. Lá chắn này
+# ràng buộc TỐC ĐỘ THAY ĐỔI của hàm rào (h_dot >= -alpha*h), nên nó LÁI ĐƯỢC:
+# đi vòng qua vùng ở tốc độ cao là hợp lệ, còn bò thẳng vào vùng thì không.
+#
+# Chạy CÙNG LÚC với filter cũ là sai - hai thứ cùng ghi /cmd_vel_safe. Chọn một.
+social_safety_shield:
+  ros__parameters:
+    use_sim_time: true
+
+    input_topic: /cmd_vel                            # lệnh danh định từ khối E
+    output_topic: /cmd_vel_safe                      # plugin diff_drive nghe đây
+    constraint_field_topic: /social_rl/constraint_field   # khối D
+    scan_topic: /scan                                # khối H
+
+    # Hệ số hàm rào: h_dot >= -alpha * h. alpha là mức độ sẵn sàng cho lề an
+    # toàn co lại. alpha=2.0 nghĩa là lề 0.5 m được phép đóng với 1.0 m/s -
+    # đúng bằng toàn dải tốc độ của base này. Nhỏ hơn = can thiệp sớm hơn.
+    alpha_hard: 2.0        # o-space cuộc trò chuyện
+    alpha_soft: 1.0        # vùng cá nhân, chỉ dùng khi bật bên dưới
+    alpha_obstacle: 2.0    # tường/bàn từ lidar
+
+    # false = đúng mũi tên NÉT ĐỨT trong sơ đồ (ràng buộc xã hội mềm là TÙY
+    # CHỌN). Policy đã bị PHẠT vì vùng cá nhân rồi; lá chắn mà cũng từ chối vào
+    # thì mọi lối đi hẹp thành bế tắc. Vùng `hard` luôn được ràng buộc bất kể
+    # cờ này.
+    enforce_soft_zones: false
+
+    # Điểm được bảo vệ nằm TRƯỚC trục bánh bao nhiêu. Bắt buộc > 0: điểm ngay
+    # trên trục bánh chỉ đi với vận tốc (v, 0), w KHÔNG làm nó dịch chuyển, nên
+    # hàm rào viết trên đó không có số hạng w và QP chỉ biết phanh chứ không
+    # biết lái. Đổi lại: lá chắn canh một điểm phía trước robot chứ không phải
+    # tâm robot, nên giữ nhỏ so với các khoảng cách an toàn bên dưới.
+    lookahead: 0.25
+
+    robot_radius: 0.30            # = obstacle_collision_distance của hàm thưởng
+    maximum_linear_speed: 0.5     # = max_linear_speed trong rl_train.yaml
+    maximum_angular_speed: 1.0
+    allow_reverse: false          # không có cảm biến phía sau
+
+    # Số tia lidar thành ràng buộc. Chỉ những tia GẦN NHẤT mới có thể chặn, mà
+    # mỗi điểm thêm vào thì số cặp trong bước liệt kê tăng bình phương.
+    scan_constraints: 12
+    scan_maximum_range: 3.0
+    # Tia gần hơn mức này LÀ THÂN ROBOT, không phải vật cản. Đo trên
+    # lirs_test.world: 170/360 tia về dưới 0.30 m, và mẫu ĐỐI XỨNG GƯƠNG qua
+    # trục robot - thế giới thì không đối xứng, nên đó là thân xe. Để nguyên
+    # thì mọi tia đó là một hàm rào đã âm sẵn 0.2 m, QP bất khả thi ngay từ
+    # message đầu tiên, và lá chắn phanh chết trong phòng trống.
+    scan_minimum_range: 0.35
+    robot_frame: base_link
+    # Lidar nằm TRƯỚC trục bánh. Đọc range như thể nó bắt đầu ở base_link thì
+    # mọi vật cản gần hơn thực tế đúng bằng khoảng lệch đó. Ở sim đo được
+    # 0.007 m - gần như bằng 0, và chính vì thế nó phải là TRA TF chứ không
+    # phải hằng số: cùng đoạn code này chạy trên base gắn lidar chỗ khác.
+    transform_timeout: 0.05
+
+    field_timeout: 1.0
+    scan_timeout: 0.5
+    input_command_timeout: 0.35   # hết hạn -> phát lệnh 0, không giữ lệnh cũ
+    # ...rồi NGỪNG phát sau ngần này giây. Đủ dài để bánh xe dừng (bánh giữ
+    # lệnh cuối, mà lệnh cuối là 0), đủ ngắn để lá chắn không chiếm
+    # /cmd_vel_safe suốt phần đời còn lại của phiên - chính chuyện đó đã làm
+    # trainer bị đè lệnh bằng 0 mà không có lỗi nào in ra.
+    stop_broadcast_time: 1.0
+    rate: 20.0                    # nhanh gấp 4 lần policy (5 Hz)
+
+    # v và w vào hàm mục tiêu bằng hai đơn vị khác nhau. Cân bằng nhau thì một
+    # chỉnh 1 rad/s trông đắt ngang việc bỏ nửa tốc độ thẳng, và lá chắn sẽ
+    # chọn phanh trong khi lái được. Xoay rẻ hơn đi.
+    linear_weight: 1.0
+    angular_weight: 0.25

@@ -20,11 +20,25 @@
     <origin xyz="0.00669528741938097 -7.83717636255732E-05 0.19525868699062" rpy="0 0 0"/>
   </xacro:property>
 
-  <!-- Unused -->
+  <!-- RGB-D camera carried by the robot, on the front edge of the base cover.
+       This is the only camera the social pipeline reads, so the three numbers
+       matter:
+         z = 0.2225 in base_link is 0.255 m above the ground, and it puts the
+             camera box (0.030 tall) entirely ABOVE the lidar plane at
+             z = 0.19526. Mounting it level with the lidar would make the
+             camera its own permanent obstacle in /scan.
+         x = 0.10  is the front edge of the 0.20 m base, clear of the lidar
+             body (radius 0.04).
+         pitch = -0.20 rad tilts it 11.5 deg UP. At 3 m the 87 x 70 deg frustum
+             then covers the ground up to 3.4 m high, i.e. two whole people; at
+             1.5 m it reaches 1.83 m, chest to neck. Closer than ~1.0 m their
+             heads leave the frame, which is what the VLM needs, so keep the
+             conversation pair at 1.5 m or more. -->
   <xacro:property name="depth_sensor_pose">
-    <origin xyz="0.14 0.0 0.045" rpy="0 0 0"/>
+    <origin xyz="0.10 0.0 0.2225" rpy="0 -0.20 0"/>
   </xacro:property>
 
+  <!-- Unused -->
   <xacro:property name="rear_camera_sensor_pose">
     <origin xyz="-0.14 0.0 0.045" rpy="0 0 3.14159"/>
   </xacro:property>

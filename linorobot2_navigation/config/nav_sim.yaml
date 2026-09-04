@@ -284,10 +284,17 @@ global_costmap:
         prediction_time: 1.5
         moving_prediction_time: 2.5
         moving_speed_threshold: 0.05
-        overlap_escape_clearance: 0.32
+        # Wide enough to clear both the 0.22 m footprint and its inflated
+        # lethal edge when a late VLM result appears around the robot.
+        overlap_escape_clearance: 0.55
         prediction_steps: 3
         o_space_cost: 254
         p_space_cost: 250
+        # A confirmed conversation may not be used as a shortcut. When the
+        # robot is already inside, only the stateful corridor back out is 200.
+        group_p_space_cost: 253
+        group_escape_cost: 200
+        group_escape_corridor_half_width: 0.55
         r_space_cost: 100
         moving_p_space_cost: 252
         moving_r_space_cost: 140
@@ -388,10 +395,13 @@ local_costmap:
         prediction_time: 1.5
         moving_prediction_time: 2.0
         moving_speed_threshold: 0.05
-        overlap_escape_clearance: 0.32
+        overlap_escape_clearance: 0.55
         prediction_steps: 3
         o_space_cost: 254
         p_space_cost: 250
+        group_p_space_cost: 253
+        group_escape_cost: 200
+        group_escape_corridor_half_width: 0.55
         r_space_cost: 100
         moving_p_space_cost: 252
         moving_r_space_cost: 140
