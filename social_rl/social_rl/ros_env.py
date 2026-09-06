@@ -513,12 +513,23 @@ class SocialAvoidEnv(gym.Env):
             if self._free_space is not None:
                 start = self._free_space.sample_pose()
             else:
-                # Position from the fixed list, but yaw over the whole circle:
-                # that is what lets the goal land behind the robot so it has to
-                # learn to turn around. The yaw written in start_poses is
-                # ignored.
+                # Position from the fixed list; yaw is drawn separately (the
+                # yaw written in start_poses is ignored).
+                #
+                # Full circle (-pi, pi) is what lets the goal land behind the
+                # robot so it has to learn to turn around. 04-09-2026: dropped
+                # to (-pi/2, pi/2) as a curriculum step -- none_goal plateaued
+                # ~0.6 across LR, scenario-mix and heading_gain changes with
+                # the full circle, and goals sit roughly towards +x/+y from
+                # every start pose, so full-circle yaw was spending a lot of
+                # episodes on a near-180 deg pivot (~16 control steps at
+                # max_angular_speed 1.0) before any progress reward was
+                # reachable. Narrower range still asks for real turning (up to
+                # ~90 deg) without that worst case. Widen back towards the
+                # full circle once none_goal recovers past 0.90.
                 pose = random.choice(self.env_config.start_poses)
-                start = (pose[0], pose[1], random.uniform(-math.pi, math.pi))
+                start = (pose[0], pose[1],
+                        random.uniform(-math.pi / 2, math.pi / 2))
             self._world.teleport_robot(float(start[0]), float(start[1]),
                                        float(start[2]))
             # The reseeded EKF and AMCL need a few cycles before TF reports the

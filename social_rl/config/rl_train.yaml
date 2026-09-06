@@ -454,10 +454,26 @@ env:
   # K_soc sống. Độ phủ 4-loại mỗi rollout tụt còn 23.6-40.8% -> `scenario/*_goal`
   # ba loại xã hội giật, nhưng tiêu chí pha này là none_goal (67% tập, ổn định).
   # none_goal hồi > 0.90 với random yaw -> đổi lại 1:1:1:1 rồi --resume, dạy né.
+  #
+  # --- 05-09-2026: ĐIỀU KIỆN ĐẠT, VỀ 1:1:1:1 ---
+  # Run 20260904_220443 (resume checkpoint 100k, yaw thu hẹp (-pi/2, pi/2) thay
+  # vì cả vòng tròn, heading_gain trả về 5.0): none_goal ổn định 0.77-1.00 suốt
+  # 80k step, --eval 20 tập deterministic trên checkpoint 160000 ra none_goal
+  # 93.3% (n=15) > 0.90. Về 1:1:1:1 để 4 loại kịch bản chia đều gradient cho
+  # K_soc, bắt đầu dạy né. checkpoint 160000 được chọn qua --eval (không phải
+  # final_model.zip - final_model FAIL cổng intrusion_gap: 0.202, dấu hiệu
+  # "quay camera né người thay vì né người thật" trên scenario crossing).
+  #
+  # --- 05-09-2026, CÙNG NGÀY: NHẢY THẲNG 1:1:1:1 THẤT BẠI, LÙI VỀ 3:1:1:1 ---
+  # Run 20260905_091740 (resume 160000, +80k step ở 1:1:1:1): --eval-episodes 40
+  # deterministic trên checkpoint 235000 và final_model đều FAIL, và TỆ HƠN hẳn
+  # 160000 lúc xuất phát - peak_intrusion 0.317 so với 0.081 của 160000 (đo lại
+  # cùng lúc, cùng mix). none 67% -> 25% đổi một phát là quá đột ngột: tỉ lệ tập
+  # có người tăng hơn gấp đôi (33% -> 75%) trong khi social_penalty không đổi,
+  # rơi vào đúng kịch bản "học tệ hơn" chứ không phải "học né". Về 3:1:1:1
+  # (`none` 50%, giữa 67% và 25%) làm bước đệm, cùng với tăng social_penalty
+  # bên dưới để phần thưởng né mạnh hơn ngay cả khi tập có người ít gặp hơn.
   scenarios:
-    - none
-    - none
-    - none
     - none
     - none
     - none
@@ -632,7 +648,16 @@ reward:
   # 0.1 m, được +4.0 progress trừ -0.8 step penalty; đi xuyên giữa vùng thì
   # -4.8 mỗi step. Vẫn lỗ, đủ để đi vòng có lợi hơn, nhưng CÓ CHẶN TRÊN - không
   # cắt tập và cuốn theo mọi điểm tập đó còn có thể kiếm được.
-  social_penalty: -8.0
+  #
+  # -8.0 -> -12.0 (05-09-2026). Run 20260905_091740 (resume 160000, 80k step ở
+  # 1:1:1:1, social_penalty vẫn -8.0): --eval-episodes 40 ra peak_intrusion
+  # 0.317, TỆ HƠN 160000 lúc xuất phát (0.081) - xuyên thẳng qua vùng người rẻ
+  # hơn hẳn so với vòng tránh với đúng mức phạt này khi tập có người dày hơn.
+  # -12.0: đi xuyên hết tốc độ giờ lỗ -8.8/step (+4.0 progress -0.8 step -12.0
+  # social) thay vì -4.8, nặng hơn ~1.8 lần nhưng vẫn KHÔNG kết thúc tập, không
+  # tạo vách vực như luật va-người cũ (xem ghi chú obstacle_collision_penalty ở
+  # trên) - chỉ đẩy điểm hoà vốn nghiêng hẳn về phía đi vòng.
+  social_penalty: -12.0
 
   # --- shaping: hai thứ duy nhất giữ cho bài toán học được ---
   # progress_gain là thứ DUY NHẤT làm robot chịu đi. 40 * 1 m = 40 = 1/5 phần
@@ -657,6 +682,16 @@ reward:
   # lãi (đủ để học), nhưng vẫn nhỏ hơn nhiều progress (+4.0/bước full speed) nên
   # ở gần góc 0 progress lấn át, không méo hành vi lái thẳng. Đối xứng (lắc để
   # cày = 0 ròng). Để 0.0 là quay lại reward trước 02-09.
+  #
+  # 5.0 -> 9.0 -> 5.0 (04-09-2026, cùng ngày): thử 9.0 resume từ checkpoint
+  # 142500 (run 20260904_115329), +43k step (run 20260904_171308). Tệ hơn 5.0
+  # ở MỌI chỉ số: none_goal 0.62 -> 0.42-0.55 (đi xuống, không phải đi lên),
+  # timeout 0.05 -> 0.25-0.30, ep_len_mean 85 -> 116-125, ep_rew_mean 160 -> 108.
+  # Cú thưởng canh-hướng một lần lớn hơn (+9*pi/2 mỗi lần thẳng hướng) có vẻ làm
+  # policy rụt rè với đoạn chạy sau đó thay vì cam kết - lê tới timeout thay vì
+  # liều đâm. Trả lại 5.0. Nút thắt none_goal không nằm ở heading_gain: đã thử
+  # 3.0/5.0/9.0, LR 3e-4/1e-4, scenario 1:1:1:1/6:1:1:1, đều plateau ~0.6. Đang
+  # chuyển hướng sang curriculum yaw khởi động (xem sample yaw trong ros_env.py).
   heading_gain: 5.0
 
   # ĐÃ BỎ angular_penalty và smoothness_penalty. Cả hai đánh vào đúng hành vi
