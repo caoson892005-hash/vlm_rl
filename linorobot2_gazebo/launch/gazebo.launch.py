@@ -59,7 +59,7 @@ def generate_launch_description():
     )
 
     world_path = PathJoinSubstitution(
-        [FindPackageShare("linorobot2_gazebo"), "worlds", "lirs_test.world"]
+        [FindPackageShare("linorobot2_gazebo"), "worlds", "bookstore.world"]
     )
 
     # Character meshes the animated-people plugin loads for the actors in

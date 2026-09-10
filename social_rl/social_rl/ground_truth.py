@@ -43,7 +43,7 @@ from social_rl.ros_interface import visible_to_camera
 # separately, because "I could not tell" is a different failure from "I read it
 # wrong", and block D treats it differently -- '' selects the neutral (1,1,1)
 # scales rather than another situation's shape.
-VLM_LABELS = ('talking', 'backs_turned', 'crossing', 'approaching', 'walking')
+VLM_LABELS = ('talking', 'backs_turned', 'passing', 'walking')
 
 
 class SimulatedVLM:

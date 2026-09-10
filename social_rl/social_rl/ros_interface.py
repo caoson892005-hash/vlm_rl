@@ -254,8 +254,10 @@ class EnvConfig:
     # Repeat a name to weight it. `none` is an episode with nobody in it, kept
     # in the mix so the policy does not learn that there is always somebody to
     # avoid and stop trusting an empty field.
+    # Three situations since 10-09-2026: `talking`, `passing` (crossing and
+    # approaching merged), and `none`. rl_train.yaml sets the real mix.
     scenarios: list = field(default_factory=lambda: [
-        'talking', 'crossing', 'approaching', 'backs_turned', 'none'])
+        'none', 'none', 'none', 'talking', 'passing', 'passing'])
     # Seconds of simulated time to let the actors settle into the new scene
     # before the first observation. Walkers start at the edge and the plugin
     # needs a publish period or two to report a velocity for them at all.

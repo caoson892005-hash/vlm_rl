@@ -37,6 +37,13 @@ public:
     disperse_duration_ = sdf->Get<double>("disperse_duration", 8.0).first;
     away_duration_ = sdf->Get<double>("away_duration", 20.0).first;
 
+    // World z the actors' feet should rest on. The placement constants below
+    // add this to each mesh's own root height. 0.20 is the value the cafe was
+    // tuned against (custom_wood_floor top at z=0); measured 10-09-2026 the
+    // toe bones then sit at z~0.195. bookstore.world sets it to 0.0 so the feet
+    // meet the retail floor, whose visible surface is at z~0.
+    actor_ground_z_ = sdf->Get<double>("actor_ground_z", 0.20).first;
+
     // How far apart the two people stand while talking, centre to centre.
     //
     // This decides whether the robot can physically drive between them, which
@@ -218,7 +225,7 @@ private:
     const std::string & scene_type = "talking")
   {
     talking_actors_.push_back({
-      name, x, y, 0.20 + root_height, yaw, root_roll,
+      name, x, y, actor_ground_z_ + root_height, yaw, root_roll,
       animation_duration, phase_offset, facing_yaw, scene_type});
   }
 
@@ -227,8 +234,11 @@ private:
     const std::vector<WalkingWaypoint> & waypoints,
     const std::string & scene_type = "walking",
     bool loop = true,
-    double z = 0.20)
+    double z = -1.0)
   {
+    if (z < 0.0) {
+      z = actor_ground_z_;
+    }
     if (waypoints.size() < 2 || waypoints.front().time != 0.0) {
       gzerr << "Walking actor [" << actor_name <<
         "] needs at least two waypoints and must start at time 0\n";
@@ -537,7 +547,7 @@ private:
         std::fmod(phase_time + offset, animation.duration));
       person.actor->SetWorldPose(
         ignition::math::Pose3d(
-          x, y, 0.20 + animation.root_height,
+          x, y, actor_ground_z_ + animation.root_height,
           animation.root_roll, 0.0, yaw),
         false, false);
       MoveProxy(person.name, x, y, kProxyCentre);
@@ -876,7 +886,11 @@ private:
       double centre_y = 0.0;
       RoutePoint(ratio, 0.0, &centre_x, &centre_y);
       WalkLine(
-        kWalkers[index], "crossing",
+        // scene_type "passing": crossing and approaching were merged into one
+        // label 10-09-2026. The two spawn geometries stay separate so a manual
+        // `crossing` / `approaching` command still lays out the shape it names,
+        // but the ground truth reports the single situation the policy sees.
+        kWalkers[index], "passing",
         centre_x + side * reach * std::cos(sideways),
         centre_y + side * reach * std::sin(sideways),
         centre_x - side * reach * std::cos(sideways),
@@ -921,7 +935,7 @@ private:
       RoutePoint(NextUniform(0.95, 1.15), offset, &from_x, &from_y);
       RoutePoint(NextUniform(-0.25, -0.05), offset, &to_x, &to_y);
       WalkLine(
-        kWalkers[index], "approaching", from_x, from_y, to_x, to_y,
+        kWalkers[index], "passing", from_x, from_y, to_x, to_y,
         NextUniform(0.5, 0.9));
     }
     spawned_ = true;
@@ -1116,6 +1130,15 @@ private:
     }
     if (scenario == "talking") {
       SpawnTalkingPeople();
+    } else if (scenario == "passing") {
+      // The RL mix now asks for one merged "somebody walks past" situation.
+      // Half the episodes get the crossing geometry, half the head-on one;
+      // both publish scene_type "passing".
+      if (NextUniform(0.0, 1.0) < 0.5) {
+        SpawnCrossingPeople();
+      } else {
+        SpawnApproachingPeople();
+      }
     } else if (scenario == "crossing") {
       SpawnCrossingPeople();
     } else if (scenario == "approaching") {
@@ -1129,7 +1152,8 @@ private:
       SpawnPeople();
     } else {
       gzerr << "Unknown scenario [" << scenario << "]. Known: talking, "
-        "crossing, approaching, backs_turned, gathering, static_pair, none\n";
+        "passing, crossing, approaching, backs_turned, gathering, static_pair, "
+        "none\n";
     }
   }
 
@@ -1190,6 +1214,7 @@ private:
   std::mutex actor_mutex_;
   std::mt19937 rng_{std::random_device{}()};
   bool spawned_{false};
+  double actor_ground_z_{0.20};
   double approach_duration_{8.0};
   double talk_duration_{60.0};
   double disperse_duration_{8.0};

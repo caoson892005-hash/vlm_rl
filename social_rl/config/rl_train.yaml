@@ -305,9 +305,15 @@ env:
   # 28-08-2026: THU HẸP CÒN BA TÌNH HUỐNG XÃ HỘI theo yêu cầu - crossing,
   # talking, approaching. `backs_turned` train sau.
   #
-  # `approaching` CHÍNH LÀ "người đi tiến tới đối diện robot": nó cho người đi
-  # ngược chiều thẳng vào robot, head on, nên tốc độ tiếp cận là tổng hai bên.
-  # Không cần viết case mới cho việc đó.
+  # 10-09-2026: GỘP `crossing` + `approaching` -> `passing`. Chuyển sang train ở
+  # map bookstore. Còn ba case: talking / passing / none. Plugin vẫn dựng cả
+  # hai hình học (50/50 mỗi tập `passing`); ground truth và trường ràng buộc
+  # chỉ thấy một nhãn `passing` (lấy hệ số của `crossing` cũ:
+  # constraint_field.DEFAULT_SCENE_SCALES). Lệnh `crossing` / `approaching`
+  # thủ công vẫn chạy để test hình học riêng.
+  #
+  # `passing` CHÍNH LÀ "người đi ngang qua": cắt ngang tuyến hoặc đi thẳng vào
+  # robot. Không cần viết case mới cho việc đó.
   #
   # `none` KHÔNG PHẢI tình huống thứ tư mà là ĐỐI CHỨNG: nó là tập DUY NHẤT dạy
   # policy rằng trường ràng buộc rỗng nghĩa là cứ đi thẳng. Không có nó, policy
@@ -478,8 +484,8 @@ env:
     - none
     - none
     - talking
-    - crossing
-    - approaching
+    - passing
+    - passing
   scenario_settle_time: 0.6
 
   # Toạ độ trong frame `map` (robot spawn ở world (-3, -2) nên map = world + 3, +2).
@@ -600,8 +606,7 @@ observation:
     scene_scales:
       talking:      [1.25, 1.0, 0.90]   # đang bận nói chuyện, vùng nghiêng về phía người kia
       backs_turned: [1.00, 0.9, 0.45]   # quay lưng lại - đi vòng ra sau là ĐÚNG phép, nên cắt mạnh vùng sau
-      crossing:     [1.10, 1.35, 0.80]  # cắt ngang - đoán sai tốc độ thì hậu quả là đứng CẠNH họ
-      approaching:  [1.50, 1.0, 0.70]   # đối đầu - tốc độ tiếp cận là tổng hai bên, cần vùng trước rộng nhất
+      passing:      [1.10, 1.35, 0.80]  # người đi ngang qua (10-09-2026 gộp crossing+approaching, lấy hệ số crossing)
       walking:      [1.15, 1.0, 0.85]
       '':           [1.00, 1.0, 1.00]   # không biết gì (chạy khi chưa có khối C)
 

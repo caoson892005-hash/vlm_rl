@@ -5,13 +5,14 @@
 
 source install/setup.bash
 ros2 topic pub --once /animated_people/scenario std_msgs/msg/String "{data: talking}"
-ros2 topic pub --once /animated_people/scenario std_msgs/msg/String "{data: crossing}"
-ros2 topic pub --once /animated_people/scenario std_msgs/msg/String "{data: approaching}"
+ros2 topic pub --once /animated_people/scenario std_msgs/msg/String "{data: passing}"       # 50/50 crossing|approaching, nhãn "passing"
+ros2 topic pub --once /animated_people/scenario std_msgs/msg/String "{data: crossing}"      # hình học cắt ngang (nhãn vẫn "passing")
+ros2 topic pub --once /animated_people/scenario std_msgs/msg/String "{data: approaching}"   # hình học đối đầu   (nhãn vẫn "passing")
 ros2 topic pub --once /animated_people/scenario std_msgs/msg/String "{data: backs_turned}"
 ros2 topic pub --once /animated_people/scenario std_msgs/msg/String "{data: none}"        # dọn sạch
 
 while true; do
-  ros2 topic pub -t 3 /animated_people/scenario std_msgs/msg/String "{data: crossing}" >/dev/null
+  ros2 topic pub -t 3 /animated_people/scenario std_msgs/msg/String "{data: passing}" >/dev/null
   sleep 7
 done
 
@@ -120,8 +121,9 @@ Khối B giờ xuất đủ bốn thứ, GIỐNG NHAU ở cả sim lẫn robot t
  ĐẦU RA KHỐI C  (Person.msg)  -  cập nhật 28-08-2026
 -------------------------------------------------------------------------------
 
-    scene_type          ngữ cảnh xã hội: talking | backs_turned | crossing |
-                        approaching | walking | "" (không biết)
+    scene_type          ngữ cảnh xã hội: talking | backs_turned | passing |
+                        walking | "" (không biết)
+                        (10-09-2026: crossing + approaching gộp thành passing)
     scene_confidence    [0,1]. 1.0 = ground truth Gazebo (KHÔNG phải ước lượng
                         - kịch bản do chính plugin chọn). 0.0 = không có phán
                         đoán nào: khối C tắt, hoặc nó trả lời "unknown"
@@ -457,8 +459,8 @@ vị trí, CÙNG vận tốc, nhưng scene_type khác thì vùng khác:
     scene_type      [trước, ngang, sau]   lý do
     talking         1.25  1.00  0.90      đang bận, vùng nghiêng về phía đối phương
     backs_turned    1.00  0.90  0.45      quay lưng - đi vòng ra sau là ĐÚNG phép
-    crossing        1.10  1.35  0.80      đoán sai tốc độ thì hậu quả là đứng CẠNH họ
-    approaching     1.50  1.00  0.70      đối đầu, tốc độ tiếp cận là tổng hai bên
+    passing         1.10  1.35  0.80      người đi ngang qua (10-09-2026 gộp
+                                          crossing+approaching, lấy hệ số crossing)
     walking         1.15  1.00  0.85
     ''              1.00  1.00  1.00      chưa có khối C thì rơi vào đây
 
@@ -523,8 +525,7 @@ HAI LOẠI VÙNG compile_zones sinh ra. Chúng CHỒNG LÊN nhau và gộp bằn
 
         talking         1.875  1.000  0.675
         backs_turned    1.500  0.900  0.3375
-        crossing        1.650  1.350  0.600
-        approaching     2.250  1.000  0.525
+        passing         1.650  1.350  0.600
         walking         1.725  1.000  0.6375
         ''              1.500  1.000  0.750
 

@@ -59,8 +59,8 @@ string motion_type
 # Values used by social_rl/constraint_field.py:
 #   talking       standing in a conversation with somebody else
 #   backs_turned  facing away from the robot; passing behind is acceptable
-#   crossing      walking across the robot's path
-#   approaching   walking towards the robot, roughly head on
+#   passing       walking past: across the robot's path or roughly head on
+#                 (crossing and approaching merged 10-09-2026)
 #   walking       moving, but none of the above
 #
 # Empty means "unknown". Block D then infers it from the relative geometry,

@@ -67,17 +67,16 @@ DEFAULT_PREDICTION_TIMES = (0.0, 0.5, 1.0, 1.5, 2.0)
 #                 partner, and the pair also gets a shared o-space below.
 #   backs_turned  Facing away. Passing behind is the socially correct move, so
 #                 the rear reach is cut hard while the front is left alone.
-#   crossing      Moving across the robot's path. Widened sideways: the cost of
-#                 guessing their speed wrong is being beside them, not behind.
-#   approaching   Closing head on. The front reach is the largest of any type,
-#                 because the closing speed is the sum of both.
+#   passing       Somebody walking past, crossing the path or closing head on.
+#                 Merged from `crossing` and `approaching` 10-09-2026; kept the
+#                 crossing multipliers, so the region is widened sideways
+#                 because the field is built before the direction is settled.
 #   walking       Moving, nothing more known about it.
 #   ''            Nothing known at all -- what a run without block C gets.
 DEFAULT_SCENE_SCALES = {
     'talking': (1.25, 1.0, 0.9),
     'backs_turned': (1.0, 0.9, 0.45),
-    'crossing': (1.1, 1.35, 0.8),
-    'approaching': (1.5, 1.0, 0.7),
+    'passing': (1.1, 1.35, 0.8),
     'walking': (1.15, 1.0, 0.85),
     '': (1.0, 1.0, 1.0),
 }
@@ -397,7 +396,7 @@ def compile_zones(people, config: ConstraintFieldConfig, *,
     conversation correctly bought the least protection of any answer -- and the
     better block C gets, the more often that hole is the one the robot drives
     through. The union keeps the o-space at 1.000 and puts the flank back to
-    0.200; `backs_turned`, `crossing`, `approaching` and the empty label are
+    0.200; `backs_turned`, `passing`, `walking` and the empty label are
     bit-identical either way, since only `talking` ever forms a group.
 
     The group zone is a bounding ellipse rather than the bare o-space disc for
