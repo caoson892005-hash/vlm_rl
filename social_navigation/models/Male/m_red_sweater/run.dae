@@ -12,31 +12,31 @@
   </asset>
   <library_images>
     <image id="young_lightskinned_male_diffuse" name="young_lightskinned_male_diffuse">
-      <init_from>textures/young_lightskinned_male_diffuse.png</init_from>
+      <init_from>/m_red_sweater/textures/young_lightskinned_male_diffuse.png</init_from>
     </image>
     <image id="short03_diffuse" name="short03_diffuse">
-      <init_from>textures/short03_diffuse.png</init_from>
+      <init_from>/m_red_sweater/textures/short03_diffuse.png</init_from>
     </image>
     <image id="brown_eye" name="brown_eye">
-      <init_from>textures/brown_eye.png</init_from>
+      <init_from>/m_red_sweater/textures/brown_eye.png</init_from>
     </image>
     <image id="eyebrow001" name="eyebrow001">
-      <init_from>textures/eyebrow001.png</init_from>
+      <init_from>/m_red_sweater/textures/eyebrow001.png</init_from>
     </image>
     <image id="sneaker_brown_diffuse" name="sneaker_brown_diffuse">
-      <init_from>textures/sneaker_brown_diffuse.PNG</init_from>
+      <init_from>/m_red_sweater/textures/sneaker_brown_diffuse.PNG</init_from>
     </image>
     <image id="Knitted_Sweater_02_NRM" name="Knitted_Sweater_02_NRM">
-      <init_from>textures/Knitted_Sweater_02_NRM.png</init_from>
+      <init_from>/m_red_sweater/textures/Knitted_Sweater_02_NRM.png</init_from>
     </image>
     <image id="Knitted_Sweater_02" name="Knitted_Sweater_02">
-      <init_from>textures/Knitted_Sweater_02.png</init_from>
+      <init_from>/m_red_sweater/textures/Knitted_Sweater_02.png</init_from>
     </image>
     <image id="M_Trousers_01_NRM" name="M_Trousers_01_NRM">
-      <init_from>textures/M_Trousers_01_NRM.png</init_from>
+      <init_from>/m_red_sweater/textures/M_Trousers_01_NRM.png</init_from>
     </image>
     <image id="M_Trousers_01" name="M_Trousers_01">
-      <init_from>textures/M_Trousers_01.png</init_from>
+      <init_from>/m_red_sweater/textures/M_Trousers_01.png</init_from>
     </image>
   </library_images>
   <library_effects>

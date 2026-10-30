@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""Localize people with RGB-D and use a Qwen2-VL LoRA to detect conversations."""
+"""Localize people from RGB-D with YOLO detection."""
 
-import array
 import copy
 import contextlib
 import json
 import math
-import os
 import queue
 import re
 import threading
 import time
 import unicodedata
 import warnings
+from collections import deque
 from enum import IntEnum
 from pathlib import Path
 
@@ -26,7 +25,6 @@ import cv2
 import numpy as np
 import rclpy
 from ament_index_python.packages import get_package_share_directory
-from geometry_msgs.msg import Point, Pose
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
@@ -37,20 +35,24 @@ from rclpy.qos import (
     QoSProfile,
     ReliabilityPolicy,
 )
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import Bool, Empty
+from geometry_msgs.msg import Point
+from std_msgs.msg import Bool, Empty, String
 from tf2_ros import Buffer, TransformException, TransformListener
 from ultralytics import YOLO
 from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithPose
 from visualization_msgs.msg import Marker, MarkerArray
 
 from social_perception.msg import (
-    Group,
-    Groups,
+    Keypoint2D,
+    Keypoint3D,
     People,
+    PeopleObservations,
+    PeopleOrientations,
     Person,
-    VlmRequest,
-    VlmResponse,
+    PersonObservation,
+    PersonOrientation,
     TalkingInteraction,
     TalkingInteractions,
 )
@@ -74,95 +76,15 @@ def rotate_vector(vector, quaternion):
     )
 
 
-# cos(45 degrees), the half-angle of the head-on cone. Must stay equal to
-# kHeadOnCosine in linorobot2_gazebo/src/animated_people_release.cpp: a policy
-# trained on one definition of "walking towards the robot" and run on another
-# is being lied to about the situation it is in.
-HEAD_ON_COSINE = 0.7071067811865476
+def yaw_quaternion(yaw):
+    """Quaternion for a yaw-only orientation in the navigation frame."""
+    half_yaw = 0.5 * yaw
+    return 0.0, 0.0, math.sin(half_yaw), math.cos(half_yaw)
 
 
-def fill_prediction(person, times, still_speed):
-    """Block B's short-horizon trajectory, constant velocity.
-
-    Mirrors FillPrediction in the Gazebo plugin. The first sample is t = 0.0
-    and repeats the present pose, so block D reads the instant it charges the
-    reward at out of the same array as the instants it rasterises.
-    """
-    vx = person.velocity.linear.x
-    vy = person.velocity.linear.y
-    moving = math.hypot(vx, vy) >= still_speed
-    # Direction of travel once somebody is walking; whatever facing the
-    # producer reported while they stand still. This node has no facing
-    # estimate, so a standing person keeps orientation 0 -- see the comment on
-    # facing in the detection loop.
-    heading = (math.atan2(vy, vx) if moving
-               else quaternion_yaw(person.pose.orientation))
-    for horizon in times:
-        pose = Pose()
-        pose.position.x = person.pose.position.x + (vx * horizon if moving else 0.0)
-        pose.position.y = person.pose.position.y + (vy * horizon if moving else 0.0)
-        pose.orientation.z = math.sin(heading / 2.0)
-        pose.orientation.w = math.cos(heading / 2.0)
-        person.prediction_times.append(float(horizon))
-        person.predicted_poses.append(pose)
-
-
-def fill_relative_motion(person, robot, still_speed):
-    """Block B's motion labels, measured against the robot.
-
-    Mirrors FillRelativeMotion in the Gazebo plugin. `robot` is (x, y, yaw) in
-    the same frame the person is expressed in.
-    """
-    vx = person.velocity.linear.x
-    vy = person.velocity.linear.y
-    speed = math.hypot(vx, vy)
-    if speed < still_speed:
-        person.radial_velocity = 0.0
-        person.motion_type = 'static'
-        return
-
-    robot_x, robot_y, robot_yaw = robot
-    dx = person.pose.position.x - robot_x
-    dy = person.pose.position.y - robot_y
-    # A person on top of the robot has no defined direction; the guard keeps
-    # the division finite, and at that range there is nothing to decide.
-    distance = max(math.hypot(dx, dy), 1e-6)
-    radial = (vx * dx + vy * dy) / distance
-    person.radial_velocity = float(radial)
-
-    along = radial / speed
-    if along < -HEAD_ON_COSINE:
-        person.motion_type = 'head_on'
-    elif along > HEAD_ON_COSINE:
-        person.motion_type = 'receding'
-    else:
-        # Sideways component in the ROBOT's frame, where +y is its left.
-        sideways = -math.sin(robot_yaw) * vx + math.cos(robot_yaw) * vy
-        person.motion_type = 'left_to_right' if sideways < 0.0 else 'right_to_left'
-
-
-def apply_scene_ruling(person, rulings):
-    """Write block C's verdict onto a person, or leave the neutral default.
-
-    Absent ruling means block C said nothing about this person, which is not
-    the same as it saying "nothing social is happening" -- both land on an
-    empty scene_type, but only the second is a measurement, and neither gives
-    block D anything but its neutral region shape.
-    """
-    ruling = rulings.get(person.id)
-    if ruling is None:
-        return
-    person.scene_type = ruling[0]
-    person.scene_confidence = ruling[1]
-    # Copied, not referenced: assigning a message field stores the object
-    # itself, and this stamp belongs to a cached decision later frames read.
-    person.scene_stamp = copy.deepcopy(ruling[2])
-
-
-def quaternion_yaw(orientation):
-    return math.atan2(
-        2.0 * (orientation.w * orientation.z + orientation.x * orientation.y),
-        1.0 - 2.0 * (orientation.y ** 2 + orientation.z ** 2))
+def wrap_angle(angle):
+    """Normalize an angle to [-pi, pi]."""
+    return math.atan2(math.sin(angle), math.cos(angle))
 
 
 def normalized_text(value):
@@ -224,151 +146,357 @@ def talking_from_response(response):
     return False, 0.0
 
 
-class RemoteVlmBackend:
-    """Ask another machine the question a local VlmBackend would answer.
+# ---------------------------------------------------------------------------
+# LEGACY / DISABLED VLM SUPPORT
+#
+# The classes and helpers in this section are retained only so an old trained
+# Qwen adapter can be restored deliberately in a future experiment.  The
+# runtime path below forces ``self.vlm_enabled`` to False, does not start this
+# worker, and does not enqueue RGB crops.  Nav2 must not depend on this code.
+# ---------------------------------------------------------------------------
 
-    Deliberately the same call signature as VlmBackend.infer, and blocking in
-    the same way, because vlm_worker is what enforces every rule around the
-    answer: which pair is worth asking about, what a newer camera frame
-    invalidates, how much a contrary reply is worth against a region already on
-    the costmap. None of that may be duplicated on the other machine, so only
-    the sentence "run the model on this crop" crosses the network.
 
-    The exchange is deliberately one question at a time. vlm_worker is a single
-    thread that blocks here until the answer arrives, so a request id is enough
-    to recognise a late reply to a question already given up on.
+class VlmProgress:
+    """Log stage-based VLM progress while blocking native operations run.
+
+    Transformers does not expose byte-level progress callbacks for cached
+    checkpoints. Percentages therefore describe completed initialization
+    stages. A heartbeat repeats the current stage and elapsed time so a long
+    ``from_pretrained`` call is visibly alive without pretending to know its
+    remaining duration.
     """
 
-    def __init__(self, node, request_pub, timeout, jpeg_quality):
-        self.node = node
-        self.request_pub = request_pub
-        self.timeout = timeout
-        self.jpeg_quality = jpeg_quality
-        # Read by the camera thread for the latency overlay, exactly as the
-        # local backend's is. The three parts are measured on the workstation;
-        # the gap between their sum and the round trip vlm_worker measures is
-        # what the network and the JPEG cost.
-        self.last_timing = (0.0, 0.0, 0.0, 0)
+    def __init__(self, logger, label, initial_stage,
+                 heartbeat_seconds=10.0, bar_width=20):
+        self.logger = logger
+        self.label = label
+        self.heartbeat_seconds = heartbeat_seconds
+        self.bar_width = bar_width
+        self.started_at = time.monotonic()
+        self.percent = 0
+        self.stage = initial_stage
         self.lock = threading.Lock()
-        self.pending_id = None
-        self.pending_response = None
-        self.answered = threading.Event()
-        self.sequence = 0
+        self.stop_event = threading.Event()
+        self.thread = None
 
-    def handle_response(self, message):
+    def start(self):
+        self._log()
+        self.thread = threading.Thread(
+            target=self._heartbeat,
+            name='vlm-load-progress',
+            daemon=True,
+        )
+        self.thread.start()
+
+    def update(self, percent, stage):
         with self.lock:
-            if message.request_id != self.pending_id:
-                # A reply to a question this side already timed out on. Acting
-                # on it would attach an answer to whatever pair is being asked
-                # about now.
-                return
-            self.pending_response = message
-        self.answered.set()
+            self.percent = max(self.percent, min(100, int(percent)))
+            self.stage = stage
+        self._log()
+
+    def complete(self, stage):
+        self.update(100, stage)
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+
+    def fail(self, error):
+        with self.lock:
+            self.stage = f'FAILED: {type(error).__name__}: {error}'
+        self._log()
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+
+    def _heartbeat(self):
+        while not self.stop_event.wait(self.heartbeat_seconds):
+            self._log()
+
+    def _log(self):
+        with self.lock:
+            percent = self.percent
+            stage = self.stage
+        completed = int(round(self.bar_width * percent / 100.0))
+        bar = '#' * completed + '-' * (self.bar_width - completed)
+        elapsed = time.monotonic() - self.started_at
+        try:
+            self.logger.info(
+                f'{self.label} [{bar}] {percent:3d}% | {stage} | '
+                f'elapsed={elapsed:.0f}s')
+        except Exception:
+            # Shutdown may invalidate the ROS context while a native model
+            # loader is still returning from a background thread.
+            pass
+
+
+class VlmBackend:
+    """Standard Transformers/PEFT loader for the supplied Qwen2-VL adapter."""
+
+    # Generation, not the image, dominates latency on a small GPU: measured on
+    # a Quadro T1000 the prefill costs ~1.8 s and every further decode step
+    # ~0.36 s, so the 7-token answer `{"talking":"Không"}` spent ~2.2 s writing
+    # punctuation the prompt already dictates. Teacher-forcing that punctuation
+    # leaves only the decisive word to generate.
+    ANSWER_PREFIX = '{"talking":"'
+    # Enough for the longest tokenization of either word ('KH','Ô','NG'); the
+    # shorter ones simply run into the closing quote, which is cut off below.
+    PREFIX_ANSWER_TOKENS = 3
+
+    def __init__(self, adapter_path, base_model, load_in_4bit, require_cuda,
+                 max_new_tokens, min_pixels, max_pixels, logger,
+                 execution_lock=None, force_answer_prefix=True):
+        self.logger = logger
+        self.execution_lock = execution_lock
+        self.force_answer_prefix = force_answer_prefix
+        progress = VlmProgress(
+            logger, 'VLM LOAD', 'Starting VLM initialization')
+        progress.start()
+        try:
+            progress.update(5, 'Checking Pillow compatibility')
+            # Ubuntu 22.04 provides Pillow 9.0.1, whose resampling constants
+            # live directly on PIL.Image. New Transformers expects the enum
+            # introduced in Pillow 9.1. This alias is API-compatible and
+            # avoids a misleading downstream PEFT import error.
+            from PIL import Image as PilImageModule
+            if not hasattr(PilImageModule, 'Resampling'):
+                class PillowResampling(IntEnum):
+                    NEAREST = PilImageModule.NEAREST
+                    LANCZOS = PilImageModule.LANCZOS
+                    BILINEAR = PilImageModule.BILINEAR
+                    BICUBIC = PilImageModule.BICUBIC
+                    BOX = PilImageModule.BOX
+                    HAMMING = PilImageModule.HAMMING
+
+                PilImageModule.Resampling = PillowResampling
+
+            progress.update(10, 'Importing PyTorch')
+            import torch
+            progress.update(20, 'Importing PEFT and Transformers')
+            from peft import PeftModel
+            from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+            from transformers.utils import logging as transformers_logging
+            transformers_logging.set_verbosity_error()
+            progress.update(30, 'ML libraries imported')
+
+            self.torch = torch
+            self.max_new_tokens = max_new_tokens
+            self.min_pixels = min_pixels
+            self.max_pixels = max_pixels
+            use_cuda = torch.cuda.is_available()
+            progress.update(
+                32, f'Runtime ready: CUDA={use_cuda}, CUDA runtime={torch.version.cuda}')
+            if require_cuda and not use_cuda:
+                raise RuntimeError(
+                    'CUDA is required for VLM inference but is unavailable')
+            model_kwargs = {
+                'device_map': 'auto' if use_cuda else None,
+                'torch_dtype': torch.float16 if use_cuda else torch.float32,
+            }
+            if load_in_4bit and use_cuda:
+                from transformers import BitsAndBytesConfig
+                model_kwargs['quantization_config'] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                )
+            elif load_in_4bit:
+                logger.warn(
+                    'CUDA is unavailable; VLM will attempt a local CPU fallback, '
+                    'which can be very slow for Qwen2-VL')
+
+            progress.update(35, f'Loading Qwen2-VL base model: {base_model}')
+            base = Qwen2VLForConditionalGeneration.from_pretrained(
+                base_model, **model_kwargs)
+            device_map = getattr(base, 'hf_device_map', {})
+            offloaded_devices = sorted({
+                str(device) for device in device_map.values()
+                if str(device) in ('cpu', 'disk')
+            })
+            if offloaded_devices:
+                logger.warn(
+                    'Part of the VLM was offloaded to '
+                    f'{", ".join(offloaded_devices)}; inference will be slower')
+            progress.update(75, 'Base model loaded; attaching LoRA adapter')
+            self.model = PeftModel.from_pretrained(base, str(adapter_path))
+            self.model.eval()
+            progress.update(88, 'LoRA adapter attached; loading processor')
+            processor_kwargs = {
+                'min_pixels': self.min_pixels,
+                'max_pixels': self.max_pixels,
+            }
+            try:
+                self.processor = AutoProcessor.from_pretrained(
+                    str(adapter_path), **processor_kwargs)
+            except (OSError, ValueError):
+                progress.update(92, 'Loading processor from base model')
+                self.processor = AutoProcessor.from_pretrained(
+                    base_model, **processor_kwargs)
+            progress.update(97, 'Processor loaded; selecting inference device')
+            self.input_device = next(self.model.parameters()).device
+            progress.update(98, 'Warming up CUDA kernels')
+            self._warm_up()
+            progress.complete(
+                f'VLM READY: adapter loaded on {self.input_device}')
+        except Exception as error:
+            progress.fail(error)
+            raise
+
+    def _warm_up(self):
+        """Pay the one-off CUDA/bitsandbytes kernel cost before the first pair.
+
+        The first generate() call measured 9.4 s against 4.1 s for every call
+        after it. Spending that here means the first real conversation is
+        judged at the steady-state latency instead of waiting out kernel
+        autotuning while two people stand in front of the camera.
+        """
+        started_at = time.monotonic()
+        try:
+            blank = np.full((256, 384, 3), 127, dtype=np.uint8)
+            self.infer(blank, 'warm-up')
+        except Exception as error:  # A failed warm-up must not block startup.
+            self.logger.warn(
+                f'VLM warm-up failed ({type(error).__name__}: {error}); '
+                'the first inference will be slower')
+            return
+        self.logger.info(
+            f'VLM warm-up finished in {time.monotonic() - started_at:.2f}s')
 
     def infer(self, bgr_image, prompt, pair=None):
-        encoded_ok, encoded = cv2.imencode(
-            '.jpg', bgr_image,
-            [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
-        if not encoded_ok:
-            raise RuntimeError('failed to JPEG-encode the pair crop')
-        request = VlmRequest()
-        request.header.stamp = self.node.get_clock().now().to_msg()
-        request.crop.header = request.header
-        request.crop.format = 'jpeg'
-        request.crop.data = encoded.tobytes()
-        # The prompt travels with the crop so the wording lives in exactly one
-        # config file. Two copies drift, and a drifted prompt is invisible: the
-        # model keeps answering, just to a different question.
-        request.prompt = prompt
-        request.member_ids = [str(member) for member in (pair or ())]
-        with self.lock:
-            self.sequence += 1
-            request.request_id = str(self.sequence)
-            self.pending_id = request.request_id
-            self.pending_response = None
-        self.answered.clear()
-        self.request_pub.publish(request)
-        if not self.answered.wait(self.timeout):
-            with self.lock:
-                self.pending_id = None
-            raise TimeoutError(
-                f'no VLM answer within {self.timeout:.1f}s; is '
-                'social_vlm_worker.py running on the workstation?')
-        with self.lock:
-            response = self.pending_response
-            self.pending_id = None
-        self.last_timing = (response.prepare_seconds, response.lock_seconds,
-                            response.generate_seconds, response.token_count)
-        if response.failed:
-            raise RuntimeError(f'remote VLM failed: {response.error}')
-        return response.raw_response
+        from PIL import Image as PilImage
+
+        started_at = time.monotonic()
+        image = PilImage.fromarray(cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB))
+        messages = [{
+            'role': 'user',
+            'content': [
+                {'type': 'image', 'image': image},
+                {'type': 'text', 'text': prompt},
+            ],
+        }]
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+        max_new_tokens = self.max_new_tokens
+        if self.force_answer_prefix:
+            # Start the assistant turn mid-answer so the model resumes from the
+            # forced prefix. It only has to produce the word, which also ends
+            # the malformed replies (`{"talking":"có}`, `{"talking":true}`)
+            # that used to cost a whole inference to recover from.
+            text += self.ANSWER_PREFIX
+            max_new_tokens = self.PREFIX_ANSWER_TOKENS
+        # This is a one-item batch, so padding is unnecessary and only causes
+        # a noisy Transformers max_length warning.
+        inputs = self.processor(
+            text=[text], images=[image], padding=False, return_tensors='pt')
+        inputs = {key: value.to(self.input_device) for key, value in inputs.items()}
+        lock_context = (self.execution_lock if self.execution_lock is not None
+                        else contextlib.nullcontext())
+        # Split the wait into preprocessing, waiting for the lock and the model
+        # itself. The same crop takes seconds standalone and far longer in the
+        # running node, and only a breakdown says which of the three grew.
+        prepared_at = time.monotonic()
+        with lock_context:
+            acquired_at = time.monotonic()
+            with self.torch.inference_mode():
+                output_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                )
+        self.last_timing = (prepared_at - started_at,
+                            acquired_at - prepared_at,
+                            time.monotonic() - acquired_at,
+                            int(inputs['input_ids'].shape[1]))
+        generated_ids = output_ids[:, inputs['input_ids'].shape[1]:]
+        answer = self.processor.batch_decode(
+            generated_ids, skip_special_tokens=True,
+            clean_up_tokenization_spaces=False)[0].strip()
+        if self.force_answer_prefix:
+            # Reattach what was teacher-forced so the published response stays
+            # the same JSON object every consumer already parses and logs. The
+            # word is the model's; only the syntax around it was supplied.
+            word = answer.split('"')[0].strip()
+            answer = self.ANSWER_PREFIX + word + '"}'
+        return answer
 
 
 class SocialVlmPerception(Node):
     def __init__(self):
-        # Every parameter comes from the profile passed on the command line
-        # (social_vlm_perception.yaml for the simulation,
-        # social_vlm_perception_real.yaml for the camera on the workstation).
-        # Declaring defaults here as well meant the same 46 values existed in
-        # two places, and they had already drifted apart: yolo_device read
-        # 'cpu' here while both profiles run it on cuda:0. A parameter left out
-        # of the profile now raises at startup instead of silently running on
-        # a value nobody can see in the config file.
-        super().__init__('social_vlm_perception',
-                         automatically_declare_parameters_from_overrides=True)
+        super().__init__('social_vlm_perception')
+        self._declare_parameters()
 
         self.confidence = float(self.get_parameter('yolo_confidence').value)
         self.image_size = int(self.get_parameter('yolo_image_size').value)
         self.target_frame = str(self.get_parameter('target_frame').value)
         self.max_depth_age = float(self.get_parameter('maximum_depth_age').value)
-        self.max_frame_age = float(self.get_parameter('maximum_frame_age').value)
         self.min_depth = float(self.get_parameter('minimum_depth').value)
         self.max_depth = float(self.get_parameter('maximum_depth').value)
-        self.track_distance = float(self.get_parameter('tracking_max_distance').value)
+        self.bytetrack_config = self._resolve_file(
+            str(self.get_parameter('bytetrack_config').value))
+        if self.bytetrack_config is None:
+            raise FileNotFoundError(
+                'ByteTrack config not found: '
+                f"{self.get_parameter('bytetrack_config').value}")
         self.duplicate_distance = float(
             self.get_parameter('duplicate_merge_distance').value)
         self.track_timeout = float(self.get_parameter('tracking_timeout').value)
-        self.reidentify_timeout = float(
-            self.get_parameter('reidentify_timeout').value)
-        self.minimum_track_hits = int(
-            self.get_parameter('minimum_track_hits').value)
-        # How many frames each live id has been SEEN in, as opposed to coasted.
-        # Kept beside self.tracks rather than inside it so the count survives a
-        # trip through lost_tracks: somebody who walks back into frame reclaims
-        # their id and their confirmation with it, and is published again the
-        # same frame instead of serving the waiting period twice.
-        self.track_hits = {}
         self.velocity_alpha = float(self.get_parameter('velocity_smoothing').value)
-        # Block B's prediction window. These have to agree with
-        # observation.constraint_field.prediction_times in the social_rl config
-        # that trained the policy, which is what sizes the CNN.
-        horizon = float(self.get_parameter('prediction_horizon').value)
-        step = float(self.get_parameter('prediction_dt').value)
-        self.prediction_times = [round(index * step, 6) for index
-                                 in range(int(round(horizon / step)) + 1)]
-        # Below this a person is standing, not walking. Extrapolating tracker
-        # noise on somebody standing still would drag their predicted position
-        # metres down the corridor by the end of the horizon.
-        self.prediction_still_speed = float(
-            self.get_parameter('prediction_still_speed').value)
-        # Whose pose radial_velocity and motion_type are measured against.
-        # Looked up in target_frame, so the same TF chain the people already
-        # travel through.
         self.robot_frame = str(self.get_parameter('robot_frame').value)
+        self.max_odom_age = float(self.get_parameter('maximum_odom_age').value)
+        self.prediction_horizon = float(
+            self.get_parameter('prediction_horizon_s').value)
+        self.prediction_step = float(self.get_parameter('prediction_step_s').value)
+        self.prediction_min_speed = float(
+            self.get_parameter('prediction_min_speed_mps').value)
+        self.prediction_marker_diameter = max(0.01, float(
+            self.get_parameter('prediction_marker_diameter_m').value))
+        self.keypoint_confidence = float(
+            self.get_parameter('keypoint_confidence').value)
+        self.keypoint_depth_window = max(
+            1, int(self.get_parameter('keypoint_depth_window_px').value))
+        self.minimum_shoulder_width = float(
+            self.get_parameter('minimum_shoulder_width_m').value)
+        self.orientation_keypoint_confidence = float(
+            self.get_parameter('orientation_keypoint_confidence').value)
+        self.orientation_nose_confidence = float(
+            self.get_parameter('orientation_nose_confidence').value)
+        self.orientation_face_confidence = float(
+            self.get_parameter('orientation_face_confidence').value)
+        self.minimum_face_direction = float(
+            self.get_parameter('minimum_face_direction_m').value)
+        self.minimum_face_alignment = min(1.0, max(0.0, float(
+            self.get_parameter('minimum_face_alignment').value)))
+        self.orientation_flip_frames = max(
+            1, int(self.get_parameter('orientation_flip_frames').value))
+        # -1 means keep the last valid heading for the lifetime of its track.
+        # A non-negative value keeps the old bounded-by-frames behaviour.
+        self.orientation_hold_frames = int(
+            self.get_parameter('orientation_hold_frames').value)
+        self.maximum_shoulder_width = float(
+            self.get_parameter('maximum_shoulder_width_m').value)
+        self.minimum_hip_width = float(
+            self.get_parameter('minimum_hip_width_m').value)
+        self.maximum_hip_width = float(
+            self.get_parameter('maximum_hip_width_m').value)
+        self.body_yaw_smoothing = min(1.0, max(0.0, float(
+            self.get_parameter('body_yaw_smoothing').value)))
+        self.orientation_arrow_length = max(0.05, float(
+            self.get_parameter('orientation_marker_arrow_length_m').value))
+        self.orientation_arrow_lifetime = max(0.1, float(
+            self.get_parameter('orientation_marker_lifetime_s').value))
+        self.orientation_arrow_color = tuple(
+            min(1.0, max(0.0, float(self.get_parameter(
+                f'orientation_marker_arrow_color_{channel}').value)))
+            for channel in ('r', 'g', 'b'))
+        if self.prediction_horizon <= 0.0 or self.prediction_step <= 0.0:
+            raise ValueError('prediction_horizon_s and prediction_step_s must be positive.')
         self.yolo_device = str(self.get_parameter('yolo_device').value)
-        self.vlm_enabled = bool(self.get_parameter('enable_vlm').value)
-        # Where the model actually runs. false keeps it in this process, which
-        # is what the simulation and the workstation-camera setup do. true
-        # sends each crop to social_vlm_worker.py over
-        # /social_perception/vlm_request, so a robot carrying the camera needs
-        # ultralytics for YOLO but neither transformers nor a GPU.
-        self.vlm_remote = bool(self.get_parameter('vlm_remote').value)
-        self.vlm_request_timeout = float(
-            self.get_parameter('vlm_request_timeout').value)
-        # The crop is the model's only evidence, so this is a quality knob, not
-        # just a bandwidth one. Compare answers before lowering it.
-        self.vlm_crop_jpeg_quality = int(
-            self.get_parameter('vlm_crop_jpeg_quality').value)
+        requested_vlm = bool(self.get_parameter('enable_vlm').value)
+        # Conversation semantics now belongs to social_vlm_interaction.py. Keep
+        # this deprecated parameter only so old YAML files fail safely instead
+        # of making Block B load a GPU model or delaying camera tracking.
+        self.vlm_enabled = False
+        if requested_vlm:
+            self.get_logger().warn(
+                'Bỏ enable_vlm ở Block B; chạy node social_vlm_interaction riêng.')
         self.vlm_interval = float(self.get_parameter('vlm_inference_interval').value)
         self.vlm_refresh_interval = float(
             self.get_parameter('vlm_refresh_interval').value)
@@ -380,29 +508,11 @@ class SocialVlmPerception(Node):
             1, int(self.get_parameter('negative_answers_to_clear').value))
         self.interaction_timeout = float(self.get_parameter('interaction_timeout').value)
         self.crop_margin = float(self.get_parameter('vlm_crop_margin').value)
-        self.latency_overlay = bool(
-            self.get_parameter('show_vlm_latency_overlay').value)
-        self.log_vlm_results = bool(self.get_parameter('log_vlm_results').value)
-        self.group_o_min_radius = float(
-            self.get_parameter('group_o_space_min_radius').value)
-        self.group_p_margin = float(self.get_parameter('group_p_space_margin').value)
-        self.group_r_margin = float(self.get_parameter('group_r_space_margin').value)
         self.last_vlm_enqueue = 0.0
-        # Serializes VLM inferences against each other. It deliberately does
-        # NOT cover YOLO.
-        #
-        # It used to. With yolo_device: cuda:0 that made every RGB frame wait
-        # out the whole of Qwen's generate(), measured at 11-13 s, so nothing
-        # reached /social_perception/annotated_image for that long (the RViz
-        # camera panel froze) and /people was published carrying the stamp of
-        # the frame received before the wait -- 15 s stale, past the costmap's
-        # TF buffer, which Nav2 reported as "SocialLayer transform failed:
-        # Lookup would require extrapolation into the past".
-        #
-        # Letting the two share the GPU costs the VLM some throughput and buys
-        # back a detector that never stops. YOLOv8n at imgsz 640 is ~50 MiB of
-        # the 4 GiB card against Qwen's ~2.5 GiB, so this is contention for
-        # compute, not for memory.
+        self.display_id_map: dict[int, int] = {}
+        # This lock is used only if YOLO is explicitly put on CUDA. The default
+        # CPU detector keeps processing current camera frames while Qwen uses
+        # the GPU in the background.
         self.ml_execution_lock = threading.Lock()
 
         yolo_path = self._resolve_file(str(self.get_parameter('yolo_model_path').value))
@@ -411,17 +521,21 @@ class SocialVlmPerception(Node):
             self.get_logger().warn(
                 f'YOLO model {yolo_path} is not local; Ultralytics may download it')
         self.yolo = YOLO(str(yolo_path))
-        self._warm_up_yolo()
-
+        self.pose_model_warning_logged = False
         self.depth_msg = None
         self.camera_info = None
+        self.depth_camera_info = None
+        self.latest_odom = None
+        # YOLO may process an RGB frame after newer sensor messages arrived.
+        # Keep a short timestamped history and select the matching depth/odom
+        # instead of pairing that RGB frame with whichever message arrived last.
+        self.sensor_lock = threading.Lock()
+        self.depth_buffer = deque(maxlen=120)
+        self.odom_buffer = deque(maxlen=240)
         self.rgb_frames = 0
         self.depth_frames = 0
-        self.next_track_id = 1
         self.tracks = {}
-        # Where tracks were last seen, so a person who drops out and comes
-        # back keeps the identity every cached VLM decision is keyed on.
-        self.lost_tracks = {}
+        self.tracks_generation = 0
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -434,16 +548,6 @@ class SocialVlmPerception(Node):
         self.vlm_inflight_pairs = {}
         self.last_vlm_scenes = {}
         self.last_logged_decisions = {}
-        # Wall-clock accounting for a single inference, measured from the
-        # moment the crop is handed to Qwen until the answer comes back. The
-        # VLM thread writes it and the camera thread reads it to draw the
-        # overlay, so it gets its own lock instead of sharing the busy scene
-        # lock a long generation would then be holding up.
-        self.latency_lock = threading.Lock()
-        self.vlm_running_since = {}
-        self.vlm_last_latency = None
-        self.vlm_latency_count = 0
-        self.vlm_latency_total = 0.0
         self.last_interactions_signature = None
         self.last_interactions_publish = 0.0
         self.work_queue = queue.Queue(maxsize=1)
@@ -453,6 +557,8 @@ class SocialVlmPerception(Node):
         rgb_topic = str(self.get_parameter('rgb_topic').value)
         depth_topic = str(self.get_parameter('depth_topic').value)
         info_topic = str(self.get_parameter('camera_info_topic').value)
+        depth_info_topic = str(
+            self.get_parameter('depth_camera_info_topic').value)
         # YOLO inference is intentionally isolated from the lightweight depth
         # callbacks. A single-threaded executor made depth wait behind YOLO,
         # producing artificial RGB/depth timestamp mismatches.
@@ -470,16 +576,37 @@ class SocialVlmPerception(Node):
         self.create_subscription(CameraInfo, info_topic, self.info_callback,
                                  camera_qos,
                                  callback_group=self.depth_callback_group)
+        if depth_info_topic:
+            self.create_subscription(
+                CameraInfo, depth_info_topic, self.depth_info_callback,
+                camera_qos, callback_group=self.depth_callback_group)
         self.create_subscription(Image, rgb_topic, self.rgb_callback,
                                  camera_qos,
                                  callback_group=self.rgb_callback_group)
+        odom_topic = str(self.get_parameter('odom_topic').value)
+        if odom_topic:
+            self.create_subscription(Odometry, odom_topic, self.odom_callback, 10)
         clear_topic = str(self.get_parameter('clear_interactions_topic').value)
         if clear_topic:
             self.create_subscription(
                 Empty, clear_topic, self.clear_interactions_callback, 10)
+        track_reset_topic = str(self.get_parameter('track_reset_topic').value)
+        if track_reset_topic and track_reset_topic != clear_topic:
+            self.create_subscription(
+                Empty, track_reset_topic, self.clear_interactions_callback, 10)
 
+        # Record the canonical raw streams. Do not publish a second copy when
+        # the RGB-D driver already uses these input topic names.
+        rgb_record_topic = str(self.get_parameter('rgb_record_topic').value)
+        depth_record_topic = str(self.get_parameter('depth_record_topic').value)
+        self.rgb_raw_pub = (self.create_publisher(Image, rgb_record_topic, camera_qos)
+                            if rgb_record_topic and rgb_record_topic != rgb_topic
+                            else None)
+        self.depth_raw_pub = (self.create_publisher(Image, depth_record_topic, camera_qos)
+                              if depth_record_topic and depth_record_topic != depth_topic
+                              else None)
         self.detections_pub = self.create_publisher(
-            Detection2DArray, '/social_perception/detections_2d', 10)
+            Detection2DArray, str(self.get_parameter('yolo_people_topic').value), 10)
         self.annotated_pub = self.create_publisher(
             Image, '/social_perception/annotated_image', 10)
         self.depth_visual_pub = self.create_publisher(
@@ -488,48 +615,16 @@ class SocialVlmPerception(Node):
             MarkerArray, '/social_perception/person_markers', 10)
         self.people_pub = self.create_publisher(
             People, str(self.get_parameter('people_topic').value), 10)
-        self.groups_pub = self.create_publisher(
-            Groups, str(self.get_parameter('social_regions_topic').value), 10)
-        self.interactions_pub = self.create_publisher(
-            TalkingInteractions,
-            str(self.get_parameter('interactions_topic').value), 10)
-        self.social_markers_pub = self.create_publisher(
-            MarkerArray, '/social_spaces', 10)
-
-        # The remote half of the pipeline, wired up here rather than inside the
-        # worker thread so every endpoint exists before the executor spins.
-        self.remote_backend = None
-        self.remote_worker_ready = threading.Event()
-        if self.vlm_enabled and self.vlm_remote:
-            # Its own group: an answer arriving must not queue behind a depth
-            # frame, and the depth path must not wait on network traffic.
-            self.remote_callback_group = MutuallyExclusiveCallbackGroup()
-            # Depth 1 and BEST_EFFORT: one question is in flight at a time, and
-            # a crop that could not be delivered is worthless a second later --
-            # the pair will simply be asked about again from a fresher frame.
-            request_pub = self.create_publisher(
-                VlmRequest, '/social_perception/vlm_request',
-                QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
-                           reliability=ReliabilityPolicy.BEST_EFFORT,
-                           durability=DurabilityPolicy.VOLATILE))
-            self.remote_backend = RemoteVlmBackend(
-                self, request_pub, self.vlm_request_timeout,
-                self.vlm_crop_jpeg_quality)
-            self.create_subscription(
-                VlmResponse, '/social_perception/vlm_response',
-                self.remote_backend.handle_response, 10,
-                callback_group=self.remote_callback_group)
-            # Latched on the worker's side, so this learns the model is up even
-            # if the workstation was started first.
-            self.create_subscription(
-                Bool, '/social_perception/vlm_worker_ready',
-                self.remote_worker_ready_callback,
-                QoSProfile(
-                    depth=1,
-                    history=HistoryPolicy.KEEP_LAST,
-                    reliability=ReliabilityPolicy.RELIABLE,
-                    durability=DurabilityPolicy.TRANSIENT_LOCAL),
-                callback_group=self.remote_callback_group)
+        self.tracks_pub = self.create_publisher(
+            People, str(self.get_parameter('people_tracks_topic').value), 10)
+        self.observations_pub = self.create_publisher(
+            PeopleObservations,
+            str(self.get_parameter('people_observations_topic').value), 10)
+        self.orientations_pub = self.create_publisher(
+            PeopleOrientations,
+            str(self.get_parameter('people_orientation_topic').value), 10)
+        self.tracked_state_pub = self.create_publisher(
+            String, str(self.get_parameter('tracked_state_topic').value), 10)
         # Latched, so anything that starts later still learns the pipeline is
         # up. It fires once YOLO has processed a real frame and the VLM has
         # finished loading, which is the moment people can actually be seen.
@@ -548,49 +643,112 @@ class SocialVlmPerception(Node):
         self.vlm_load_done = not self.vlm_enabled
         self.vlm_load_ok = not self.vlm_enabled
 
-        self.create_timer(0.2, self.publish_social_outputs)
-        if self.vlm_enabled:
-            self.vlm_thread = threading.Thread(
-                target=self.vlm_worker, name='social-vlm-worker', daemon=True)
-            self.vlm_thread.start()
+        # VLM output is deliberately not published here. A separate process
+        # owns /social_perception/talking_interactions, preventing empty
+        # heartbeat messages from Block B overwriting semantic VLM decisions.
         self.get_logger().info(
             f'Social perception ready: RGB={rgb_topic}, depth={depth_topic}, '
-            f'target={self.target_frame}, YOLO={yolo_path} on {self.yolo_device}, '
-            f'VLM={self.vlm_enabled}')
+            f'color_info={info_topic}, depth_info={depth_info_topic or "disabled"}, '
+            f'raw-record RGB={rgb_record_topic or "disabled"}, '
+            f'depth={depth_record_topic or "disabled"}, '
+            f'target={self.target_frame}, YOLO={yolo_path} on {self.yolo_device}; '
+            'VLM interaction is a separate node.')
 
-    def _warm_up_yolo(self):
-        """Build the YOLO inference backend before the VLM thread can exist.
-
-        Ultralytics defers the real work to the first predict(): it fuses
-        Conv+BatchNorm, and `fuse_conv_and_bn` calls `register_parameter` to
-        install the fused bias. Meanwhile Transformers loads the VLM under
-        accelerate's `init_on_device`, which patches `nn.Module.
-        register_parameter` process-wide -- not per-thread -- to divert new
-        parameters to the meta device. A first frame arriving inside that
-        window therefore built a YOLO whose fused biases had no storage, and
-        the following `.to('cuda:0')` died with 'Cannot copy out of meta
-        tensor', taking the node down with it.
-
-        Doing the fuse here, before the worker thread starts, closes the
-        window: later predicts reuse this backend and register no parameters.
-        """
-        started_at = time.monotonic()
-        try:
-            blank = np.zeros((self.image_size, self.image_size, 3), dtype=np.uint8)
-            self.yolo.predict(source=blank, classes=[0], conf=self.confidence,
-                              imgsz=self.image_size, device=self.yolo_device,
-                              verbose=False)
-        except Exception as error:
-            # Leave the node running: the first camera frame will retry this,
-            # and warning here is what explains a later meta-tensor crash.
-            self.get_logger().warn(
-                f'YOLO warm-up failed ({type(error).__name__}: {error}); the '
-                'first frame will build the backend instead, which can race '
-                'the VLM load')
-            return
-        self.get_logger().info(
-            f'YOLO ready on {self.yolo_device} in '
-            f'{time.monotonic() - started_at:.2f}s')
+    def _declare_parameters(self):
+        parameters = {
+            'yolo_model_path': 'yolov8n.pt',
+            'rgb_topic': '/camera/color/image_raw',
+            'depth_topic': '/camera/depth/image_raw',
+            'camera_info_topic': '/camera/color/camera_info',
+            # Optional metadata from a separate depth camera. The depth image
+            # must still be registered to the RGB image for pixel sampling.
+            'depth_camera_info_topic': '/camera/depth/camera_info',
+            # Canonical raw streams for recording. Both the simulated robot
+            # camera and a real RGB-D driver may publish these directly.
+            'rgb_record_topic': '/camera/color/image_raw',
+            'depth_record_topic': '/camera/depth/image_raw',
+            'yolo_confidence': 0.25,
+            'yolo_image_size': 640,
+            'yolo_device': 'cpu',
+            'target_frame': 'map',
+            'maximum_depth_age': 0.15,
+            'minimum_depth': 0.2,
+            'maximum_depth': 12.0,
+            'bytetrack_config': 'config/bytetrack.yaml',
+            'duplicate_merge_distance': 0.6,
+            'tracking_timeout': 6.0,
+            'velocity_smoothing': 0.35,
+            'robot_frame': 'base_link',
+            'odom_topic': '/odom',
+            'maximum_odom_age': 0.2,
+            'tracked_state_topic': '/people/tracked_state_json',
+            'prediction_horizon_s': 2.0,
+            'prediction_step_s': 0.5,
+            'prediction_min_speed_mps': 0.10,
+            'prediction_marker_diameter_m': 0.08,
+            # COCO Pose keypoints below this score or without valid RGB-D depth
+            # are kept out of the 3-D skeleton and body-yaw calculation.
+            'keypoint_confidence': 0.35,
+            'keypoint_depth_window_px': 5,
+            'minimum_shoulder_width_m': 0.15,
+            # Match the validated hip/shoulder/nose yaw estimator. History is
+            # kept per ByteTrack id, never shared between different people.
+            'orientation_keypoint_confidence': 0.50,
+            # Hips/shoulders provide an undirected body axis. Face keypoints
+            # select its forward sign so RViz never guesses front versus back.
+            'orientation_nose_confidence': 0.60,
+            'orientation_face_confidence': 0.40,
+            'minimum_face_direction_m': 0.04,
+            'minimum_face_alignment': 0.45,
+            'orientation_flip_frames': 4,
+            'orientation_hold_frames': -1,
+            'maximum_shoulder_width_m': 0.60,
+            'minimum_hip_width_m': 0.15,
+            'maximum_hip_width_m': 0.50,
+            'body_yaw_smoothing': 0.30,
+            'orientation_marker_arrow_length_m': 0.45,
+            'orientation_marker_lifetime_s': 7.0,
+            'orientation_marker_arrow_color_r': 1.0,
+            'orientation_marker_arrow_color_g': 0.0,
+            'orientation_marker_arrow_color_b': 0.85,
+            'people_topic': '/people',
+            'people_tracks_topic': '/people/tracks',
+            'people_observations_topic': '/people_observations',
+            'people_orientation_topic': '/people/orientation',
+            'yolo_people_topic': '/yolo/people',
+            'interactions_topic': '/social_perception/talking_interactions',
+            'clear_interactions_topic': '/animated_people/hide',
+            # Gazebo's crossing actor teleports from B back to A each loop.
+            # A real camera leaves this empty and keeps occlusion coasting.
+            'track_reset_topic': '',
+            # Legacy switch kept for backward-compatible parameter files. It
+            # is force-disabled in __init__; social geometry is the only
+            # active conversation proxy.
+            'enable_vlm': False,
+            'vlm_adapter_path': 'Saved_Model',
+            'vlm_base_model': 'unsloth/Qwen2-VL-2B-Instruct-bnb-4bit',
+            'vlm_load_in_4bit': True,
+            'vlm_require_cuda': True,
+            'vlm_max_new_tokens': 12,
+            'vlm_force_answer_prefix': True,
+            'vlm_min_pixels': 56 * 56,
+            'vlm_max_pixels': 256 * 28 * 28,
+            'vlm_inference_interval': 2.0,
+            'vlm_refresh_interval': 15.0,
+            'vlm_position_change_threshold': 0.25,
+            'vlm_crop_margin': 0.05,
+            'maximum_talking_distance': 3.0,
+            'maximum_vlm_pairs': 1,
+            'negative_answers_to_clear': 2,
+            'interaction_timeout': 0.0,
+            'log_vlm_results': True,
+            'talking_prompt': (
+                'Quan sát hai người trong ảnh. Họ có đang nói chuyện trực tiếp '
+                'với nhau không? Chỉ trả lời đúng một JSON: '
+                '{"talking":"có"} hoặc {"talking":"không"}.'),
+        }
+        for name, default in parameters.items():
+            self.declare_parameter(name, default)
 
     @staticmethod
     def _resolve_file(value):
@@ -599,6 +757,7 @@ class SocialVlmPerception(Node):
         if not candidate.is_absolute():
             candidates.extend([
                 Path.cwd() / candidate,
+                Path(__file__).resolve().parent.parent / candidate,
                 Path(__file__).resolve().parents[2] / candidate,
             ])
             try:
@@ -611,36 +770,45 @@ class SocialVlmPerception(Node):
                 return path.resolve()
         return None
 
-    def remote_worker_ready_callback(self, message):
-        if message.data:
-            self.remote_worker_ready.set()
-
-    def wait_for_remote_worker(self):
-        """Block until the workstation reports its model is loaded.
-
-        No deadline on purpose. The robot may well be powered on before the
-        workstation, and giving up would leave a node that looks alive while
-        silently never asking anything. The heartbeat is what tells an operator
-        which of the two machines they are still waiting for.
-        """
-        waited = 0.0
-        while not self.stop_event.is_set():
-            if self.remote_worker_ready.wait(5.0):
-                self.get_logger().info(
-                    f'VLM từ xa đã sẵn sàng sau {waited:.0f}s')
-                return True
-            waited += 5.0
-            self.get_logger().info(
-                f'Đang đợi social_vlm_worker.py trên máy trạm ({waited:.0f}s). '
-                'Kiểm tra ROS_DOMAIN_ID và ROS_LOCALHOST_ONLY nếu chờ quá lâu.')
-        return False
-
     def depth_callback(self, message):
-        self.depth_msg = message
+        if self.depth_raw_pub is not None:
+            self.depth_raw_pub.publish(message)
+        with self.sensor_lock:
+            self.depth_msg = message
+            self.depth_buffer.append(message)
         self.depth_frames += 1
 
     def info_callback(self, message):
         self.camera_info = message
+
+    def depth_info_callback(self, message):
+        """Consume optional depth CameraInfo without treating it as RGB intrinsics.
+
+        The node samples the depth image at RGB pixel locations, so only a
+        depth stream registered to the colour camera is valid for this
+        pipeline. Its CameraInfo is subscribed separately for a standard
+        RGB-D topic layout and for downstream inspection.
+        """
+        self.depth_camera_info = message
+
+    def odom_callback(self, message):
+        """Keep the latest robot velocity for short-horizon relative prediction."""
+        with self.sensor_lock:
+            self.latest_odom = message
+            self.odom_buffer.append(message)
+
+    def nearest_sensor_message(self, buffer_name, header):
+        """Return the buffered message nearest to a camera-frame timestamp."""
+        target_stamp = stamp_seconds(header.stamp)
+        with self.sensor_lock:
+            messages = tuple(getattr(self, buffer_name))
+        if not messages:
+            return None, None
+        message = min(
+            messages,
+            key=lambda item: abs(stamp_seconds(item.header.stamp) - target_stamp))
+        age = abs(stamp_seconds(message.header.stamp) - target_stamp)
+        return message, age
 
     def clear_interactions_callback(self, _message):
         """Immediately invalidate simulated people when they are hidden."""
@@ -735,11 +903,15 @@ class SocialVlmPerception(Node):
     # the one part of a person that is neither background seen past an arm nor
     # floor seen past the feet.
     TORSO_SIDE, TORSO_TOP, TORSO_BOTTOM = 0.30, 0.20, 0.70
-
-    # Bề dày một thân người, dùng để tách người khỏi nền trong ROI. Rộng hơn
-    # thân thật (~0.30 m) để chừa chỗ cho người đứng chếch và cho nhiễu depth.
-    PERSON_DEPTH = 0.5
-
+    # COCO human-pose indices used for a compact but useful RViz skeleton.
+    NOSE, LEFT_EYE, RIGHT_EYE, LEFT_EAR, RIGHT_EAR = 0, 1, 2, 3, 4
+    LEFT_SHOULDER, RIGHT_SHOULDER = 5, 6
+    LEFT_HIP, RIGHT_HIP = 11, 12
+    COCO_SKELETON = (
+        (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+        (5, 11), (6, 12), (11, 12), (11, 13), (13, 15),
+        (12, 14), (14, 16), (0, 5), (0, 6),
+    )
     @classmethod
     def torso_center(cls, box):
         """Pixel that median_depth's distance actually belongs to.
@@ -766,34 +938,268 @@ class SocialVlmPerception(Node):
                     max(0, int(rx1)):min(depth.shape[1], int(rx2))]
         valid = roi[np.isfinite(roi) & (roi >= self.min_depth) &
                     (roi <= self.max_depth)]
-        if valid.size < 8:
-            return None
-        # Trung vị của MẶT GẦN NHẤT, không phải của cả ROI.
-        #
-        # Trung vị cả ROI trả về bức tường ngay khi quá nửa ROI là nền - và
-        # điều đó xảy ra thường xuyên hơn ta tưởng: người đứng chếch, bị che
-        # một phần, hoặc khung YOLO rộng hơn thân. Đo 29-08-2026 trên
-        # lirs_test.world, 705 lần đo trong 80 s: 54 lần (8%) lệch quá 0.5 m,
-        # tệ nhất là 8.50 m thay vì 1.44 m khi 54% ROI là nền. Hậu quả không
-        # phải "mất người" mà là ĐẶT NGƯỜI SAI CHỖ - một chấm nổi trên tường,
-        # cùng phương vị nhưng xa gấp hơn hai lần, và khối D dựng nguyên một
-        # vùng xã hội quanh nó.
-        #
-        # Người LUÔN ở trước nền, nên mặt gần nhất trong ROI là người. Lấy
-        # phân vị 10 thay vì min để một vài điểm nhiễu quá gần không kéo lệch,
-        # rồi giữ mọi điểm trong một bề dày thân người tính từ đó.
-        nearest = float(np.percentile(valid, 10))
-        front = valid[valid <= nearest + self.PERSON_DEPTH]
-        return float(np.median(front))
+        # Use the 20th percentile instead of median to ensure we measure the person (closer)
+        # and ignore the background wall if the bounding box is too wide.
+        return float(np.percentile(valid, 20)) if valid.size >= 8 else None
 
-    def point_in_target(self, u, v, depth, source_frame, stamp):
-        info = self.camera_info
-        fx, fy, cx, cy = info.k[0], info.k[4], info.k[2], info.k[5]
-        if fx <= 0.0 or fy <= 0.0:
+    def keypoint_depth(self, depth, u, v, rgb_shape):
+        """Median registered depth around one RGB keypoint pixel."""
+        scale_x = depth.shape[1] / rgb_shape[1]
+        scale_y = depth.shape[0] / rgb_shape[0]
+        center_x, center_y = u * scale_x, v * scale_y
+        radius_x = max(1, int(round(self.keypoint_depth_window * scale_x / 2.0)))
+        radius_y = max(1, int(round(self.keypoint_depth_window * scale_y / 2.0)))
+        left = max(0, int(round(center_x)) - radius_x)
+        right = min(depth.shape[1], int(round(center_x)) + radius_x + 1)
+        top = max(0, int(round(center_y)) - radius_y)
+        bottom = min(depth.shape[0], int(round(center_y)) + radius_y + 1)
+        roi = depth[top:bottom, left:right]
+        valid = roi[np.isfinite(roi) & (roi >= self.min_depth) &
+                    (roi <= self.max_depth)]
+        return float(np.median(valid)) if valid.size >= 3 else None
+
+    @staticmethod
+    def result_keypoints(result, detection_index):
+        """Return one YOLO Pose row as (x, y, confidence) triples.
+
+        YOLO detection checkpoints expose ``keypoints=None``. Keeping that
+        case explicit lets the RGB-D detector remain usable while clearly
+        reporting that body orientation is unavailable.
+        """
+        keypoints = getattr(result, 'keypoints', None)
+        if keypoints is None or getattr(keypoints, 'xy', None) is None:
             return None
-        optical = ((u - cx) * depth / fx, (v - cy) * depth / fy, depth)
+        if detection_index >= len(keypoints.xy):
+            return None
+        xy = keypoints.xy[detection_index].cpu().tolist()
+        confidence_data = getattr(keypoints, 'conf', None)
+        confidence = (confidence_data[detection_index].cpu().tolist()
+                      if confidence_data is not None else [1.0] * len(xy))
+        return [(float(point[0]), float(point[1]), float(score))
+                for point, score in zip(xy, confidence)]
+
+    def localize_keypoints(self, pose_keypoints, depth, rgb_shape, transform):
+        """Fill ROS keypoint messages and return valid 3-D points by COCO id."""
+        keypoints_2d = []
+        keypoints_3d = []
+        points_3d = {}
+        if pose_keypoints is None:
+            return keypoints_2d, keypoints_3d, points_3d
+        for keypoint_id, (u, v, confidence) in enumerate(pose_keypoints):
+            point_2d = Keypoint2D()
+            point_2d.id = keypoint_id
+            point_2d.x, point_2d.y = u, v
+            point_2d.confidence = confidence
+            keypoints_2d.append(point_2d)
+            if confidence < self.keypoint_confidence:
+                continue
+            depth_m = self.keypoint_depth(depth, u, v, rgb_shape)
+            if depth_m is None or transform is None:
+                continue
+            point = self.point_in_target(u, v, depth_m, rgb_shape, transform)
+            if point is None:
+                continue
+            point_3d = Keypoint3D()
+            point_3d.id = keypoint_id
+            point_3d.position.x, point_3d.position.y, point_3d.position.z = point
+            point_3d.confidence = confidence
+            keypoints_3d.append(point_3d)
+            # Confidence travels with the point so orientation can apply its
+            # stricter threshold independently from skeleton rendering.
+            points_3d[keypoint_id] = (*point, confidence)
+        return keypoints_2d, keypoints_3d, points_3d
+
+    def body_yaw_from_keypoints(self, points_3d, previous_track):
+        """Estimate a stable heading from body axis plus multi-point face cues.
+
+        Hip and shoulder pairs only describe an *axis*: their two directions
+        differ by 180 degrees and must not be averaged as directed headings.
+        We therefore average them in double-angle space. The torso-to-nose
+        vector and nose-to-eyes/ears vector vote for the forward half. A track
+        must see an opposite vote for several frames before its heading flips;
+        short face occlusions retain the last reliable heading briefly.
+        """
+        def confidence(point):
+            return float(point[3]) if len(point) > 3 else 1.0
+
+        def hold_previous_heading():
+            if not previous_track or not previous_track.get('orientation_valid', False):
+                return None, 0, 0
+            held_frames = int(previous_track.get('orientation_hold_frames', 0)) + 1
+            if (self.orientation_hold_frames >= 0 and
+                    held_frames > self.orientation_hold_frames):
+                return None, 0, 0
+            return (float(previous_track['body_yaw_rad']),
+                    int(previous_track.get('orientation_flip_votes', 0)),
+                    held_frames)
+
+        def valid_pair(first, second, minimum, maximum):
+            if (first is None or second is None or
+                    confidence(first) < self.orientation_keypoint_confidence or
+                    confidence(second) < self.orientation_keypoint_confidence):
+                return False
+            return minimum <= math.hypot(second[0] - first[0], second[1] - first[1]) <= maximum
+
+        def torso_pair_for_face(first, second, maximum):
+            """Accept a projected torso pair when its centre is still usable.
+
+            A person viewed nearly side-on can project both shoulders (or hips)
+            onto almost the same ground-plane position.  That pair has no
+            usable body *axis*, but its midpoint is still a reliable torso
+            reference for the nose direction below.  Keep the upper-width
+            bound to reject widely separated, incorrectly associated joints.
+            """
+            if (first is None or second is None or
+                    confidence(first) < self.orientation_keypoint_confidence or
+                    confidence(second) < self.orientation_keypoint_confidence):
+                return False
+            return math.hypot(second[0] - first[0], second[1] - first[1]) <= maximum
+
+        def perpendicular_yaw(first, second):
+            return wrap_angle(math.atan2(second[1] - first[1], second[0] - first[0]) +
+                              math.pi / 2.0)
+
+        axis_candidates = []
+        left_hip = points_3d.get(self.LEFT_HIP)
+        right_hip = points_3d.get(self.RIGHT_HIP)
+        hips_valid = valid_pair(left_hip, right_hip,
+                                self.minimum_hip_width, self.maximum_hip_width)
+        if hips_valid:
+            axis_candidates.append((perpendicular_yaw(left_hip, right_hip),
+                                    2.0 * 0.5 * (confidence(left_hip) + confidence(right_hip))))
+
+        left_shoulder = points_3d.get(self.LEFT_SHOULDER)
+        right_shoulder = points_3d.get(self.RIGHT_SHOULDER)
+        shoulders_valid = valid_pair(left_shoulder, right_shoulder,
+                                     self.minimum_shoulder_width,
+                                     self.maximum_shoulder_width)
+        if shoulders_valid:
+            axis_candidates.append((perpendicular_yaw(left_shoulder, right_shoulder),
+                                    1.5 * 0.5 * (confidence(left_shoulder) +
+                                                 confidence(right_shoulder))))
+
+        nose = points_3d.get(self.NOSE)
+        shoulders_for_face = torso_pair_for_face(
+            left_shoulder, right_shoulder, self.maximum_shoulder_width)
+        hips_for_face = torso_pair_for_face(
+            left_hip, right_hip, self.maximum_hip_width)
+        if shoulders_valid:
+            torso_pair = (left_shoulder, right_shoulder)
+        elif hips_valid:
+            torso_pair = (left_hip, right_hip)
+        elif shoulders_for_face:
+            torso_pair = (left_shoulder, right_shoulder)
+        elif hips_for_face:
+            torso_pair = (left_hip, right_hip)
+        else:
+            torso_pair = None
+
+        if (torso_pair is None or nose is None or
+                confidence(nose) < self.orientation_nose_confidence):
+            return hold_previous_heading()
+
+        def stabilize_heading(yaw):
+            """Apply the existing temporal flip guard and yaw smoothing."""
+            flip_votes = 0
+            if previous_track and previous_track.get('orientation_valid', False):
+                previous_yaw = float(previous_track['body_yaw_rad'])
+                if abs(wrap_angle(yaw - previous_yaw)) > math.pi / 2.0:
+                    flip_votes = int(previous_track.get('orientation_flip_votes', 0)) + 1
+                    if flip_votes < self.orientation_flip_frames:
+                        return previous_yaw, flip_votes, 0
+                else:
+                    flip_votes = 0
+                yaw = wrap_angle(previous_yaw + self.body_yaw_smoothing *
+                                 wrap_angle(yaw - previous_yaw))
+            return yaw, flip_votes, 0
+
+        torso_center = (
+            0.5 * (torso_pair[0][0] + torso_pair[1][0]),
+            0.5 * (torso_pair[0][1] + torso_pair[1][1]),
+        )
+        nose_to_torso = (nose[0] - torso_center[0], nose[1] - torso_center[1])
+        if not axis_candidates:
+            # RGB-D keeps the nose-to-torso vector even when side-on torso
+            # width collapses.  This is camera-only perception, not simulator
+            # ground truth, and is withheld when the forward cue is too short.
+            if math.hypot(*nose_to_torso) < self.minimum_face_direction:
+                return hold_previous_heading()
+            return stabilize_heading(math.atan2(nose_to_torso[1], nose_to_torso[0]))
+
+        total_weight = sum(weight for _, weight in axis_candidates)
+        if total_weight <= 0.0:
+            return hold_previous_heading()
+        axis_yaw = 0.5 * math.atan2(
+            sum(weight * math.sin(2.0 * candidate)
+                for candidate, weight in axis_candidates),
+            sum(weight * math.cos(2.0 * candidate)
+                for candidate, weight in axis_candidates))
+
+        face_cues = [(nose_to_torso[0], nose_to_torso[1], 1.0)]
+        facial_points = [
+            points_3d[keypoint_id] for keypoint_id in
+            (self.LEFT_EYE, self.RIGHT_EYE, self.LEFT_EAR, self.RIGHT_EAR)
+            if keypoint_id in points_3d and
+            confidence(points_3d[keypoint_id]) >= self.orientation_face_confidence
+        ]
+        if len(facial_points) >= 2:
+            facial_weight = sum(confidence(point) for point in facial_points)
+            facial_center = (
+                sum(confidence(point) * point[0] for point in facial_points) / facial_weight,
+                sum(confidence(point) * point[1] for point in facial_points) / facial_weight,
+            )
+            face_cues.append((nose[0] - facial_center[0],
+                              nose[1] - facial_center[1], 1.0))
+
+        face_vote = 0.0
+        face_vote_weight = 0.0
+        for face_x, face_y, cue_weight in face_cues:
+            face_distance = math.hypot(face_x, face_y)
+            if face_distance < self.minimum_face_direction:
+                continue
+            alignment = ((math.cos(axis_yaw) * face_x +
+                          math.sin(axis_yaw) * face_y) / face_distance)
+            if abs(alignment) < self.minimum_face_alignment:
+                continue
+            face_vote += cue_weight * alignment
+            face_vote_weight += cue_weight
+        if face_vote_weight <= 0.0:
+            return hold_previous_heading()
+        face_vote /= face_vote_weight
+        if abs(face_vote) < self.minimum_face_alignment:
+            return hold_previous_heading()
+
+        yaw = axis_yaw if face_vote > 0.0 else wrap_angle(axis_yaw + math.pi)
+        return stabilize_heading(yaw)
+
+    @staticmethod
+    def set_person_yaw(person, yaw):
+        qx, qy, qz, qw = yaw_quaternion(yaw)
+        person.pose.orientation.x = qx
+        person.pose.orientation.y = qy
+        person.pose.orientation.z = qz
+        person.pose.orientation.w = qw
+
+    def camera_intrinsics(self, rgb_shape):
+        """Return intrinsics scaled to the RGB image used by YOLO."""
+        info = self.camera_info
+        image_height, image_width = rgb_shape[:2]
+        info_width = int(info.width) if info.width else image_width
+        info_height = int(info.height) if info.height else image_height
+        scale_x = image_width / max(1, info_width)
+        scale_y = image_height / max(1, info_height)
+        return (info.k[0] * scale_x, info.k[4] * scale_y,
+                info.k[2] * scale_x, info.k[5] * scale_y)
+
+    def target_transform(self, source_frame, stamp):
+        """Look up one camera-to-target transform for the whole RGB-D frame."""
+        if not source_frame:
+            self.get_logger().warn(
+                'Camera frame_id is empty; cannot transform RGB-D points',
+                throttle_duration_sec=2.0)
+            return None
         try:
-            transform = self.tf_buffer.lookup_transform(
+            return self.tf_buffer.lookup_transform(
                 self.target_frame, source_frame, rclpy.time.Time.from_msg(stamp),
                 timeout=Duration(seconds=0.05))
         except TransformException as error:
@@ -801,311 +1207,359 @@ class SocialVlmPerception(Node):
                 f'TF {source_frame} -> {self.target_frame}: {error}',
                 throttle_duration_sec=2.0)
             return None
+
+    @staticmethod
+    def transform_optical_point(optical, transform):
         rotated = rotate_vector(optical, transform.transform.rotation)
         translation = transform.transform.translation
         return (rotated[0] + translation.x,
                 rotated[1] + translation.y,
                 rotated[2] + translation.z)
 
-    def robot_pose(self, stamp):
-        """(x, y, yaw) of the robot in target_frame, or None if TF is not up.
+    def point_in_target(self, u, v, depth, rgb_shape, transform):
+        fx, fy, cx, cy = self.camera_intrinsics(rgb_shape)
+        if fx <= 0.0 or fy <= 0.0:
+            return None
+        optical = ((u - cx) * depth / fx, (v - cy) * depth / fy, depth)
+        return self.transform_optical_point(optical, transform)
 
-        Only radial_velocity and motion_type need this. A failure here must not
-        cost the frame: the positions and velocities are already valid without
-        it, and dropping them would be a worse trade than publishing two empty
-        labels -- which is exactly what an empty motion_type means.
-        """
+    def track_velocity(self, track_id, point, stamp_value):
+        """Estimate map-frame velocity for the stable ID assigned by ByteTrack."""
+        previous = self.tracks.get(track_id)
+        if previous is None:
+            return (0.0, 0.0, 0.0)
+        dt = stamp_value - previous['stamp']
+        if dt <= 1e-3:
+            return (0.0, 0.0, 0.0)
+        measured = tuple((point[index] - previous['point'][index]) / dt
+                         for index in range(3))
+        return tuple(
+            self.velocity_alpha * measured[index] +
+            (1.0 - self.velocity_alpha) * previous['velocity'][index]
+            for index in range(3))
+
+    def reset_bytetrack(self):
+        """Forget tracks when the simulator removes all actors."""
+        predictor = getattr(self.yolo, 'predictor', None)
+        for tracker in getattr(predictor, 'trackers', []):
+            tracker.reset()
+
+    def robot_transform(self, header):
+        """Return the map/target-frame to robot-frame transform at an RGB stamp."""
         try:
-            transform = self.tf_buffer.lookup_transform(
-                self.target_frame, self.robot_frame,
-                rclpy.time.Time.from_msg(stamp), timeout=Duration(seconds=0.05))
+            return self.tf_buffer.lookup_transform(
+                self.robot_frame, self.target_frame,
+                rclpy.time.Time.from_msg(header.stamp),
+                timeout=Duration(seconds=0.05))
         except TransformException as error:
             self.get_logger().warn(
-                f'TF {self.robot_frame} -> {self.target_frame}: {error}',
-                throttle_duration_sec=5.0)
+                f'TF {self.target_frame} -> {self.robot_frame}: {error}',
+                throttle_duration_sec=2.0)
             return None
-        translation = transform.transform.translation
-        return (translation.x, translation.y,
-                quaternion_yaw(transform.transform.rotation))
 
-    def scene_rulings(self):
-        """Block C's verdict per person id: {id: (scene_type, confidence, stamp)}.
+    def robot_velocity(self, header):
+        """Return the current robot linear velocity in robot-frame coordinates."""
+        odom, age = self.nearest_sensor_message('odom_buffer', header)
+        if odom is None:
+            return (0.0, 0.0, 0.0)
+        if age > self.max_odom_age:
+            self.get_logger().warn(
+                f'Odom is {age:.3f}s away from the RGB frame; using zero robot velocity',
+                throttle_duration_sec=2.0)
+            return (0.0, 0.0, 0.0)
+        velocity = odom.twist.twist.linear
+        return (float(velocity.x), float(velocity.y), float(velocity.z))
 
-        Reads the decision cache the social-region publisher already maintains
-        rather than asking the model again. The cache is keyed by pair and
-        refreshed every few seconds; this runs at frame rate, so re-deriving it
-        here would be asking the same question hundreds of times per answer.
+    @staticmethod
+    def relative_position(x, y):
+        degrees = math.degrees(math.atan2(y, x))
+        if -30.0 <= degrees <= 30.0:
+            return 'front'
+        if 30.0 < degrees < 150.0:
+            return 'front_left' if degrees < 90.0 else 'rear_left'
+        if -150.0 < degrees < -30.0:
+            return 'front_right' if degrees > -90.0 else 'rear_right'
+        return 'rear'
 
-        Only a positive `talking` ruling produces a scene_type. "not_talking"
-        is a real answer, but block D carries no region for it -- its neutral
-        shape already IS "nothing known socially", so inventing a value its
-        table does not hold would fall back to that same shape while looking
-        like information. Which way somebody is moving is block B's half of the
-        judgement and arrives on motion_type either way.
-        """
-        rulings = {}
-        with self.state_lock:
-            cached = list(self.interaction_cache.items())
-        for pair, result in cached:
-            if result['state'] != 'talking':
-                continue
-            stamp = result['inference_stamp']
-            for member_id in pair:
-                previous = rulings.get(member_id)
-                # Somebody can sit in two confirmed pairs. The newest ruling is
-                # the one that says how recently this was reconfirmed.
-                if (previous is None or
-                        stamp_seconds(stamp) > stamp_seconds(previous[2])):
-                    rulings[member_id] = (
-                        'talking', float(result['confidence']), stamp)
-        return rulings
-
-    def assign_track(self, point, stamp_value, used_ids):
-        best_id, best_distance = None, self.track_distance
-        for track_id, state in self.tracks.items():
-            if track_id in used_ids:
-                continue
-            distance = math.hypot(point[0] - state['point'][0],
-                                  point[1] - state['point'][1])
-            if distance < best_distance:
-                best_id, best_distance = track_id, distance
-        if best_id is None:
-            # Before minting a new id, check whether this is somebody who was
-            # tracked until moments ago and is standing where they were left.
-            #
-            # A new id is not a cosmetic detail here. Every VLM decision is
-            # cached under the pair of ids it was made about, so reissuing one
-            # renames the pair, orphans the decision and deletes the social
-            # region -- for a full inference, which is tens of seconds during
-            # which the two people are still talking and nothing keeps the
-            # robot out from between them. Handing the same person their id
-            # back is what makes the region survive being briefly lost.
-            for track_id, state in self.lost_tracks.items():
-                if track_id in used_ids:
-                    continue
-                if stamp_value - state['stamp'] > self.reidentify_timeout:
-                    continue
-                distance = math.hypot(point[0] - state['point'][0],
-                                      point[1] - state['point'][1])
-                if distance < best_distance:
-                    best_id, best_distance = track_id, distance
-            if best_id is not None:
-                self.lost_tracks.pop(best_id, None)
-                # Velocity across an unobserved gap is not measurable, and a
-                # position difference divided by that gap is not a speed.
-                return best_id, (0.0, 0.0, 0.0)
-
-        if best_id is None:
-            best_id = self.next_track_id
-            self.next_track_id += 1
-            velocity = (0.0, 0.0, 0.0)
+    def motion_state(self, x, y, velocity_x, velocity_y):
+        speed = math.hypot(velocity_x, velocity_y)
+        if speed < self.prediction_min_speed:
+            return 'stationary', 'stationary', speed
+        distance = math.hypot(x, y)
+        radial_speed = 0.0 if distance < 1e-3 else (
+            x * velocity_x + y * velocity_y) / distance
+        if radial_speed <= -0.5 * self.prediction_min_speed:
+            direction = 'toward_robot'
+        elif radial_speed >= 0.5 * self.prediction_min_speed:
+            direction = 'away_from_robot'
+        elif velocity_y <= -0.5 * self.prediction_min_speed:
+            direction = 'left_to_right'
+        elif velocity_y >= 0.5 * self.prediction_min_speed:
+            direction = 'right_to_left'
+        elif velocity_x > 0.0:
+            direction = 'forward'
         else:
-            previous = self.tracks[best_id]
-            dt = stamp_value - previous['stamp']
-            if dt <= 1e-3:
-                velocity = (0.0, 0.0, 0.0)
-            else:
-                measured = tuple((point[index] - previous['point'][index]) / dt
-                                 for index in range(3))
-                velocity = tuple(
-                    self.velocity_alpha * measured[index] +
-                    (1.0 - self.velocity_alpha) * previous['velocity'][index]
-                    for index in range(3))
-        return best_id, velocity
+            direction = 'backward'
+        return 'moving', direction, speed
+
+    def build_tracked_state(self, header, visible_tracks):
+        """Build the map-frame Block-B JSON contract from visible tracks."""
+        people = []
+        for track_id, track in sorted(visible_tracks.items()):
+            position = track['point']
+            velocity = track['velocity']
+            speed = math.hypot(velocity[0], velocity[1])
+            heading_valid = speed >= self.prediction_min_speed
+            heading = math.atan2(velocity[1], velocity[0]) if heading_valid else 0.0
+
+            def trajectory_point(dt):
+                # Block B publishes only the constant-velocity position at dt.
+                # Prediction uncertainty is intentionally not part of this
+                # contract, so downstream Block D keeps its configured social
+                # Gaussian dimensions instead of uncertainty-based expansion.
+                return {
+                    'dt_s': round(dt, 3),
+                    'x': round(position[0] + velocity[0] * dt, 3),
+                    'y': round(position[1] + velocity[1] * dt, 3),
+                }
+
+            trajectory = []
+            dt = self.prediction_step
+            while dt < self.prediction_horizon - 1e-6:
+                trajectory.append(trajectory_point(dt))
+                dt += self.prediction_step
+            trajectory.append(trajectory_point(self.prediction_horizon))
+            people.append({
+                'track_id': track_id,
+                'position_m': {
+                    'x': round(position[0], 3), 'y': round(position[1], 3),
+                },
+                'velocity_mps': {
+                    'vx': round(velocity[0], 3), 'vy': round(velocity[1], 3),
+                },
+                'motion_heading_rad': round(heading, 3),
+                'motion_heading_valid': heading_valid,
+                # Body-facing orientation is estimated from 3-D shoulder/hip
+                # axis and face keypoints, independently of motion heading.
+                'body_orientation_rad': round(
+                    float(track.get('body_yaw_rad', 0.0)), 3),
+                'body_orientation_valid': bool(
+                    track.get('orientation_valid', False)),
+                'prediction': {
+                    'horizon_s': round(self.prediction_horizon, 3),
+                    'trajectory_m': trajectory,
+                },
+            })
+        return {
+            'header': {
+                'stamp_ns': (
+                    int(header.stamp.sec) * 1_000_000_000 + int(header.stamp.nanosec)),
+                'frame_id': self.target_frame,
+            },
+            'people': people,
+        }
+
+    def publish_tracked_state(self, header, visible_tracks):
+        state = self.build_tracked_state(header, visible_tracks)
+        if state is None:
+            return
+        message = String()
+        message.data = json.dumps(state, ensure_ascii=False, separators=(',', ':'))
+        self.tracked_state_pub.publish(message)
 
     def rgb_callback(self, rgb_msg):
+        if self.rgb_raw_pub is not None:
+            self.rgb_raw_pub.publish(rgb_msg)
         self.rgb_frames += 1
         # A hide/clear callback may run while YOLO is processing this frame.
         # Capturing the generation here lets us reject that stale frame later.
+        reset_bytetrack = False
         with self.state_lock:
             frame_generation = self.scene_generation
-        # Decoded before the depth checks below, and separately from depth, so
-        # that every path from here on has a frame to show. Turning the RGB
-        # message into an array needs nothing from depth, and the camera view
-        # is how a person checks the pipeline is alive -- it must not go dark
-        # because depth is late, which is exactly when someone looks at it.
-        try:
-            image = self.rgb_array(rgb_msg)
-        except (ValueError, TypeError) as error:
-            # The one case with nothing to publish.
-            self.get_logger().error(str(error), throttle_duration_sec=2.0)
-            return
-
+            if self.tracks_generation != frame_generation:
+                # A hide event happened between frames. Reset here, on the RGB
+                # callback group that owns tracking, so the clear callback can
+                # never reset ByteTrack while association is running it.
+                self.tracks = {}
+                self.tracks_generation = frame_generation
+                reset_bytetrack = True
         # Keep one immutable reference throughout this inference even if the
         # depth callback receives a newer frame on the second executor thread.
-        depth_msg = self.depth_msg
+        depth_msg, depth_age = self.nearest_sensor_message('depth_buffer', rgb_msg.header)
         if depth_msg is None or self.camera_info is None:
             self.get_logger().warn('Waiting for depth image and CameraInfo',
                                    throttle_duration_sec=2.0)
-            self.publish_camera_view(image, rgb_msg.header)
             return
-        if abs(stamp_seconds(rgb_msg.header.stamp) -
-               stamp_seconds(depth_msg.header.stamp)) > self.max_depth_age:
-            self.get_logger().warn('RGB and depth timestamps are not synchronized',
-                                   throttle_duration_sec=2.0)
-            self.publish_camera_view(image, rgb_msg.header)
-            return
-        # /people is stamped with this frame's time, and the costmap layer
-        # transforms it through a TF buffer that only keeps a few seconds. A
-        # frame this callback picked up late would be published under a stamp
-        # TF has already forgotten, which Nav2 reports as "extrapolation into
-        # the past" and which silently costs the social layer its input. Drop
-        # it here instead. A clock that has not started yet reads as a negative
-        # age and is left alone.
-        frame_age = (stamp_seconds(self.get_clock().now().to_msg()) -
-                     stamp_seconds(rgb_msg.header.stamp))
-        if frame_age > self.max_frame_age:
+        if depth_age > self.max_depth_age:
             self.get_logger().warn(
-                f'Bỏ khung hình cũ {frame_age:.2f}s (ngưỡng '
-                f'{self.max_frame_age:.2f}s): pipeline không theo kịp camera',
-                throttle_duration_sec=2.0)
-            self.publish_camera_view(image, rgb_msg.header)
+                'RGB and depth timestamps are not synchronized: '
+                f'nearest delta={depth_age:.3f}s',
+                                   throttle_duration_sec=2.0)
             return
         try:
+            image = self.rgb_array(rgb_msg)
             depth_image = self.depth_array(depth_msg)
         except (ValueError, TypeError) as error:
             self.get_logger().error(str(error), throttle_duration_sec=2.0)
-            self.publish_camera_view(image, rgb_msg.header)
             return
 
         self.publish_depth_visualization(depth_image, depth_msg.header)
-        # Runs unsynchronized with the VLM on purpose; see ml_execution_lock.
-        result = self.yolo.predict(
-            source=image, classes=[0], conf=self.confidence,
-            imgsz=self.image_size, device=self.yolo_device,
-            verbose=False)[0]
+        yolo_uses_cuda = self.yolo_device.lower() not in ('cpu', 'mps')
+        lock_context = (self.ml_execution_lock if yolo_uses_cuda
+                        else contextlib.nullcontext())
+        with lock_context:
+            if reset_bytetrack:
+                self.reset_bytetrack()
+            result = self.yolo.track(
+                source=image, classes=[0], conf=self.confidence,
+                imgsz=self.image_size, device=self.yolo_device,
+                tracker=str(self.bytetrack_config), persist=True,
+                verbose=False)[0]
         detections = Detection2DArray()
         detections.header = rgb_msg.header
         people = People()
         people.header.stamp = rgb_msg.header.stamp
         people.header.frame_id = self.target_frame
-        # Block B's two robot-relative fields need the robot in the same frame
-        # the people end up in. None means the chain is not up yet, and
-        # radial_velocity/motion_type stay at their "not known" values rather
-        # than being filled with a guess that reads like a measurement.
-        robot = self.robot_pose(rgb_msg.header.stamp)
-        # Block C's standing verdicts, read once per frame rather than per
-        # person: the cache is shared and taking its lock inside the detection
-        # loop would serialise every box against the inference thread.
-        rulings = self.scene_rulings()
+        observations = PeopleObservations()
+        observations.header = rgb_msg.header
+        orientations = PeopleOrientations()
+        orientations.header = people.header
         markers = MarkerArray()
+        delete_all = Marker()
+        delete_all.action = Marker.DELETEALL
+        markers.markers.append(delete_all)
         annotated = image.copy()
         candidates = []
-        new_tracks, used_ids = {}, set()
+        new_tracks = {}
+        visible_tracks = {}
         stamp_value = stamp_seconds(rgb_msg.header.stamp)
-        # Every point already accepted for tracking this frame.
-        #
-        # YOLO's NMS only drops boxes that overlap heavily in the image; two
-        # boxes on the same person -- torso and whole body, say -- survive it
-        # and land within a few centimetres of each other once projected. Both
-        # reaching assign_track mints a SECOND id for that person, because
-        # used_ids forbids the later box from taking the id the first one just
-        # claimed, and the loser is then coasted for tracking_timeout seconds
-        # as a person in its own right. Measured 31-08-2026 with two people in
-        # the room: 28 ids in 40 s, up to 7 people in one message, and only
-        # 23.6% of messages reporting the right count.
-        #
-        # The coasting loop below already refuses to republish a track sitting
-        # on top of somebody published this frame. This is the same test, at
-        # the same distance, applied to the detections themselves.
-        frame_points = []
+
+        source_frame = (self.camera_info.header.frame_id or
+                        rgb_msg.header.frame_id or depth_msg.header.frame_id)
+        transform = None
+        if result.boxes is not None and len(result.boxes) > 0:
+            transform = self.target_transform(source_frame, rgb_msg.header.stamp)
 
         if result.boxes is not None:
-            # Highest score first, so the box that survives a merge is the
-            # confident one. Ultralytics already returns NMS output in this
-            # order; sorting makes that a property of this code rather than of
-            # the version installed.
-            for box in sorted(result.boxes,
-                              key=lambda item: float(item.conf[0]),
-                              reverse=True):
+            for detection_index, box in enumerate(result.boxes):
                 bbox = tuple(float(value) for value in box.xyxy[0].cpu().tolist())
                 score = float(box.conf[0].cpu())
                 detection = self.make_detection(rgb_msg, bbox, score)
                 detections.detections.append(detection)
                 z = self.median_depth(depth_image, bbox, image.shape)
                 x1, y1, x2, y2 = bbox
-                source_frame = depth_msg.header.frame_id or self.camera_info.header.frame_id
-                point = None if z is None else self.point_in_target(
-                    *self.torso_center(bbox), z,
-                    source_frame, rgb_msg.header.stamp)
-                color = (0, 200, 255) if point is not None else (0, 0, 255)
-                label = f'person {score:.2f}' + (
-                    f' {z:.1f}m' if z is not None else ' no-depth')
+                point = None if z is None or transform is None else self.point_in_target(
+                    *self.torso_center(bbox), z, image.shape, transform)
+                # ByteTrack assigns a numeric ID; map it to a display ID from 1 to 5
+                # so that colors and downstream IDs are strictly bound to 1-5.
+                raw_track_id = None if box.id is None else int(box.id[0].item())
+                if raw_track_id is not None:
+                    if raw_track_id not in self.display_id_map:
+                        used = set(self.display_id_map.values())
+                        for slot in range(1, 6):
+                            if slot not in used:
+                                self.display_id_map[raw_track_id] = slot
+                                break
+                        else:
+                            # Fallback if >5 people
+                            self.display_id_map[raw_track_id] = (raw_track_id % 5) + 1
+                    track_id = self.display_id_map[raw_track_id]
+                else:
+                    track_id = None
+                track_label = f'ID {track_id}' if track_id is not None else 'ID ?'
+                label = track_label + (f' {z:.1f}m' if z is not None else ' no-depth')
+
+                # Assign a distinct palette color per track_id so multiple people
+                # are visually distinguishable on the camera overlay.
+                _PERC_PALETTE = [
+                    (0, 255, 0),    # Green
+                    (255, 0, 0),    # Blue
+                    (0, 0, 255),    # Red
+                    (0, 255, 255),  # Yellow
+                    (255, 0, 255),  # Magenta
+                ]
+                if track_id is not None:
+                    color = _PERC_PALETTE[track_id % len(_PERC_PALETTE)]
+                else:
+                    color = (0, 200, 255)  # fallback orange for untracked detections
                 cv2.rectangle(annotated, (int(x1), int(y1)),
                               (int(x2), int(y2)), color, 2)
                 cv2.putText(annotated, label, (int(x1), max(20, int(y1) - 7)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                pose_keypoints = self.result_keypoints(result, detection_index)
+                if pose_keypoints is None and not self.pose_model_warning_logged:
+                    self.get_logger().warn(
+                        'YOLO checkpoint không xuất keypoints; skeleton/body-yaw '
+                        'sẽ không có. Hãy dùng YOLO Pose checkpoint.')
+                    self.pose_model_warning_logged = True
+                self.draw_pose_overlay(annotated, pose_keypoints)
                 if point is None:
                     continue
-                if any(math.hypot(point[0] - x, point[1] - y)
-                       < self.duplicate_distance for x, y in frame_points):
-                    cv2.putText(annotated, 'merged',
-                                (int(x1), min(image.shape[0] - 8, int(y2) + 20)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-                    continue
-                frame_points.append((point[0], point[1]))
 
-                track_id, velocity = self.assign_track(
-                    point, stamp_value, used_ids)
-                used_ids.add(track_id)
-                new_tracks[track_id] = {
-                    'point': point, 'velocity': velocity, 'stamp': stamp_value}
-                # One frame of evidence is not a person.
-                #
-                # Measured 01-09-2026 with two people in the room: a spurious
-                # box seen ONCE at 7.6 m produced a track that was then coasted
-                # for the full tracking_timeout -- 49 messages of /people, six
-                # seconds, from a single frame -- and social_rl's own people
-                # memory held it for seconds longer still. A second phantom
-                # came from two consecutive frames and cost another 49. Raising
-                # yolo_confidence does not reach them: those boxes scored 0.87
-                # and 0.53/0.31, straddling any threshold a real person also
-                # has to pass.
-                #
-                # So gate on evidence rather than on score. An unconfirmed
-                # track stays in self.tracks and keeps counting, but reaches
-                # neither /people nor the coasting loop below. The cost is that
-                # somebody entering frame is published (minimum_track_hits - 1)
-                # frames late, 0.25 s at the 8 Hz measured here; a person who
-                # was already confirmed keeps their count through lost_tracks
-                # and pays it only once.
-                hits = self.track_hits.get(track_id, 0) + 1
-                self.track_hits[track_id] = hits
-                if hits < self.minimum_track_hits:
-                    cv2.putText(annotated,
-                                f'new {hits}/{self.minimum_track_hits}',
-                                (int(x1), min(image.shape[0] - 8, int(y2) + 20)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+                if track_id is None:
                     continue
+                previous_track = self.tracks.get(track_id)
+                velocity = self.track_velocity(track_id, point, stamp_value)
+                keypoints_2d, keypoints_3d, points_3d = self.localize_keypoints(
+                    pose_keypoints, depth_image, image.shape, transform)
+                body_yaw, orientation_flip_votes, orientation_hold_frames = (
+                    self.body_yaw_from_keypoints(points_3d, previous_track))
+                orientation_valid = body_yaw is not None
+                new_tracks[track_id] = {
+                    'point': point,
+                    'velocity': velocity,
+                    'stamp': stamp_value,
+                    'orientation_valid': orientation_valid,
+                    'body_yaw_rad': 0.0 if body_yaw is None else body_yaw,
+                    'orientation_flip_votes': orientation_flip_votes,
+                    'orientation_hold_frames': orientation_hold_frames,
+                }
+                visible_tracks[track_id] = new_tracks[track_id]
+                # Keep downstream IDs stable: VLM pairs observations with
+                # ``People`` by this exact string, while the overlay uses the
+                # raw ByteTrack integer above the bounding box.
                 detection.id = f'person_{track_id}'
                 person = Person()
                 person.id = detection.id
                 person.pose.position.x, person.pose.position.y, person.pose.position.z = point
                 person.pose.orientation.w = 1.0
+                if orientation_valid:
+                    self.set_person_yaw(person, body_yaw)
                 (person.velocity.linear.x, person.velocity.linear.y,
                  person.velocity.linear.z) = velocity
-                fill_prediction(person, self.prediction_times,
-                                self.prediction_still_speed)
-                if robot is not None:
-                    fill_relative_motion(person, robot,
-                                         self.prediction_still_speed)
-                apply_scene_ruling(person, rulings)
                 people.people.append(person)
+                observation = PersonObservation()
+                observation.id = person.id
+                observation.confidence = score
+                (observation.bbox_x_min, observation.bbox_y_min,
+                 observation.bbox_x_max, observation.bbox_y_max) = bbox
+                observation.distance_m = float(z)
+                observation.orientation_valid = orientation_valid
+                observation.body_yaw_rad = 0.0 if body_yaw is None else body_yaw
+                observation.keypoints_2d = keypoints_2d
+                observation.keypoints_3d = keypoints_3d
+                observations.people.append(observation)
+                orientation = PersonOrientation()
+                orientation.id = person.id
+                orientation.valid = orientation_valid
+                orientation.body_yaw_rad = observation.body_yaw_rad
+                orientations.people.append(orientation)
                 candidates.append({'person': person, 'bbox': bbox})
-                markers.markers.append(self.person_marker(people.header, person, track_id))
-                cv2.putText(annotated, person.id,
-                            (int(x1), min(image.shape[0] - 8, int(y2) + 20)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+                markers.markers.extend(self.person_markers(
+                    people.header, person, track_id, points_3d, body_yaw))
+                markers.markers.extend(self.predicted_trajectory_markers(
+                    people.header, track_id, new_tracks[track_id]))
+                if orientation_valid:
+                    cv2.putText(
+                        annotated, f'yaw {math.degrees(body_yaw):+.0f} deg',
+                        (int(x1), min(image.shape[0] - 28, int(y2) + 40)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
         # A person the robot is standing in front of is still a person.
         #
         # Retaining the track used to protect only the id counter: the occluded
-        # person still dropped out of /people, so the pair key stopped matching
-        # and the finished VLM decision was deleted along with the social
-        # region. The robot approaching to pass between two people is itself
-        # what occludes them, so the region protecting them disappeared exactly
-        # when it was needed and a fresh inference (tens of seconds) was needed
-        # to earn it back.
+        # person still dropped out of /people. The robot approaching to
+        # pass between two people is itself what can briefly occlude them.
         #
         # Republishing the track at its last known position keeps the pair
         # intact, and keeps the hidden person in the costmap while the robot
@@ -1117,16 +1571,6 @@ class SocialVlmPerception(Node):
             if track_id in new_tracks:
                 continue
             if not 0.0 <= age <= self.track_timeout:
-                # Past coasting range, but remember where they were so the
-                # same person can reclaim this id instead of being treated as
-                # a stranger the moment they are seen again.
-                self.lost_tracks[track_id] = state
-                continue
-            # Never confirmed, and now not seen either: the blip is over.
-            # Coasting it is what turns one stray box into six seconds of
-            # person. Park it where a reappearance can still reclaim the id.
-            if self.track_hits.get(track_id, 0) < self.minimum_track_hits:
-                self.lost_tracks[track_id] = state
                 continue
             # A track sitting on top of somebody already published this frame
             # is a second id for that same person, left over from a frame where
@@ -1144,37 +1588,38 @@ class SocialVlmPerception(Node):
             (coasted.pose.position.x, coasted.pose.position.y,
              coasted.pose.position.z) = state['point']
             coasted.pose.orientation.w = 1.0
+            orientation_valid = bool(state.get('orientation_valid', False))
+            body_yaw = float(state.get('body_yaw_rad', 0.0))
+            if orientation_valid:
+                self.set_person_yaw(coasted, body_yaw)
             (coasted.velocity.linear.x, coasted.velocity.linear.y,
              coasted.velocity.linear.z) = state['velocity']
-            fill_prediction(coasted, self.prediction_times,
-                            self.prediction_still_speed)
-            if robot is not None:
-                fill_relative_motion(coasted, robot,
-                                     self.prediction_still_speed)
-            apply_scene_ruling(coasted, rulings)
             people.people.append(coasted)
-            markers.markers.append(
-                self.person_marker(people.header, coasted, track_id))
+            orientation = PersonOrientation()
+            orientation.id = coasted.id
+            orientation.valid = orientation_valid
+            orientation.body_yaw_rad = body_yaw
+            orientations.people.append(orientation)
+            markers.markers.extend(self.person_markers(
+                people.header, coasted, track_id, {},
+                body_yaw if orientation_valid else None))
+            markers.markers.extend(self.predicted_trajectory_markers(
+                people.header, track_id, state))
         self.tracks = new_tracks
-        # Hit counts outlive self.tracks but not lost_tracks, which is what a
-        # reclaimed id needs and all it needs.
-        self.track_hits = {track_id: hits
-                           for track_id, hits in self.track_hits.items()
-                           if track_id in new_tracks or track_id in self.lost_tracks}
-        # `annotated` is finished at this point -- every box and label is drawn
-        # by the two loops above, and nothing below touches the pixels. Sending
-        # it now rather than at the end of the callback means the scene-cleared
-        # return below cannot blank the RViz camera panel, and keeps the topic
-        # off the one lock this callback still takes.
-        self.publish_camera_view(annotated, rgb_msg.header)
+        # Clean up mapping for raw track IDs that are no longer active
+        stale_raw_ids = [rid for rid, did in self.display_id_map.items() if did not in new_tracks]
+        for rid in stale_raw_ids:
+            del self.display_id_map[rid]
+
         visible_ids = {item.id for item in people.people}
         removed_completed_result = False
         with self.state_lock:
             if frame_generation != self.scene_generation:
                 # This RGB message started before a hide/clear event. Publishing
-                # its people would make old actors visible again and could
-                # validate an obsolete VLM answer. The camera view is just what
-                # the lens saw, so it went out above regardless.
+                # it would make old actors visible again and could validate an
+                # obsolete VLM answer.
+                self.tracks = {}
+                self.tracks_generation = self.scene_generation
                 return
             # Somebody leaving the frame invalidates work about *them*, not the
             # whole scene.
@@ -1216,8 +1661,8 @@ class SocialVlmPerception(Node):
         if dropped_inflight:
             # If this appears repeatedly while two people are talking, tracking
             # is losing them faster than the VLM can answer: raise
-            # tracking_timeout or tracking_max_distance rather than blaming the
-            # model.
+            # tracking_timeout or ByteTrack's track_buffer rather than blaming
+            # the model.
             self.get_logger().warn(
                 'MẤT DẤU giữa lúc suy luận, bỏ kết quả VLM của '
                 f'{dropped_inflight} (biến mất: {sorted(vanished_ids)})',
@@ -1228,8 +1673,15 @@ class SocialVlmPerception(Node):
         self.mark_first_frame_done()
         self.detections_pub.publish(detections)
         self.people_pub.publish(people)
+        self.tracks_pub.publish(people)
+        self.observations_pub.publish(observations)
+        self.orientations_pub.publish(orientations)
+        self.publish_tracked_state(rgb_msg.header, visible_tracks)
         self.markers_pub.publish(markers)
-        self.enqueue_vlm_scene(image, candidates, people.header)
+        self.annotated_pub.publish(self.cv_image_message(annotated, rgb_msg.header))
+        # VLM pair-crop generation and talking/not-talking inference are
+        # disabled.
+        # self.enqueue_vlm_scene(image, candidates, people.header)
 
     @staticmethod
     def make_detection(rgb_msg, bbox, score):
@@ -1246,8 +1698,8 @@ class SocialVlmPerception(Node):
         detection.results.append(hypothesis)
         return detection
 
-    @staticmethod
-    def person_marker(header, person, track_id):
+    def person_markers(self, header, person, track_id, keypoints_3d, body_yaw):
+        """Create RViz body, skeleton, and optional forward-yaw markers."""
         marker = Marker()
         marker.header = header
         marker.ns = 'rgbd_people'
@@ -1263,7 +1715,127 @@ class SocialVlmPerception(Node):
         marker.color.r, marker.color.g = 0.0, 1.0
         marker.color.b, marker.color.a = 0.1, 0.55
         marker.lifetime = Duration(seconds=0.4).to_msg()
-        return marker
+        markers = [marker]
+
+        if keypoints_3d:
+            joints = Marker()
+            joints.header = header
+            joints.ns = 'pose_keypoints'
+            joints.id = track_id
+            joints.type = Marker.SPHERE_LIST
+            joints.action = Marker.ADD
+            joints.scale.x = joints.scale.y = joints.scale.z = 0.08
+            joints.color.r, joints.color.g, joints.color.b, joints.color.a = 0.1, 0.8, 1.0, 0.95
+            joints.points = [Point(x=point[0], y=point[1], z=point[2])
+                             for point in keypoints_3d.values()]
+            joints.lifetime = Duration(seconds=0.4).to_msg()
+            markers.append(joints)
+
+            skeleton = Marker()
+            skeleton.header = header
+            skeleton.ns = 'pose_skeleton'
+            skeleton.id = track_id
+            skeleton.type = Marker.LINE_LIST
+            skeleton.action = Marker.ADD
+            skeleton.scale.x = 0.035
+            skeleton.color.r, skeleton.color.g, skeleton.color.b, skeleton.color.a = 1.0, 0.75, 0.0, 0.95
+            for first, second in SocialVlmPerception.COCO_SKELETON:
+                if first in keypoints_3d and second in keypoints_3d:
+                    first_point, second_point = keypoints_3d[first], keypoints_3d[second]
+                    skeleton.points.extend((
+                        Point(x=first_point[0], y=first_point[1], z=first_point[2]),
+                        Point(x=second_point[0], y=second_point[1], z=second_point[2]),
+                    ))
+            if skeleton.points:
+                skeleton.lifetime = Duration(seconds=0.4).to_msg()
+                markers.append(skeleton)
+
+        if body_yaw is not None:
+            arrow = Marker()
+            arrow.header = header
+            arrow.ns = 'body_yaw'
+            arrow.id = track_id
+            arrow.type = Marker.ARROW
+            arrow.action = Marker.ADD
+            arrow.pose = copy.deepcopy(person.pose)
+            arrow.pose.position.z = max(1.2, person.pose.position.z + 0.35)
+            arrow.scale.x, arrow.scale.y, arrow.scale.z = (
+                self.orientation_arrow_length, 0.12, 0.18)
+            arrow.color.r, arrow.color.g, arrow.color.b = self.orientation_arrow_color
+            arrow.color.a = 0.95
+            arrow.lifetime = Duration(seconds=self.orientation_arrow_lifetime).to_msg()
+            markers.append(arrow)
+        return markers
+
+    def predicted_trajectory_markers(self, header, track_id, track):
+        """Draw the map-frame constant-velocity prediction used by Block-B."""
+        velocity_x, velocity_y, _ = track['velocity']
+        if math.hypot(velocity_x, velocity_y) < self.prediction_min_speed:
+            return []
+
+        point = track['point']
+        # Keep the visual marker in target_frame (normally map).  Block-B also
+        # exports robot-relative coordinates, but putting those directly into a
+        # map-frame marker would make the trajectory shift whenever the robot
+        # moves.  The tracker velocity and point are already map-frame values.
+        trajectory = [Point(x=point[0], y=point[1], z=point[2])]
+        future_points = []
+        dt = self.prediction_step
+        while dt < self.prediction_horizon - 1e-6:
+            future_points.append(Point(
+                x=point[0] + velocity_x * dt,
+                y=point[1] + velocity_y * dt,
+                z=point[2]))
+            dt += self.prediction_step
+        future_points.append(Point(
+            x=point[0] + velocity_x * self.prediction_horizon,
+            y=point[1] + velocity_y * self.prediction_horizon,
+            z=point[2]))
+        trajectory.extend(future_points)
+
+        line = Marker()
+        line.header = header
+        line.ns = 'predicted_trajectory_line'
+        line.id = track_id
+        line.type = Marker.LINE_STRIP
+        line.action = Marker.ADD
+        line.pose.orientation.w = 1.0
+        line.scale.x = 0.045
+        line.color.r, line.color.g, line.color.b, line.color.a = 0.0, 0.9, 1.0, 0.95
+        line.points = trajectory
+        line.lifetime = Duration(seconds=0.4).to_msg()
+
+        dots = Marker()
+        dots.header = header
+        dots.ns = 'predicted_trajectory_points'
+        dots.id = track_id
+        dots.type = Marker.SPHERE_LIST
+        dots.action = Marker.ADD
+        dots.pose.orientation.w = 1.0
+        dots.scale.x = dots.scale.y = dots.scale.z = self.prediction_marker_diameter
+        dots.color.r, dots.color.g, dots.color.b, dots.color.a = 1.0, 0.0, 0.0, 0.95
+        # The actor/body marker is the present position.  Dots are only the
+        # predicted positions at prediction_step through prediction_horizon.
+        dots.points = future_points
+        dots.lifetime = Duration(seconds=0.4).to_msg()
+        return [line, dots]
+
+    def draw_pose_overlay(self, image, pose_keypoints):
+        """Draw YOLO Pose joints in the annotated RGB image for quick checks."""
+        if pose_keypoints is None:
+            return
+        visible = {
+            keypoint_id: (int(round(u)), int(round(v)))
+            for keypoint_id, (u, v, confidence) in enumerate(pose_keypoints)
+            if confidence >= self.keypoint_confidence
+        }
+        for first, second in self.COCO_SKELETON:
+            if first in visible and second in visible:
+                cv2.line(image, visible[first], visible[second], (0, 215, 255), 2,
+                         lineType=cv2.LINE_AA)
+        for point in visible.values():
+            cv2.circle(image, point, 4, (0, 255, 80), -1, lineType=cv2.LINE_AA)
+            cv2.circle(image, point, 5, (20, 20, 20), 1, lineType=cv2.LINE_AA)
 
     @staticmethod
     def cv_image_message(image, header):
@@ -1273,32 +1845,8 @@ class SocialVlmPerception(Node):
         output.encoding = 'bgr8'
         output.is_bigendian = 0
         output.step = output.width * 3
-        # array.array('B', ...) rather than bytes: the generated setter for a
-        # uint8[] field returns immediately for an array.array, but validates a
-        # bytes object element by element -- two Python loops over all 921 600
-        # bytes of a 640x480 frame. Measured on this machine: 257 ms per call
-        # against 0.34 ms. Two calls per frame (annotated view and depth
-        # colormap) were 880 ms of every 1215 ms rgb_callback spent, which held
-        # /people to 0.82 Hz and made its stamps older than people_timeout.
-        output.data = array.array('B', image.tobytes())
+        output.data = image.tobytes()
         return output
-
-    def publish_camera_view(self, image, header):
-        """Put a frame on the annotated topic, whichever way rgb_callback exits.
-
-        The RViz camera panel is the one place a person looks to decide whether
-        this pipeline is alive, so it stays fed even on the paths that have no
-        people to report: depth not up yet, depth out of sync, a frame arriving
-        too late to stamp, or the scene cleared mid-frame. On those paths the
-        image is the plain camera view with no boxes, which is the honest
-        picture -- nothing was detected because nothing was run.
-
-        The overlay is drawn here rather than at the call sites so the latency
-        readout appears on every published frame, not only on the complete ones.
-        """
-        if self.latency_overlay:
-            self.draw_latency_overlay(image)
-        self.annotated_pub.publish(self.cv_image_message(image, header))
 
     def publish_depth_visualization(self, depth_image, depth_header):
         finite = np.isfinite(depth_image) & (depth_image >= self.min_depth) & (
@@ -1315,6 +1863,7 @@ class SocialVlmPerception(Node):
             self.cv_image_message(depth_color, depth_header))
 
     def enqueue_vlm_scene(self, image, candidates, observation_header):
+        """LEGACY / DISABLED: queue a VLM pair crop if the branch is restored."""
         if not self.vlm_enabled or len(candidates) < 2:
             self.discard_queued_vlm_work()
             return
@@ -1339,8 +1888,8 @@ class SocialVlmPerception(Node):
         # only ever looking at the closest `max_vlm_pairs`. Truncating first
         # meant the nearest pair permanently occupied the only slot: while its
         # decision was still fresh the loop skipped it and ended, so a second
-        # conversation further away was never once put to the model and could
-        # not form a region of its own.
+        # conversation further away was never once put to the model for its
+        # separate diagnostic interaction result.
         for _, first, second in pair_candidates:
             if len(work) >= self.max_vlm_pairs:
                 break
@@ -1460,51 +2009,14 @@ class SocialVlmPerception(Node):
                     self.last_vlm_scenes.pop(pair, None)
 
     def vlm_worker(self):
-        backend = self.load_vlm_backend()
-        if backend is None:
-            return
-        prompt = str(self.get_parameter('talking_prompt').value)
-        self.run_vlm_loop(backend, prompt)
-
-    def load_vlm_backend(self):
-        """Return the object vlm_worker calls .infer() on, or None to give up.
-
-        Both answer the same call, so everything after this point is identical
-        whether the model sits in this process or on another machine.
-        """
-        if self.vlm_remote:
-            if not self.wait_for_remote_worker():
-                self.mark_vlm_load_done(False)
-                return None
-            self.mark_vlm_load_done(True)
-            return self.remote_backend
-
-        # Imported here, not at module scope, so a robot running vlm_remote
-        # never needs transformers, peft or bitsandbytes installed at all.
-        from vlm_backend import VlmBackend
-
+        """LEGACY / DISABLED: load and run the Qwen talking classifier."""
         adapter_value = str(self.get_parameter('vlm_adapter_path').value)
         adapter_path = self._resolve_file(adapter_value)
-
-        # A merged checkpoint is preferred when one is present: it loads without
-        # PEFT and answers identically (22/22 on the recorded crops). Missing or
-        # half-written, the adapter path below still works, so this stays an
-        # optimisation rather than a new requirement. Build one with
-        # social_perception/scripts/merge_vlm_adapter.py.
-        merged_value = str(self.get_parameter('vlm_merged_path').value)
-        merged_path = self._resolve_file(merged_value) if merged_value else None
-        if merged_path is not None and not (merged_path / 'config.json').is_file():
-            self.get_logger().warn(
-                f'Ignoring vlm_merged_path {merged_value}: no config.json there')
-            merged_path = None
-
-        if merged_path is None and (
-                adapter_path is None
-                or not (adapter_path / 'adapter_config.json').is_file()):
+        if adapter_path is None or not (adapter_path / 'adapter_config.json').is_file():
             self.get_logger().error(
                 f'VLM adapter not found at {adapter_value}; people localization remains active')
             self.mark_vlm_load_done(False)
-            return None
+            return
         try:
             backend = VlmBackend(
                 adapter_path,
@@ -1516,19 +2028,16 @@ class SocialVlmPerception(Node):
                 int(self.get_parameter('vlm_max_pixels').value),
                 self.get_logger(),
                 self.ml_execution_lock,
-                bool(self.get_parameter('vlm_force_answer_prefix').value),
-                bool(self.get_parameter('vlm_offline').value),
-                merged_path)
+                bool(self.get_parameter('vlm_force_answer_prefix').value))
         except Exception as error:  # Keep YOLO/depth available when ML deps are absent.
             self.get_logger().error(
                 f'Unable to load VLM ({type(error).__name__}: {error}); '
                 'people localization remains active')
             self.mark_vlm_load_done(False)
-            return None
+            return
         self.mark_vlm_load_done(True)
-        return backend
 
-    def run_vlm_loop(self, backend, prompt):
+        prompt = str(self.get_parameter('talking_prompt').value)
         while not self.stop_event.is_set():
             try:
                 work = self.work_queue.get(timeout=0.25)
@@ -1574,10 +2083,6 @@ class SocialVlmPerception(Node):
                 if not start_is_current:
                     self.finish_vlm_item(pair, item_generation, keep_scene=False)
                     continue
-                self.latency_started(pair)
-                self.get_logger().info(
-                    f'>>> VLM BẮT ĐẦU suy luận {pair} '
-                    f'(ảnh cắt {crop.shape[1]}x{crop.shape[0]})')
                 inference_started = time.monotonic()
                 try:
                     response = backend.infer(crop, prompt, pair)
@@ -1587,18 +2092,13 @@ class SocialVlmPerception(Node):
                         f'VLM inference failed for {pair}: {type(error).__name__}: {error}')
                     response, talking, confidence = str(error), False, 0.0
                 inference_elapsed = time.monotonic() - inference_started
-                average, samples = self.latency_finished(
-                    pair, inference_elapsed)
                 prep, wait, gen, ntok = getattr(
                     backend, 'last_timing', (0.0, 0.0, 0.0, 0))
                 self.get_logger().info(
-                    f'<<< VLM XONG {pair}: {inference_elapsed:.2f}s '
-                    f'(từ lúc bắt đầu tới khi có kết quả) | '
-                    f'tb {average:.2f}s, số lần {samples}')
-                self.get_logger().info(
-                    f'    chi tiết {pair}: crop={crop.shape[1]}x{crop.shape[0]}, '
-                    f'tokens={ntok} [tien_xu_ly={prep:.2f}s '
-                    f'cho_lock={wait:.2f}s model={gen:.2f}s]')
+                    f'VLM latency {pair}: {inference_elapsed:.2f}s, '
+                    f'crop={crop.shape[1]}x{crop.shape[0]}, tokens={ntok} '
+                    f'[tien_xu_ly={prep:.2f}s cho_lock={wait:.2f}s '
+                    f'model={gen:.2f}s]')
 
                 # Do not publish a result from an old image. Require a newer
                 # camera frame to confirm that both members are still visible
@@ -1648,10 +2148,9 @@ class SocialVlmPerception(Node):
                         scene['time'] = time.monotonic()
                     # Log while holding the generation lock so a clear event
                     # cannot be printed before this older decision. Report the
-                    # settled decision, not the raw answer: printing "KHÔNG NÓI
-                    # CHUYỆN" for an answer that was overruled would contradict
-                    # the region still on screen.
-                    if self.log_vlm_results:
+                    # settled decision, not the raw answer, so the interaction
+                    # topic and terminal log always agree.
+                    if bool(self.get_parameter('log_vlm_results').value):
                         self.log_vlm_result(pair, settled)
 
     def settled_result(self, previous, fresh):
@@ -1662,17 +2161,9 @@ class SocialVlmPerception(Node):
         `{"talking": "có"}`, the unterminated `{"talking": "có}`, and
         `{"talking":true}`. An answer that cannot be read carries no
         information about the conversation, yet it used to overwrite the cache
-        exactly like a confident "no" and delete the region outright.
-
-        Nothing then stopped the robot until a whole new inference confirmed
-        the conversation again -- tens of seconds later, and the people were
-        still talking the entire time. A single contrary answer is likewise
-        weak evidence against a region the robot is actively keeping clear, so
-        it takes `negative_answers_to_clear` of them in a row.
-
-        This stickiness is bounded, and deliberately so: publish_social_outputs
-        drops the region the moment either person stops being tracked, which is
-        the condition that actually means the conversation is over.
+        exactly like a confident "no". The diagnostic talking state therefore
+        still requires `negative_answers_to_clear` contrary answers in a row.
+        This cache is legacy-only; it does not control navigation output.
         """
         if previous is None or previous['state'] != 'talking':
             return fresh
@@ -1690,7 +2181,7 @@ class SocialVlmPerception(Node):
         else:
             reason = 'không đọc được câu trả lời'
         self.get_logger().info(
-            f'GIỮ VÙNG XÃ HỘI ({reason}): {fresh["response"]!r}')
+            f'GIỮ KẾT QUẢ VLM ({reason}): {fresh["response"]!r}')
         held = dict(previous)
         held['negatives'] = negatives
         held['time'] = fresh['time']
@@ -1702,12 +2193,9 @@ class SocialVlmPerception(Node):
         with self.state_lock:
             people = dict(self.latest_people)
             header = self.latest_header
-            # A conversation ends when the model says it ended, not when a
-            # stopwatch runs out: two people talking for longer than the
-            # timeout had their region deleted underneath them. Zero disables
-            # the stopwatch entirely, which is the default. What still bounds
-            # the decision is the membership test below -- a region cannot
-            # outlive the people it belongs to.
+            # Zero keeps a diagnostic VLM decision until a newer answer arrives.
+            # Any positive timeout expires only that interaction record; the
+            # person tracking output is unaffected.
             expired = [
                 pair for pair, result in self.interaction_cache.items()
                 if (self.interaction_timeout > 0.0 and
@@ -1727,7 +2215,6 @@ class SocialVlmPerception(Node):
 
         interactions = TalkingInteractions()
         interactions.header = header
-        positive_pairs = []
         for pair, result in sorted(results.items()):
             interaction = TalkingInteraction()
             interaction.id = f'talking_{pair[0]}_{pair[1]}'
@@ -1741,62 +2228,7 @@ class SocialVlmPerception(Node):
             interaction.center = self.center_of(result['people'])
             interaction.raw_response = result['response']
             interactions.interactions.append(interaction)
-            if (interaction.talking and
-                    all(member_id in people for member_id in pair)):
-                positive_pairs.append(pair)
 
-        groups = Groups()
-        groups.header = header
-        social_markers = MarkerArray()
-        delete_all = Marker()
-        delete_all.header = header
-        delete_all.action = Marker.DELETEALL
-        social_markers.markers.append(delete_all)
-        marker_id = 0
-        for group_index, member_ids in enumerate(self.connected_components(positive_pairs)):
-            members = [people[member_id] for member_id in member_ids]
-            center = self.center_of(members)
-            member_radius = max(math.hypot(
-                person.pose.position.x - center.x,
-                person.pose.position.y - center.y) for person in members)
-            # Stamp each region from the decisions that actually built it. A
-            # component can rest on several confirmed pairs, so the newest
-            # ruling is what says how recently this region was reconfirmed.
-            supporting = [results[pair] for pair in positive_pairs
-                          if set(pair) <= member_ids]
-            newest = max(supporting,
-                         key=lambda item: stamp_seconds(item['inference_stamp']))
-            group = Group()
-            # Copied, not referenced: assigning a message field stores the
-            # object itself, and these two belong to the cached decision that
-            # later inferences still read.
-            group.inference_stamp = copy.deepcopy(newest['inference_stamp'])
-            group.observation_stamp = copy.deepcopy(
-                newest['observation_header'].stamp)
-            group.confidence = float(newest['confidence'])
-            group.id = f'vlm_social_region_{group_index}'
-            group.member_ids = sorted(member_ids)
-            group.center = center
-            group.o_radius = max(self.group_o_min_radius, member_radius * 0.5)
-            group.p_radius = max(group.o_radius + 0.15,
-                                 member_radius + self.group_p_margin)
-            group.r_radius = group.p_radius + self.group_r_margin
-            groups.groups.append(group)
-            # A translucent disc first, so the region reads as an area from any
-            # camera angle. The outlines on top keep the three radii readable.
-            social_markers.markers.append(self.social_disc_marker(
-                header, group, marker_id))
-            marker_id += 1
-            for radius, color, label in (
-                    (group.o_radius, (1.0, 0.0, 0.0, 0.90), 'O'),
-                    (group.p_radius, (1.0, 0.45, 0.0, 0.75), 'P'),
-                    (group.r_radius, (1.0, 0.9, 0.0, 0.55), 'R')):
-                social_markers.markers.append(self.social_circle_marker(
-                    header, group, marker_id, radius, color, label))
-                marker_id += 1
-            social_markers.markers.append(self.social_label_marker(
-                header, group, marker_id, len(members)))
-            marker_id += 1
         interaction_signature = tuple(
             (item.id, item.state, item.talking, round(item.confidence, 3),
              item.raw_response, item.inference_stamp.sec,
@@ -1809,59 +2241,6 @@ class SocialVlmPerception(Node):
             self.interactions_pub.publish(interactions)
             self.last_interactions_signature = interaction_signature
             self.last_interactions_publish = now
-        self.groups_pub.publish(groups)
-        self.social_markers_pub.publish(social_markers)
-
-    def latency_started(self, pair):
-        """Record that this pair is now waiting on the model."""
-        with self.latency_lock:
-            self.vlm_running_since[pair] = time.monotonic()
-
-    def latency_finished(self, pair, elapsed):
-        """Fold one completed inference into the running statistics."""
-        with self.latency_lock:
-            self.vlm_running_since.pop(pair, None)
-            self.vlm_last_latency = elapsed
-            self.vlm_latency_count += 1
-            self.vlm_latency_total += elapsed
-            return (self.vlm_latency_total / self.vlm_latency_count,
-                    self.vlm_latency_count)
-
-    def latency_overlay_text(self):
-        """One status line for the annotated image, or None when idle.
-
-        cv2's Hershey fonts carry no Vietnamese diacritics, so the text is
-        deliberately unaccented -- the alternative renders as boxes.
-        """
-        now = time.monotonic()
-        with self.latency_lock:
-            running = dict(self.vlm_running_since)
-            last = self.vlm_last_latency
-            count = self.vlm_latency_count
-            total = self.vlm_latency_total
-        if running:
-            pair, started_at = min(running.items(), key=lambda item: item[1])
-            waited = now - started_at
-            label = ','.join(member.replace('person_', '') for member in pair)
-            return f'VLM: dang suy luan cap ({label}) {waited:4.1f}s'
-        if count:
-            return (f'VLM: lan cuoi {last:.2f}s | tb {total / count:.2f}s '
-                    f'| n={count}')
-        return None
-
-    def draw_latency_overlay(self, annotated):
-        text = self.latency_overlay_text()
-        if text is None:
-            return
-        font, scale, thickness = cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
-        (width, height), baseline = cv2.getTextSize(
-            text, font, scale, thickness)
-        # A filled plate behind the text keeps it readable over the camera
-        # image, which is often bright wall or floor exactly here.
-        cv2.rectangle(annotated, (6, 6), (14 + width, 18 + height + baseline),
-                      (0, 0, 0), cv2.FILLED)
-        cv2.putText(annotated, text, (10, 12 + height), font, scale,
-                    (0, 255, 255), thickness, cv2.LINE_AA)
 
     def log_vlm_result(self, pair, result):
         if result['state'] == 'talking':
@@ -1878,6 +2257,11 @@ class SocialVlmPerception(Node):
         self.get_logger().info(f'KẾT QUẢ: {decision}')
 
     @staticmethod
+    def angular_distance(first, second):
+        return abs(math.atan2(math.sin(first - second),
+                              math.cos(first - second)))
+
+    @staticmethod
     def center_of(people):
         center = Point()
         count = float(len(people))
@@ -1886,104 +2270,8 @@ class SocialVlmPerception(Node):
         center.z = sum(person.pose.position.z for person in people) / count
         return center
 
-    @staticmethod
-    def connected_components(pairs):
-        graph = {}
-        for first, second in pairs:
-            graph.setdefault(first, set()).add(second)
-            graph.setdefault(second, set()).add(first)
-        components = []
-        remaining = set(graph)
-        while remaining:
-            seed = remaining.pop()
-            component, stack = {seed}, [seed]
-            while stack:
-                current = stack.pop()
-                for neighbor in graph[current] & remaining:
-                    remaining.remove(neighbor)
-                    component.add(neighbor)
-                    stack.append(neighbor)
-            components.append(component)
-        return components
-
-    # Every social marker outlives one publish cycle only. Without this a
-    # crashed or stopped node leaves a region frozen on screen, which reads
-    # exactly like a live detection and hides the fact that nothing is running.
-    MARKER_LIFETIME = 0.6
-
-    @classmethod
-    def social_circle_marker(cls, header, group, marker_id, radius, color, label):
-        marker = Marker()
-        marker.header = header
-        marker.ns = f'vlm_social_region_{label}'
-        marker.id = marker_id
-        marker.type = Marker.LINE_STRIP
-        marker.action = Marker.ADD
-        marker.pose.position = copy.deepcopy(group.center)
-        marker.pose.position.z = 0.04
-        marker.pose.orientation.w = 1.0
-        marker.scale.x = 0.06
-        marker.color.r, marker.color.g, marker.color.b, marker.color.a = color
-        marker.lifetime = Duration(seconds=cls.MARKER_LIFETIME).to_msg()
-        for index in range(65):
-            angle = 2.0 * math.pi * index / 64.0
-            point = Point()
-            point.x = radius * math.cos(angle)
-            point.y = radius * math.sin(angle)
-            marker.points.append(point)
-        return marker
-
-    @classmethod
-    def social_disc_marker(cls, header, group, marker_id):
-        """Filled R-space, drawn flat on the floor under the outlines."""
-        marker = Marker()
-        marker.header = header
-        marker.ns = 'vlm_social_region_fill'
-        marker.id = marker_id
-        marker.type = Marker.CYLINDER
-        marker.action = Marker.ADD
-        marker.pose.position = copy.deepcopy(group.center)
-        marker.pose.position.z = 0.01
-        marker.pose.orientation.w = 1.0
-        marker.scale.x = 2.0 * group.r_radius
-        marker.scale.y = 2.0 * group.r_radius
-        marker.scale.z = 0.02
-        marker.color.r, marker.color.g = 1.0, 0.75
-        marker.color.b, marker.color.a = 0.0, 0.22
-        marker.lifetime = Duration(seconds=cls.MARKER_LIFETIME).to_msg()
-        return marker
-
-    @classmethod
-    def social_label_marker(cls, header, group, marker_id, member_count):
-        """Floating caption so the VLM decision is visible in the 3D view."""
-        marker = Marker()
-        marker.header = header
-        marker.ns = 'vlm_social_region_label'
-        marker.id = marker_id
-        marker.type = Marker.TEXT_VIEW_FACING
-        marker.action = Marker.ADD
-        marker.pose.position = copy.deepcopy(group.center)
-        marker.pose.position.z = 2.1
-        marker.pose.orientation.w = 1.0
-        marker.scale.z = 0.28
-        marker.color.r = marker.color.g = marker.color.b = 1.0
-        marker.color.a = 0.95
-        marker.text = (f'VLM: dang noi chuyen ({member_count} nguoi)\n'
-                       f'R={group.r_radius:.2f} m')
-        marker.lifetime = Duration(seconds=cls.MARKER_LIFETIME).to_msg()
-        return marker
-
     def destroy_node(self):
         self.stop_event.set()
-        # Print the session total on the way out: the per-inference lines have
-        # usually scrolled away by the time a run ends.
-        with self.latency_lock:
-            samples = self.vlm_latency_count
-            total = self.vlm_latency_total
-        if samples:
-            self.get_logger().info(
-                f'TỔNG KẾT VLM: {samples} lần suy luận, '
-                f'tb {total / samples:.2f}s')
         if self.vlm_thread is not None:
             try:
                 self.vlm_thread.join(timeout=1.0)
@@ -1997,13 +2285,7 @@ class SocialVlmPerception(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = SocialVlmPerception()
-    # Three mutually-exclusive callback groups need three threads to run
-    # concurrently: RGB (YOLO), depth, and the default group that carries the
-    # 0.2 s social-output timer. At two threads a slow RGB frame left depth and
-    # the timer sharing one thread, which is what produced the "RGB and depth
-    # timestamps are not synchronized" warnings the depth group was split out
-    # to prevent. The fourth is headroom for service/parameter callbacks.
-    executor = MultiThreadedExecutor(num_threads=4)
+    executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
     try:
         executor.spin()

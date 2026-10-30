@@ -34,12 +34,15 @@ from social_rl.gazebo_world import GazeboWorld
 from social_rl.ground_truth import GroundTruthPeople
 from social_rl.observation import VECTOR_FEATURES, ObservationConfig
 from social_rl.reward import RewardConfig, evaluate_step
+from social_rl.route_sampling import (route_seed_frame, route_start_yaw,
+                                      sample_list_route)
 from social_rl.ros_interface import (EnvConfig, PerceptionBridge,
                                      scale_action)
+from social_rl.velocity_smoother import VelocitySmoother
 
 
-def _reward_social_intrusion(state: dict, has_ground_truth: bool) -> float:
-    """Choose the authoritative social depth for this environment step.
+def _reward_intrusion_by_type(state: dict, has_ground_truth: bool) -> dict:
+    """Choose the authoritative C_talk/C_view/C_cross for this step.
 
     Ground-truth mode must fail loudly if the bridge ever stops supplying the
     full scene; silently falling back there would reopen the turn-away
@@ -47,8 +50,8 @@ def _reward_social_intrusion(state: dict, has_ground_truth: bool) -> float:
     Perception mode has no simulator-only list and deliberately uses its
     visible/remembered value.
     """
-    key = ('social_intrusion_hidden'
-           if has_ground_truth else 'social_intrusion')
+    key = ('social_intrusion_hidden_by_type'
+           if has_ground_truth else 'social_intrusion_by_type')
     return state[key]
 
 
@@ -204,6 +207,18 @@ class SocialAvoidEnv(gym.Env):
         self.observation_config = observation_config
         self.reward_config = reward_config
 
+        if env_config.talking_goal_clearance <= 0.0:
+            raise ValueError('talking_goal_clearance must be greater than 0 m')
+        # The actor places its centre no earlier than 45% along the route. A
+        # shorter route cannot retain the configured clearance before its goal
+        # and would silently spawn an empty `talking` episode in Gazebo.
+        minimum_talking_length = env_config.talking_goal_clearance / 0.55
+        if env_config.talking_minimum_route_distance < minimum_talking_length:
+            raise ValueError(
+                'talking_minimum_route_distance must be at least '
+                f'{minimum_talking_length:.3f} m for talking_goal_clearance '
+                f'{env_config.talking_goal_clearance:.3f} m')
+
         if not rclpy.ok():
             raise RuntimeError('rclpy.init() must be called before the env')
         self._node = Node(node_name, parameter_overrides=[
@@ -231,6 +246,10 @@ class SocialAvoidEnv(gym.Env):
             String, env_config.scenario_topic, 10)
         self._cmd_pub = self._node.create_publisher(
             Twist, env_config.cmd_vel_topic, 10)
+        self._velocity_smoother = VelocitySmoother(
+            env_config.max_linear_acceleration,
+            env_config.max_angular_acceleration,
+            enabled=env_config.velocity_smoothing_enabled)
 
         self._world = GazeboWorld(
             self._node, self._tf_buffer,
@@ -304,6 +323,10 @@ class SocialAvoidEnv(gym.Env):
         # actor plugin so it lays people out around the route the robot is
         # actually driving. None until the first reset has sampled a goal.
         self._route = None
+        # Which shelf face the `waiting` person of this episode stands at (-1 =
+        # towards world -y, 1 = +y), from the drawn route. None for every other
+        # scenario.
+        self._waiting_face = None
 
     # ------------------------------------------------------------------ time
 
@@ -380,6 +403,11 @@ class SocialAvoidEnv(gym.Env):
         command.linear.x = float(linear)
         command.angular.z = float(angular)
         self._cmd_pub.publish(command)
+
+    def _stop(self):
+        """Send an immediate zero; safety stops must not be rate-limited."""
+        self._velocity_smoother.reset()
+        self._publish(0.0, 0.0)
 
     def _robot_position_in_map(self):
         transform = self._tf_buffer.lookup_transform(
@@ -473,16 +501,56 @@ class SocialAvoidEnv(gym.Env):
         """
         if self._route is None:
             return scenario
-        return '{} route {:.3f} {:.3f} {:.3f} {:.3f}'.format(
+        command = '{} route {:.3f} {:.3f} {:.3f} {:.3f}'.format(
             scenario, *self._route)
+        if scenario == 'talking':
+            command += ' goal_clearance {:.3f}'.format(
+                self.env_config.talking_goal_clearance)
+        # 18-09-2026: eval-only worst case, see EnvConfig.talking_offset_override.
+        # None (every training run, and a plain --eval) leaves this command
+        # exactly as before.
+        if self.env_config.talking_offset_override is not None:
+            command += ' offset {:.3f} {:.3f}'.format(
+                *self.env_config.talking_offset_override)
+        if scenario == 'waiting' and self._waiting_face is not None:
+            command += ' face {:d}'.format(int(self._waiting_face))
+        if scenario == 'talking':
+            self._node.get_logger().info(
+                'talking route (world): ({:.3f}, {:.3f}) -> ({:.3f}, {:.3f})'
+                .format(*self._route))
+        return command
 
     def _episode_route(self, robot_x: float, robot_y: float, goal) -> tuple:
-        """This episode's start -> goal line, converted into the world frame."""
-        start_x, start_y, _ = self._world.map_to_world(robot_x, robot_y, 0.0)
+        """Physical robot start and sampled goal, both in Gazebo's world frame.
+
+        The talking plugin positions its actors in ``world`` and the Gazebo
+        view also renders ``world``.  On a reset, ``odom`` can lag the body
+        while the EKF accepts its new seed, so deriving the route start from
+        its TF pose can put the pair on a parallel, stale route.  Ground-truth
+        training already receives the robot's exact Gazebo pose from
+        ``/model_states``; use that authoritative source when it is present.
+        The goal still starts in the configured goal frame and is transformed
+        through the static world -> map edge as before.
+        """
+        if self._ground_truth is not None:
+            start_x, start_y, _ = self._ground_truth.robot_pose()
+        else:
+            start_x, start_y, _ = self._world.map_to_world(
+                robot_x, robot_y, 0.0)
         end_x, end_y, _ = self._world.map_to_world(goal[0], goal[1], 0.0)
         return (start_x, start_y, end_x, end_y)
 
-    def _select_scenario(self):
+    def _pick_scenario(self):
+        """Draw this episode's scenario NAME from env.scenarios.
+
+        Split from _select_scenario on 28-09-2026: `waiting` has its own goal,
+        so the name has to be known before the goal is sampled.
+        """
+        if not self.env_config.scenarios:
+            return 'none'
+        return random.choice(self.env_config.scenarios)
+
+    def _select_scenario(self, scenario):
         """Lay a fresh set of people out for this episode.
 
         The trainer picks the name and the actor plugin picks the geometry, so
@@ -490,9 +558,6 @@ class SocialAvoidEnv(gym.Env):
         time. Without this the policy meets one conversation, always in the
         same place, and learns that spot rather than the situation.
         """
-        if not self.env_config.scenarios:
-            return 'none'
-        scenario = random.choice(self.env_config.scenarios)
         message = String()
         message.data = self._with_route(scenario)
         self._scenario_pub.publish(message)
@@ -503,35 +568,93 @@ class SocialAvoidEnv(gym.Env):
         if seed is not None:
             random.seed(seed)
 
-        self._publish(0.0, 0.0)
+        self._stop()
         # Physics has to run for the teleport to settle, for the actors to
         # start walking and for the localizers to catch up.
         if self.env_config.pause_between_steps:
             self._world.unpause()
 
+        # The scenario NAME is drawn first (28-09-2026): `waiting` runs one of
+        # env.waiting_routes -- its own start AND goal, drawn around the shelf
+        # -- instead of a start_poses x goals combination, so the start has to
+        # be known before the teleport below.
+        scenario = self._pick_scenario()
+        waiting_route = (random.choice(self.env_config.waiting_routes)
+                         if scenario == 'waiting' else None)
+        if waiting_route is not None and random.random() < 0.5:
+            # Swap start <-> goal so training also covers the line walked
+            # the other way; a route only ever driven start->goal taught the
+            # policy to detour around the person from one side only, which
+            # went ragged on eval runs that walked it goal->start. `face`
+            # (which side of the shelf the person stands on) is a property
+            # of the shelf, not of travel direction, so it is left alone.
+            sx, sy, gx, gy, face = waiting_route
+            waiting_route = (gx, gy, sx, sy, face)
+        self._waiting_face = (waiting_route[4] if waiting_route is not None
+                              else None)
+        # Unlike waiting, list-based scenarios had independently sampled ends.
+        # Bind them into one route here so an optional reversal trains exactly
+        # the same geometry in the opposite direction, without cross-pairing
+        # starts and goals that were never designed as a route.
+        list_route = (
+            sample_list_route(
+                self.env_config.start_poses, self.env_config.goals,
+                self.env_config.minimum_goal_distance,
+                self.env_config.reverse_list_routes,
+                minimum_route_distance=(
+                    self.env_config.talking_minimum_route_distance
+                    if scenario == 'talking' else None))
+            if self.env_config.randomize_start and waiting_route is None
+            and self._free_space is None else None)
+
         if self.env_config.randomize_start:
-            if self._free_space is not None:
+            if waiting_route is not None:
+                # Facing the goal, give or take env.waiting_yaw_noise, so the
+                # robot leaves the start the way the route is drawn and the
+                # person is in front of it rather than behind (a sideways
+                # start left the person outside the camera cone for the whole
+                # approach in most of the first waiting episodes).
+                heading = math.atan2(waiting_route[3] - waiting_route[1],
+                                     waiting_route[2] - waiting_route[0])
+                noise = self.env_config.waiting_yaw_noise
+                start = (waiting_route[0], waiting_route[1],
+                         heading + random.uniform(-noise, noise))
+            elif self._free_space is not None:
                 start = self._free_space.sample_pose()
             else:
-                # Position from the fixed list; yaw is drawn separately (the
-                # yaw written in start_poses is ignored).
+                # Position from the chosen fixed route; the yaw written in
+                # start_poses is ignored because one start can pair with many
+                # goals. Aim along the selected route, then apply its bounded
+                # curriculum noise so westbound routes cannot spawn eastbound.
                 #
-                # Full circle (-pi, pi) is what lets the goal land behind the
-                # robot so it has to learn to turn around. 04-09-2026: dropped
-                # to (-pi/2, pi/2) as a curriculum step -- none_goal plateaued
-                # ~0.6 across LR, scenario-mix and heading_gain changes with
-                # the full circle, and goals sit roughly towards +x/+y from
-                # every start pose, so full-circle yaw was spending a lot of
-                # episodes on a near-180 deg pivot (~16 control steps at
-                # max_angular_speed 1.0) before any progress reward was
-                # reachable. Narrower range still asks for real turning (up to
-                # ~90 deg) without that worst case. Widen back towards the
-                # full circle once none_goal recovers past 0.90.
-                pose = random.choice(self.env_config.start_poses)
-                start = (pose[0], pose[1],
-                        random.uniform(-math.pi / 2, math.pi / 2))
-            self._world.teleport_robot(float(start[0]), float(start[1]),
-                                       float(start[2]))
+                # `random_start_yaw_limit` is a curriculum knob.  It is kept
+                # separate from waiting_yaw_noise: only these list-based
+                # episodes may start away from their nominal route heading.
+                yaw_limit = self.env_config.random_start_yaw_limit
+                if not 0.0 <= yaw_limit <= math.pi:
+                    raise ValueError(
+                        'random_start_yaw_limit must be in [0, pi] radians')
+                if scenario == 'talking':
+                    # The pair centre is on this route. Facing its goal makes
+                    # the social region visible from the first observation in
+                    # either travel direction, including reversed episodes.
+                    yaw = route_start_yaw(
+                        list_route[0], list_route[1],
+                        self.env_config.talking_start_yaw_noise)
+                else:
+                    yaw = route_start_yaw(
+                        list_route[0], list_route[1], yaw_limit)
+                start = (list_route[0][0], list_route[0][1], yaw)
+            # A route explicitly selected from the authored lists must seed in
+            # the same frame as its forced goal.  With the default `map` seed
+            # the EKF resets odom to (0, 0, yaw 0), which can make a reversed
+            # none/talking route terminate immediately or face away from the
+            # actors.  Freely sampled episodes preserve their established
+            # map-frame behaviour; their goal is sampled after this reset.
+            self._world.teleport_robot(
+                float(start[0]), float(start[1]), float(start[2]),
+                seed_frame=route_seed_frame(
+                    self.env_config.goal_frame, waiting_route, list_route))
             # The reseeded EKF and AMCL need a few cycles before TF reports the
             # new pose; sampling the goal any earlier measures the distance
             # from where the robot used to be.
@@ -544,9 +667,14 @@ class SocialAvoidEnv(gym.Env):
         # the name first, as this used to, meant the layout was chosen against
         # the route of the PREVIOUS episode. See _with_route for the 30.6%.
         robot_x, robot_y = self._robot_position_in_map()
-        self._goal = self._sample_goal(robot_x, robot_y)
+        # A `waiting` route carries its own goal: the plugin stands the person
+        # in front of the shelf next to the straight line from this start to
+        # that goal, so the line crosses the person's zone.
+        self._goal = (tuple(waiting_route[2:4]) if waiting_route is not None
+                      else list_route[1] if list_route is not None
+                      else self._sample_goal(robot_x, robot_y))
         self._route = self._episode_route(robot_x, robot_y, self._goal)
-        self._scenario = self._select_scenario()
+        self._scenario = self._select_scenario(scenario)
 
         # Settle AFTER the spawn, which is what makes the first observation of
         # the episode show people who are already walking rather than a scene
@@ -583,7 +711,12 @@ class SocialAvoidEnv(gym.Env):
         return observation, {'goal': self._goal, 'scenario': self._scenario}
 
     def step(self, action):
-        linear, angular = scale_action(action, self.env_config)
+        target_linear, target_angular = scale_action(action, self.env_config)
+        # The policy target is deliberately filtered before Gazebo advances.
+        # Therefore PPO receives the consequences of the same acceleration
+        # bound that the robot will use after this run is deployed.
+        linear, angular = self._velocity_smoother.step(
+            target_linear, target_angular, self.env_config.control_period)
         self._publish(linear, angular)
 
         # Advance the world by exactly one control period. The command is
@@ -613,7 +746,7 @@ class SocialAvoidEnv(gym.Env):
         # away or hiding somebody behind an occluder cannot erase the social
         # penalty.  The perception path has no privileged list and therefore
         # falls back explicitly to what its tracker supplied.
-        social_intrusion = _reward_social_intrusion(
+        intrusion_by_type = _reward_intrusion_by_type(
             state, has_ground_truth=self._ground_truth is not None)
         outcome = evaluate_step(
             self.reward_config,
@@ -622,7 +755,9 @@ class SocialAvoidEnv(gym.Env):
             goal_bearing=state['goal_bearing'],
             previous_goal_bearing=self._previous_goal_bearing,
             minimum_scan=state['minimum_scan'],
-            social_intrusion=social_intrusion)
+            talk_intrusion=intrusion_by_type['talking'],
+            view_intrusion=intrusion_by_type['waiting'],
+            cross_intrusion=intrusion_by_type['cross'])
 
         self._previous_goal_distance = state['goal_distance']
         self._previous_goal_bearing = state['goal_bearing']
@@ -649,7 +784,7 @@ class SocialAvoidEnv(gym.Env):
         truncated = (not outcome.terminated
                      and self._steps >= self.env_config.max_episode_steps)
         if outcome.terminated or truncated:
-            self._publish(0.0, 0.0)
+            self._stop()
 
         info = {'reward_components': outcome.components}
         if outcome.terminated or truncated:
@@ -713,7 +848,7 @@ class SocialAvoidEnv(gym.Env):
                 self._world.unpause()
             except RuntimeError as error:
                 self._logger.warn(f'could not unpause on close: {error}')
-        self._publish(0.0, 0.0)
+        self._stop()
         if self._gzclient is not None and self._gzclient.poll() is None:
             self._gzclient.terminate()
             self._gzclient.wait(timeout=5.0)

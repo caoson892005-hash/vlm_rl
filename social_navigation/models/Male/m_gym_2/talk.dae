@@ -12,25 +12,25 @@
   </asset>
   <library_images>
     <image id="young_darkskinned_male_diffuse" name="young_darkskinned_male_diffuse">
-      <init_from>textures/young_darkskinned_male_diffuse.png</init_from>
+      <init_from>/m_gym_2/textures/young_darkskinned_male_diffuse.png</init_from>
     </image>
     <image id="short04_diffuse" name="short04_diffuse">
-      <init_from>textures/short04_diffuse.png</init_from>
+      <init_from>/m_gym_2/textures/short04_diffuse.png</init_from>
     </image>
     <image id="brown_eye" name="brown_eye">
-      <init_from>textures/brown_eye.png</init_from>
+      <init_from>/m_gym_2/textures/brown_eye.png</init_from>
     </image>
     <image id="eyebrow001" name="eyebrow001">
-      <init_from>textures/eyebrow001.png</init_from>
+      <init_from>/m_gym_2/textures/eyebrow001.png</init_from>
     </image>
     <image id="gymuniform_diffuse" name="gymuniform_diffuse">
-      <init_from>textures/gymuniform_diffuse.png</init_from>
+      <init_from>/m_gym_2/textures/gymuniform_diffuse.png</init_from>
     </image>
     <image id="gymuniform_normal" name="gymuniform_normal">
-      <init_from>textures/gymuniform_normal.png</init_from>
+      <init_from>/m_gym_2/textures/gymuniform_normal.png</init_from>
     </image>
     <image id="shoes06_diffuse" name="shoes06_diffuse">
-      <init_from>textures/shoes06_diffuse.png</init_from>
+      <init_from>/m_gym_2/textures/shoes06_diffuse.png</init_from>
     </image>
   </library_images>
   <library_effects>

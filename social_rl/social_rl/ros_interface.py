@@ -19,14 +19,14 @@ from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
                        QoSReliabilityPolicy)
 from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
-from social_perception.msg import (ConstraintField as ConstraintFieldMsg,
-                                   People, Zone as ZoneMsg,
-                                   ZoneSample as ZoneSampleMsg)
+from social_perception.msg import People, VlmPersonStates
 from tf2_ros import TransformException
 
-from social_rl.constraint_field import compile_zones, intrusion_at_zones
+from social_rl.constraint_field import (compile_zones, intrusion_at_zones,
+                                        intrusion_by_type)
 from social_rl.observation import (ObservationInput, RelativeEntity,
                                    build_observation)
+from social_rl.semantic_fusion import VlmStateCache
 
 
 @dataclass
@@ -39,20 +39,11 @@ class EnvConfig:
     next to a checkpoint records exactly what produced it.
     """
 
-    # Gazebo's diff-drive plugin listens on /cmd_vel_safe and
-    # social_velocity_filter is what normally bridges /cmd_vel to it. Training
-    # writes to /cmd_vel_safe directly on purpose: with the filter in the way
-    # the executed command is not the sampled action, and the policy would be
-    # learning from somebody else's decisions. The deployment node publishes to
-    # /cmd_vel instead, so the filter stays as the last line of defence there.
+    # This names the command topic actually consumed by the simulated or real
+    # base.  The rate limiter below runs in-process in both training and the
+    # agent node, so the policy always learns the same executed command.
     cmd_vel_topic: str = '/cmd_vel_safe'
     scan_topic: str = '/scan'
-
-    # Where block D's compiled zones go out. Block F is the consumer; RViz and
-    # anybody debugging a run are the other two. Published from wherever the
-    # zones were compiled, which is once per control step either in training or
-    # in the deployment agent.
-    constraint_field_topic: str = '/social_rl/constraint_field'
 
     # Where blocks B and C come from.
     #
@@ -68,6 +59,13 @@ class EnvConfig:
     # trained on ground truth runs unmodified on the real tracker.
     people_source: str = 'ground_truth'
     people_topic: str = '/people'
+    # Block C is a slower stream. Its header names the People frame that was
+    # classified, so deployment joins it by person ID and source timestamp
+    # without delaying a control tick for the VLM.
+    vlm_states_topic: str = '/social_perception/vlm_person_states'
+    # Seconds a semantic verdict may trail the current tracker sample. The
+    # source-stamp check below still rejects a recycled ByteTrack identity.
+    vlm_state_timeout: float = 25.0
 
     # --- ground truth chỉ trong tầm camera ---
     # Ground truth của Gazebo liệt kê MỌI actor, không qua camera, không qua
@@ -155,7 +153,7 @@ class EnvConfig:
     vlm_period: float = 0.5
     # Đọc nhầm sang một nhãn khác. 0.2 ~ VLM 4-5 lớp đúng 70-85%.
     vlm_wrong_label_prob: float = 0.2
-    # Không dám kết luận -> trả '' -> khối D rơi về bộ tỉ lệ trung tính.
+    # Không dám kết luận -> trả '' -> khối D rơi về weight nền (0.5).
     vlm_abstain_prob: float = 0.1
     # Sai số hướng nhìn, radian. Giữ nguyên trong suốt một phán quyết chứ không
     # bốc lại mỗi bước - sai lệch của một model là nhất quán, còn nhiễu mỗi
@@ -167,6 +165,15 @@ class EnvConfig:
     vlm_facing_lost_prob: float = 0.0
     # 0 = ngẫu nhiên mỗi lần chạy. Đặt khác 0 để lặp lại đúng một run.
     vlm_seed: int = 0
+    # 11-09-2026: scene_confidence bốc ngẫu nhiên đều trong [min, max] mỗi lần
+    # phán quyết được vẽ lại (cùng nhịp vlm_period), thay vì luôn 1.0. Đây là
+    # đường DUY NHẤT confidence khác 1.0 lúc train -- nó chạy thẳng vào
+    # `factor = 1 + expansion_a*(1-c)` của constraint_field.py, nên các vùng
+    # QUAN SÁT ĐƯỢC co giãn kích thước ngẫu nhiên trong lúc reward (tính trên
+    # danh sách sự thật, confidence luôn 1.0) không đổi. Mặc định bằng
+    # [1.0, 1.0] tức KHÔNG ngẫu nhiên hoá, giữ hành vi cũ khi chưa bật.
+    vlm_confidence_min: float = 1.0
+    vlm_confidence_max: float = 1.0
 
     # Kept so old saved configs still load. Ground-truth training now always
     # computes the complete-list intrusion because reward depends on it; false
@@ -216,8 +223,43 @@ class EnvConfig:
     # do.
     allow_reverse: bool = False
 
+    # Stateful action-to-command limiter.  Defaults keep old saved checkpoints
+    # behaviour unchanged; a new training YAML must enable it and its saved
+    # env_config.yaml then makes deployment use the identical dynamics.
+    velocity_smoothing_enabled: bool = False
+    # m/s² and rad/s².  At the default 0.2 s control period, the configured
+    # limits allow at most 0.10 m/s and 0.25 rad/s change per policy tick.
+    # They reduce steering oscillation without masking a hard safety stop.
+    max_linear_acceleration: float = 0.5
+    max_angular_acceleration: float = 1.25
+
     # --- simulation-only: episode reset ---
     randomize_start: bool = True
+    # Radians, +-.  Applied to `none` and other list-based episodes after a
+    # start position is chosen; waiting routes deliberately use their own
+    # `waiting_yaw_noise` because they must begin facing the person.  Keep the
+    # old +-90 degree curriculum as the default so saved checkpoints without
+    # this field reproduce their original reset distribution.
+    random_start_yaw_limit: float = math.pi / 2.0
+    # When using fixed start_poses/goals (not free-space or waiting routes),
+    # reverse half of the sampled start-to-goal pairs. Default false preserves
+    # historical runs; true makes the policy learn each selected route in both
+    # travel directions without creating start-to-start or goal-to-goal routes.
+    reverse_list_routes: bool = False
+    # Radians, +-. Talking pairs are centred on their route, so 0.0 starts the
+    # robot facing that pair. Valid [0, pi/2]; use a small value only when
+    # deliberately training recovery from a partially off-axis social region.
+    talking_start_yaw_noise: float = 0.0
+    # Metres, > 0. Distance from the talking-pair centre to the endpoint goal.
+    # The actor plugin limits its along-route placement to this clearance,
+    # preventing a valid completion pose (reward.goal_distance around the
+    # goal) from being inside the hard conversation region.
+    talking_goal_clearance: float = 1.9
+    # Metres, >= talking_goal_clearance / 0.55. Talking routes shorter than
+    # this are not sampled: with the pair no earlier than 45% along the route,
+    # they cannot satisfy the goal clearance. This filter affects only
+    # `talking`, never empty episodes.
+    talking_minimum_route_distance: float = 3.5
     entity_name: str = 'linorobot2'
     set_entity_state_service: str = '/set_entity_state'
     ekf_set_pose_service: str = '/set_pose'
@@ -232,6 +274,23 @@ class EnvConfig:
     # distance -- which is the whole trade-off being learned.
     goals: list = field(default_factory=lambda: [
         [4.5, 2.0], [4.0, 3.5], [4.5, 0.8], [3.8, 1.5]])
+    # 28-09-2026: the routes a `waiting` episode drives, each [start_x, start_y,
+    # goal_x, goal_y, face] in the goal frame. One is drawn per episode INSTEAD
+    # of a start_poses x goals combination. `face` is the side of the shelf the
+    # person stands at: -1 = the face that looks towards world -y, 1 = +y. The
+    # plugin puts the person in front of that face next to the straight line.
+    waiting_routes: list = field(default_factory=lambda: [
+        [0.6, 3.0, 5.1, -0.8, -1], [0.7, 0.0, 5.6, 3.3, -1],
+        [0.4, 0.0, 4.3, 5.4, 1], [0.3, 2.3, 6.9, 1.4, -1],
+        [-0.6, 0.9, 6.1, 1.1, -1]])
+    # Radians, +-. A `waiting` robot starts facing its goal, give or take this.
+    waiting_yaw_noise: float = 0.35
+    # The shelf a `waiting` person looks at: its Gazebo model name and half its
+    # thickness (local x axis, from the visual mesh). ground_truth.py turns them
+    # into d_obj. The plugin has the same two numbers as constants
+    # (kWaitingShelfName, kWaitingShelfHalfThickness) and the two must agree.
+    waiting_object_model: str = 'BookshelfA_01_002'
+    waiting_object_half_thickness: float = 0.36
     # A goal closer than this makes for an episode with no avoidance in it.
     minimum_goal_distance: float = 2.0
     # Upper bound, and only meaningful when free_space_map draws the pair. It
@@ -262,6 +321,17 @@ class EnvConfig:
     # before the first observation. Walkers start at the edge and the plugin
     # needs a publish period or two to report a velocity for them at all.
     scenario_settle_time: float = 0.6
+
+    # 18-09-2026: EVAL-ONLY override of the `talking` pair's lateral offset
+    # from the route (animated_people_release.cpp's SpawnTalkingPeople draws
+    # it from [0.0, 0.0] otherwise). None means "use the plugin's own
+    # default" -- this stays None for every training run and for a plain
+    # --eval; only train.py's --eval-talking-offset sets it, via
+    # dataclasses.replace(), never through a saved YAML. A worst case for
+    # probing avoidance (people dead-centre on the route, not the randomised
+    # band the policy actually trained on) belongs here, not in rl_train.yaml,
+    # so nobody can accidentally train against it.
+    talking_offset_override: tuple = None
 
     # Hold physics between control steps: unpause, let exactly control_period
     # of simulated time pass, pause again, and only then read the observation.
@@ -560,7 +630,8 @@ class PerceptionBridge:
     """Latest /scan, /people and /odom, expressed in the robot frame."""
 
     def __init__(self, node, tf_buffer, env_config, observation_config,
-                 people_provider=None):
+                 people_provider=None, subscribe_motion=True,
+                 subscribe_social=True):
         self._node = node
         self._tf_buffer = tf_buffer
         self._env = env_config
@@ -575,6 +646,9 @@ class PerceptionBridge:
         # whether a person came from Gazebo or from YOLO, and that includes how
         # long they survive after leaving the frame.
         self._memory = PeopleMemory(env_config, observation_config)
+        # Deployment consumes delayed VLM output only as semantic metadata.
+        # Training's ground-truth provider remains independent of Block C.
+        self._vlm_states = VlmStateCache(env_config.vlm_state_timeout)
 
         # Keep only the newest sample: an RL step acts on now, and a queue of
         # stale scans would just delay every reaction by its own length.
@@ -586,27 +660,33 @@ class PerceptionBridge:
         self.people = None
         self.odom = None
         self.people_transform_valid = True
-        node.create_subscription(LaserScan, env_config.scan_topic,
-                                 self._on_scan, sensor_qos)
-        node.create_subscription(People, env_config.people_topic,
-                                 self._on_people, 10)
-        node.create_subscription(Odometry, env_config.odom_topic,
-                                 self._on_odom, sensor_qos)
+        self.constraint_field = None
+        if subscribe_motion:
+            node.create_subscription(LaserScan, env_config.scan_topic,
+                                     self._on_scan, sensor_qos)
+            node.create_subscription(Odometry, env_config.odom_topic,
+                                     self._on_odom, sensor_qos)
+        if subscribe_social:
+            node.create_subscription(People, env_config.people_topic,
+                                     self._on_people, 10)
+            if self._people_provider is None:
+                node.create_subscription(
+                    VlmPersonStates, env_config.vlm_states_topic,
+                    self._on_vlm_states, 10)
 
-        # Block D's output, published from the one place it is already
-        # compiled. Block F subscribes to this rather than compiling its own
-        # copy: two compilations of the same people list drift the moment one
-        # of them is handed a message the other did not see, and a shield
-        # arguing with the policy about where a region is defeats the point of
-        # having a shield.
-        self._field_pub = node.create_publisher(
-            ConstraintFieldMsg, env_config.constraint_field_topic, 10)
+        # Block D no longer publishes from here. In training the field is an
+        # in-process grid (constraint_field.py) that feeds the observation and
+        # reward directly; deployment uses a separate continuous field node
+        # so visualization and grounding do not depend on a navigation goal.
 
     def _on_scan(self, msg):
         self.scan = msg
 
     def _on_people(self, msg):
         self.people = msg
+
+    def _on_vlm_states(self, msg):
+        self._vlm_states.update(msg)
 
     def _on_odom(self, msg):
         self.odom = msg
@@ -740,57 +820,20 @@ class PerceptionBridge:
                                    person.pose.position.y)
             vx, vy = rotate_vector(transform, person.velocity.linear.x,
                                    person.velocity.linear.y)
-            # Facing and scene_type are what block C fills in. A tracker that
-            # publishes neither leaves facing at 0 and scene_type empty, and
-            # block D falls back to its neutral region -- the observation keeps
-            # its shape either way, so a policy does not stop loading the day
-            # the VLM is switched off.
+            # Geometry remains owned by the tracker. VLM only selects the
+            # social-zone meaning for this same timestamp-safe person ID.
+            scene_type, scene_confidence = self._vlm_states.lookup(
+                person.id, message.header)
             if (self._env.people_camera_only
                     and not visible_to_camera(x, y, self._env)):
                 continue
             people.append(RelativeEntity(
                 x, y, vx, vy,
                 facing=quaternion_to_yaw(person.pose.orientation) + transform_yaw,
-                scene_type=person.scene_type,
+                scene_type=scene_type,
                 track_id=person.id,
-                scene_confidence=person.scene_confidence))
+                scene_confidence=scene_confidence))
         return people
-
-    def _publish_field(self, field):
-        """Put block D's zones on the wire for block F and for RViz.
-
-        Frame is the robot frame, which is what the zones are already in, so a
-        consumer needs no TF to act on them. Stamped with the node clock rather
-        than with a sensor stamp: the zones are a statement about now, compiled
-        from whatever the newest people message was, and dating them by that
-        message would make a shield reject its own input as stale during the
-        gap between camera frames.
-        """
-        message = ConstraintFieldMsg()
-        message.header.stamp = self._node.get_clock().now().to_msg()
-        message.header.frame_id = self._observation.robot_frame
-        message.horizon_steps = int(field.horizon_steps)
-        message.dt = float(field.dt)
-        for zone in field.zones:
-            entry = ZoneMsg()
-            entry.zone_id = zone.zone_id
-            entry.track_ids = list(zone.track_ids)
-            entry.scene_type = zone.scene_type
-            entry.confidence = float(zone.confidence)
-            entry.hardness = zone.hardness
-            entry.valid_from = float(zone.valid_from)
-            entry.valid_to = float(zone.valid_to)
-            for sample in zone.trajectory_of_zone:
-                item = ZoneSampleMsg()
-                item.t = float(sample.t)
-                item.shape = sample.shape
-                item.center = [float(value) for value in sample.center]
-                item.size = [float(value) for value in sample.size]
-                item.core = float(sample.core)
-                item.orientation = float(sample.orientation)
-                entry.trajectory_of_zone.append(item)
-            message.zones.append(entry)
-        self._field_pub.publish(message)
 
     def goal_transform(self):
         """goal_frame -> robot_frame. The goal and PeopleMemory both ride it."""
@@ -809,6 +852,77 @@ class PerceptionBridge:
     def forget_people(self):
         """Drop the memory of everybody. Called between episodes."""
         self._memory.clear()
+
+    def reset_deployment_grounding(self):
+        """Start a fresh deploy grounding cycle after a locked field expires."""
+        if self._people_provider is not None:
+            raise RuntimeError(
+                'reset_deployment_grounding is only for tracker input')
+        self._memory.clear()
+        self._vlm_states.clear()
+        self.constraint_field = None
+
+    def deployment_constraint_field(self):
+        """Compile the live deploy field without requiring a navigation
+        goal."""
+        # Memory is stored in goal_frame exactly as in observe(), so people do
+        # not move with the robot while temporarily outside the camera.
+        goal_transform = self.goal_transform()
+        if self._people_provider is None:
+            people = self.relative_people()
+            if not self.people_transform_valid:
+                raise RuntimeError(
+                    'tracked people cannot be transformed into the robot '
+                    'frame')
+        else:
+            # Simulation-only field generation intentionally follows the
+            # ground-truth branch of observe_with_field().  This prevents the
+            # displayed waiting zone and the PPO social-grid input from
+            # diverging when testing a checkpoint against Gazebo truth.
+            people = self._people_provider.relative_people()
+            if self._env.people_occlusion:
+                if self.scan is None:
+                    raise RuntimeError(
+                        f'no message on {self._env.scan_topic} yet')
+                scan_xy = self.scan_points()
+                full_people = self._people_provider.relative_people(
+                    apply_camera=False)
+                people = [person for person in people
+                          if not occluded_by_scan(person.x, person.y, scan_xy,
+                                                  self._env)
+                          and not occluded_by_person(person, full_people,
+                                                     self._env)]
+            self.people_transform_valid = True
+        now = self._node.get_clock().now().nanoseconds * 1e-9
+        people = self._memory.remember(people, goal_transform, now)
+        field = compile_zones(people, self._observation.constraint_field)
+        self.constraint_field = field
+        return field
+
+    def observe_with_field(self, goal_map_x: float, goal_map_y: float, field):
+        """Build a deploy observation from an externally supplied field."""
+        if self.scan is None:
+            raise RuntimeError(f'no message on {self._env.scan_topic} yet')
+        goal_transform = self.goal_transform()
+        goal_x, goal_y = transform_point(
+            goal_transform, goal_map_x, goal_map_y)
+        scan_xy, scan_ranges = self.scan_returns()
+        linear, angular = self.robot_velocity()
+        observation = build_observation(
+            ObservationInput(
+                scan_points=scan_xy,
+                goal_x=goal_x,
+                goal_y=goal_y,
+                linear=linear,
+                angular=angular),
+            self._observation,
+            field)
+        state = {
+            'goal_distance': math.hypot(goal_x, goal_y),
+            'goal_bearing': math.atan2(goal_y, goal_x),
+            'minimum_scan': self.minimum_scan(scan_ranges),
+        }
+        return observation, state
 
     def observe(self, goal_map_x: float, goal_map_y: float):
         """Build the policy input and the raw quantities the reward needs."""
@@ -869,7 +983,7 @@ class PerceptionBridge:
         # Block D. The channels come off `shown`, so the policy sees exactly
         # the situation its perception describes -- including a misread one.
         field = compile_zones(shown, self._observation.constraint_field)
-        self._publish_field(field)
+        self.constraint_field = field
         observation = build_observation(
             ObservationInput(scan_points=scan_xy,
                              goal_x=goal_x, goal_y=goal_y,
@@ -897,6 +1011,10 @@ class PerceptionBridge:
             # separate from the complete-list value below so eval can compare
             # keeping distance with merely keeping people out of the view.
             'social_intrusion': intrusion_at_zones(visible_truth_field),
+            # 12-09-2026: C_talk/C_view/C_cross split of the line above, for
+            # reward.evaluate_step's three-way social term. Reward fallback
+            # when no simulator-only full list exists (people_source=perception).
+            'social_intrusion_by_type': intrusion_by_type(visible_truth_field),
             # What the policy believed it was in. Equal to the line above
             # unless simulated block C changed a label. Diagnostic only.
             'social_intrusion_shown': intrusion_at_zones(field),
@@ -912,14 +1030,18 @@ class PerceptionBridge:
             'people_transform_valid': self.people_transform_valid,
         }
         # Full simulator truth, cone and occlusion ignored.  SocialAvoidEnv
-        # charges this value at the same social_penalty as the filtered one;
-        # keeping both values also preserves the visible-vs-full peak metric.
+        # charges this value with the same lambda_s/w_talk/w_view/w_cross as
+        # the filtered one; keeping both values also preserves the
+        # visible-vs-full peak metric.
         # Test against None rather than truthiness so an empty full scene emits
         # an authoritative 0.0 instead of looking like unavailable truth.
         if full_people is not None:
             hidden_field = compile_zones(
                 full_people, self._observation.constraint_field)
             state['social_intrusion_hidden'] = intrusion_at_zones(hidden_field)
+            # 12-09-2026: the ground-truth reward source's C_talk/C_view/C_cross.
+            state['social_intrusion_hidden_by_type'] = intrusion_by_type(
+                hidden_field)
             # Clamped: memory can recall somebody the scene no longer lists
             # at all, which would otherwise read as a negative count.
             state['hidden_people'] = max(len(full_people) - len(people), 0)

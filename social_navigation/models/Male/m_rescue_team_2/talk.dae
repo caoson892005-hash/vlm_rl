@@ -12,34 +12,34 @@
   </asset>
   <library_images>
     <image id="middleage_darkskinned_male_diffuse" name="middleage_darkskinned_male_diffuse">
-      <init_from>textures/middleage_darkskinned_male_diffuse.png</init_from>
+      <init_from>/m_rescue_team_2/textures/middleage_darkskinned_male_diffuse.png</init_from>
     </image>
     <image id="male02_diffuse_black" name="male02_diffuse_black">
-      <init_from>textures/male02_diffuse_black.png</init_from>
+      <init_from>/m_rescue_team_2/textures/male02_diffuse_black.png</init_from>
     </image>
     <image id="brown_eye" name="brown_eye">
-      <init_from>textures/brown_eye.png</init_from>
+      <init_from>/m_rescue_team_2/textures/brown_eye.png</init_from>
     </image>
     <image id="eyebrow001" name="eyebrow001">
-      <init_from>textures/eyebrow001.png</init_from>
+      <init_from>/m_rescue_team_2/textures/eyebrow001.png</init_from>
     </image>
     <image id="rescueteam_jacket" name="rescueteam_jacket">
-      <init_from>textures/rescueteam_jacket.png</init_from>
+      <init_from>/m_rescue_team_2/textures/rescueteam_jacket.png</init_from>
     </image>
     <image id="rescueteam_pants" name="rescueteam_pants">
-      <init_from>textures/rescueteam_pants.png</init_from>
+      <init_from>/m_rescue_team_2/textures/rescueteam_pants.png</init_from>
     </image>
     <image id="tennisshoes_normals" name="tennisshoes_normals">
-      <init_from>textures/tennisshoes_normals.png</init_from>
+      <init_from>/m_rescue_team_2/textures/tennisshoes_normals.png</init_from>
     </image>
     <image id="tennisshoes" name="tennisshoes">
-      <init_from>textures/tennisshoes.png</init_from>
+      <init_from>/m_rescue_team_2/textures/tennisshoes.png</init_from>
     </image>
     <image id="munskydd-normal" name="munskydd-normal">
-      <init_from>textures/munskydd-normal.png</init_from>
+      <init_from>/m_rescue_team_2/textures/munskydd-normal.png</init_from>
     </image>
     <image id="munskydd" name="munskydd">
-      <init_from>textures/munskydd.png</init_from>
+      <init_from>/m_rescue_team_2/textures/munskydd.png</init_from>
     </image>
   </library_images>
   <library_effects>

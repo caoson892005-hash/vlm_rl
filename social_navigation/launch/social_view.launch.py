@@ -1,24 +1,17 @@
 """Open RViz on the social layer only, for Gazebo or for real hardware.
 
+This file only starts RViz; it does not calculate or publish social regions.
 The view is deliberately separate from the Nav2 RViz config. On hardware the
-camera and the VLM run on the workstation while Nav2 may run on the robot, so
+camera perception runs on the workstation while Nav2 may run on the robot, so
 the person watching the social regions is not necessarily sitting in front of
 the machine that owns the navigation stack.
 
-    ros2 launch social_navigation social_view.launch.py              # Gazebo
-    ros2 launch social_navigation social_view.launch.py sim:=false   # hardware
+    ros2 launch social_navigation social_view.launch.py sim:=true    # Gazebo
+    ros2 launch social_navigation social_view.launch.py              # hardware
 
 Fixed frame is `map` in both cases. In Gazebo the perception node publishes in
 `world`, which reaches `map` through the static transform that
 gazebo.launch.py already provides.
-
-`sim` defaults to true here to match social_bringup.launch.py, which is how
-this view is normally opened (`rviz:=true`) and which passes `sim` down
-explicitly. The two files disagreeing was a trap: getting use_sim_time wrong
-does not fail loudly, it leaves RViz holding a clock that never matches the
-timestamps on TF, so every display that needs a transform quietly switches
-off and the window looks broken for no stated reason. Both directions fail
-that way, so the default belongs on the case that occurs more often.
 """
 
 from launch import LaunchDescription
@@ -38,9 +31,8 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'sim',
-            default_value='true',
-            description='true for Gazebo, false for a real camera on this '
-                        'machine; must match social_bringup.launch.py'),
+            default_value='false',
+            description='Set to true when running against Gazebo'),
         DeclareLaunchArgument(
             'rviz_config',
             default_value=default_config,
@@ -54,7 +46,7 @@ def generate_launch_description():
             package='rviz2',
             executable='rviz2',
             name='social_rviz',
-            # This terminal exists to show VLM decisions. RViz narrates its
+            # This terminal exists to show perception and social geometry. RViz narrates its
             # OpenGL and Ogre setup on every start and repeats frame warnings
             # while a transform is briefly missing, which buries them.
             #

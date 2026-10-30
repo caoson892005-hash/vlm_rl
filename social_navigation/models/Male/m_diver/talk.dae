@@ -12,28 +12,28 @@
   </asset>
   <library_images>
     <image id="middleage_lightskinned_male_diffuse" name="middleage_lightskinned_male_diffuse">
-      <init_from>textures/middleage_lightskinned_male_diffuse.png</init_from>
+      <init_from>/m_diver/textures/middleage_lightskinned_male_diffuse.png</init_from>
     </image>
     <image id="short04_diffuse" name="short04_diffuse">
-      <init_from>textures/short04_diffuse.png</init_from>
+      <init_from>/m_diver/textures/short04_diffuse.png</init_from>
     </image>
     <image id="brown_eye" name="brown_eye">
-      <init_from>textures/brown_eye.png</init_from>
+      <init_from>/m_diver/textures/brown_eye.png</init_from>
     </image>
     <image id="eyebrow001" name="eyebrow001">
-      <init_from>textures/eyebrow001.png</init_from>
+      <init_from>/m_diver/textures/eyebrow001.png</init_from>
     </image>
     <image id="diver_scuba_rig_norm" name="diver_scuba_rig_norm">
-      <init_from>textures/diver_scuba_rig_norm.png</init_from>
+      <init_from>/m_diver/textures/diver_scuba_rig_norm.png</init_from>
     </image>
     <image id="diver_scuba_rig" name="diver_scuba_rig">
-      <init_from>textures/diver_scuba_rig.png</init_from>
+      <init_from>/m_diver/textures/diver_scuba_rig.png</init_from>
     </image>
     <image id="diver_suit_norm" name="diver_suit_norm">
-      <init_from>textures/diver_suit_norm.png</init_from>
+      <init_from>/m_diver/textures/diver_suit_norm.png</init_from>
     </image>
     <image id="diver_suit" name="diver_suit">
-      <init_from>textures/diver_suit.png</init_from>
+      <init_from>/m_diver/textures/diver_suit.png</init_from>
     </image>
   </library_images>
   <library_effects>

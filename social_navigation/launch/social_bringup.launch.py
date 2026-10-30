@@ -6,31 +6,21 @@ command (social_sim.launch.py), because on real hardware there is nothing to
 spawn, and in simulation the moment people walk in is a decision worth keeping
 in your own hands rather than tying it to model loading.
 
-The pipeline is identical in both cases; only where the camera sits differs. In
-Gazebo it is a link of the robot and moves with it; on real hardware it is still
-a fixed observer plugged into the workstation:
+The pipeline is identical in both cases:
 
-    RGB-D  ->  YOLO + depth  ->  /people                    (every person seen)
-                    |
-                    +-> VLM "are they talking?" -> /people_groups  (only
-                        conversation regions confirmed by the model)
+    RGB-D  ->  YOLO Pose + depth  ->  /people (every localized person)
 
-Both topics feed social_navigation::SocialLayer, declared in
-linorobot2_navigation/config/nav_sim.yaml. The layer costs them independently,
-so people who are *not* in a conversation are still avoided as individuals.
+`/people` feeds social_navigation::SocialLayer, declared in
+linorobot2_navigation/config/nav_sim.yaml. The layer costs each person
+individually.
 
 Gazebo:
 
     ros2 launch social_navigation social_bringup.launch.py sim:=true
 
-    The RGB-D camera is the one on the robot (the depth_sensor macro in
-    2wd.urdf.xacro), so robot_state_publisher already carries
-    base_link -> camera_link -> camera_depth_link. What it does NOT carry is
-    map -> odom: that edge comes from AMCL, so navigation.launch.py has to be
-    running as well or every frame is dropped on a TF lookup. The camera also
-    only sees what the robot is pointed at -- drive it towards the people
-    before expecting anything on /people. Wait for the "SẴN SÀNG" line in this
-    terminal, then release the actors from another one:
+    The RGB-D camera is mounted on the simulated robot at 30 cm above
+    base_link. Its URDF publishes the base_link -> camera frames; wait for the
+    "SẴN SÀNG" line in this terminal, then release actors from another one:
 
     ros2 launch social_navigation social_sim.launch.py scenario:=talking
 
@@ -44,8 +34,8 @@ Real hardware, camera and GPU on the workstation, robot only navigating:
     what turns a pixel into a person standing at a map coordinate, so measure
     them against the same origin the map was built from.
 
-Add rviz:=true to open the social view alongside the pipeline: the regions, the
-tracked people, the annotated camera image and the costmap. It stays off by
+Add rviz:=true to open the social view alongside the pipeline: the tracked
+people, annotated camera image and costmap. It stays off by
 default so the pipeline can run headless, over ssh, or next to an RViz window
 that is already open. Do not also pass rviz:=true to navigation.launch.py --
 two RViz windows on the same topics only cost frame rate.
@@ -110,7 +100,28 @@ def launch_setup(context, *args, **kwargs):
             '/launch/social_vlm_perception.launch.py',
         ]),
         condition=IfCondition(LaunchConfiguration('perception')),
-        launch_arguments={'config_file': config_file}.items()))
+        launch_arguments={
+            'config_file': config_file,
+            'yolo_model_path': LaunchConfiguration('yolo_model_path'),
+        }.items()))
+
+    # Per-ByteTrack semantic VLM is a separate process, so a slow/failed Qwen
+    # model cannot stall RGB-D localization, ByteTrack, or Block-B trajectory
+    # prediction. It is opt-in because local adapter paths and GPU budget are
+    # machine specific; its YAML selects sim or real time automatically below.
+    interaction_config = LaunchConfiguration('vlm_interaction_config').perform(context)
+    if not interaction_config:
+        interaction_config = os.path.join(
+            get_package_share_directory('social_perception'), 'config',
+            'social_vlm_interaction.yaml' if simulation
+            else 'social_vlm_interaction_real.yaml')
+    actions.append(IncludeLaunchDescription(
+        PythonLaunchDescriptionSource([
+            FindPackageShare('social_perception'),
+            '/launch/social_vlm_interaction.launch.py',
+        ]),
+        condition=IfCondition(LaunchConfiguration('vlm_interaction')),
+        launch_arguments={'config_file': interaction_config}.items()))
 
     # Watching the regions is part of running the pipeline, not a separate
     # chore. The view works the same whether Nav2 is running or not: without it
@@ -139,11 +150,23 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'perception',
             default_value='true',
-            description='Run YOLO/depth people tracking and VLM region detection'),
+            description='Run YOLO Pose, depth localization, and person tracking'),
+        DeclareLaunchArgument(
+            'vlm_interaction',
+            default_value='false',
+            description='Run the independent Qwen per-ByteTrack state node after Block B'),
+        DeclareLaunchArgument(
+            'vlm_interaction_config',
+            default_value='',
+            description='Optional VLM state YAML; empty selects sim/real profile'),
         DeclareLaunchArgument(
             'config_file',
             default_value='',
             description='Override the parameter file; empty selects it from sim'),
+        DeclareLaunchArgument(
+            'yolo_model_path',
+            default_value='',
+            description='Optional local YOLO Pose checkpoint overriding config'),
         DeclareLaunchArgument(
             'rviz',
             default_value='false',
@@ -159,9 +182,8 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'rviz_log_level',
             default_value='ERROR',
-            description='RViz log level reaching this terminal; the VLM '
-                        'decisions are what this output is for, so RViz stays '
-                        'silent unless it fails'),
+            description='RViz log level reaching this terminal; keep it quiet '
+                        'unless RViz itself fails'),
 
         DeclareLaunchArgument(
             'camera_tf',

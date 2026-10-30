@@ -12,31 +12,31 @@
   </asset>
   <library_images>
     <image id="young_lightskinned_male_diffuse3" name="young_lightskinned_male_diffuse3">
-      <init_from>textures/young_lightskinned_male_diffuse3.png</init_from>
+      <init_from>/m_boho_top/textures/young_lightskinned_male_diffuse3.png</init_from>
     </image>
     <image id="male02_diffuse_black" name="male02_diffuse_black">
-      <init_from>textures/male02_diffuse_black.png</init_from>
+      <init_from>/m_boho_top/textures/male02_diffuse_black.png</init_from>
     </image>
     <image id="brown_eye" name="brown_eye">
-      <init_from>textures/brown_eye.png</init_from>
+      <init_from>/m_boho_top/textures/brown_eye.png</init_from>
     </image>
     <image id="eyebrow001" name="eyebrow001">
-      <init_from>textures/eyebrow001.png</init_from>
+      <init_from>/m_boho_top/textures/eyebrow001.png</init_from>
     </image>
     <image id="bohotop1" name="bohotop1">
-      <init_from>textures/bohotop1.png</init_from>
+      <init_from>/m_boho_top/textures/bohotop1.png</init_from>
     </image>
     <image id="M_Trousers_02_NRM" name="M_Trousers_02_NRM">
-      <init_from>textures/M_Trousers_02_NRM.png</init_from>
+      <init_from>/m_boho_top/textures/M_Trousers_02_NRM.png</init_from>
     </image>
     <image id="M_Trousers_02" name="M_Trousers_02">
-      <init_from>textures/M_Trousers_02.png</init_from>
+      <init_from>/m_boho_top/textures/M_Trousers_02.png</init_from>
     </image>
     <image id="Shoes_Monk_Strap_NRM" name="Shoes_Monk_Strap_NRM">
-      <init_from>textures/Shoes_Monk_Strap_NRM.png</init_from>
+      <init_from>/m_boho_top/textures/Shoes_Monk_Strap_NRM.png</init_from>
     </image>
     <image id="Shoes_Monk_Strap" name="Shoes_Monk_Strap">
-      <init_from>textures/Shoes_Monk_Strap.png</init_from>
+      <init_from>/m_boho_top/textures/Shoes_Monk_Strap.png</init_from>
     </image>
   </library_images>
   <library_effects>

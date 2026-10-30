@@ -4,7 +4,8 @@
 
 Việc THẢ NGƯỜI đã tách khỏi social_bringup.
 
-    social_bringup.launch.py   chỉ nạp model và xử lý ảnh: YOLO + depth + VLM
+    social_bringup.launch.py   nạp model và xử lý ảnh: YOLO detection + depth,
+                               định vị/bám vết người (không VLM, không O/P/R)
                                (+ TF camera khi chạy thật, + RViz nếu muốn).
                                Không đụng gì tới actor.
 
@@ -15,118 +16,78 @@ Việc THẢ NGƯỜI đã tách khỏi social_bringup.
 
 Tách như vậy để: khi chạy thật không có gì để spawn nên social_bringup dùng
 nguyên xi, còn khi mô phỏng thì bạn chủ động chọn thời điểm người xuất hiện và
-đổi kịch bản mà không phải khởi động lại VLM (nạp model là phần lâu nhất).
+đổi kịch bản mà không phải khởi động lại perception.
 
-Hai kịch bản có sẵn, chọn bằng tham số `scenario:` của social_sim.launch.py:
+Bốn kịch bản có sẵn, chọn bằng tham số `scenario:` của social_sim.launch.py:
 
     scenario:=talking     người ĐỨNG NÓI CHUYỆN (tĩnh, mặc định)
     scenario:=gathering   người DI CHUYỂN (đi vào - nói chuyện - tản ra - lặp)
+    scenario:=crossing    MỘT người đi ngang qua trước camera (lặp lại)
+    scenario:=standing    MỘT người đứng yên, khóa animation, tại Gazebo world (0, -1.4)
 
-Perception xuất ra hai topic mà SocialLayer dùng để dựng costmap:
+Perception xuất ra một topic mà SocialLayer dùng để dựng costmap:
 
     /people          mọi người mà YOLO+depth nhìn thấy
-    /people_groups   vùng hội thoại do VLM xác nhận
 
--------------------------------------------------------------------------------
- CAMERA NẰM TRÊN ROBOT (đã đổi, trước đây gắn cố định trên tường)
--------------------------------------------------------------------------------
+Topic dataset/debug độc lập với Nav2:
 
-Camera RGB-D không còn là model tĩnh `dataset_camera` trong lirs_test.world nữa.
-Nó là một link của robot, khai trong
+    /people_observations  bbox, distance, keypoint 2-D/3-D và body-yaw theo track_id
+    /people/orientation   body-yaw + cờ valid theo track_id
+    /people/tracked_state_json  Block-B: vị trí, vận tốc, motion heading,
+                                 body orientation từ keypoints và quỹ đạo
+                                 constant-velocity trong frame odom (Gazebo)
+    /social_constraints/current_grid Block-D: grid hiện tại, chỉ phát nếu
+                                 publish_cost_grid=true (mặc định false)
+    /social_constraints/grid    Block-D: alias cùng current_grid, optional
+    /social_constraints/markers Block-D: vòng đồng mức 90%..15% hiện tại + nhãn sigma;
+                                 talking dùng một vòng chung cho đúng hai người
+    /social_perception/vlm_person_states  Block-VLM: JSON semantic theo từng
+                                 ByteTrack ID từ 4 frame RGB; node này optional
+                                 và chưa được Block-D dùng để tạo group cost
+    /animated_people/track_reset  Gazebo báo actor crossing vừa reset B -> A;
+                                   perception xoá track cũ, không vẽ ghost person
 
-    linorobot2_description/urdf/sensors/depth_sensor.urdf.xacro
-    linorobot2_description/urdf/2wd_properties.urdf.xacro   (depth_sensor_pose)
-
-đặt ở mép trước nắp base: x = 0.10, z = 0.2225 trong `base_link` (0.255 m so với
-mặt đất), ngẩng lên 0.20 rad. Chọn z như vậy để hộp camera nằm HẲN TRÊN mặt
-phẳng lidar (z = 0.19526); đặt ngang lidar thì chính camera thành vật cản vĩnh
-viễn trong /scan.
-
-    topic     /camera/color/image_raw
-              /camera/depth/image_rect_raw
-              /camera/color/camera_info
-    frame     camera_depth_link  (base_link -> camera_link -> camera_depth_link,
-                                  do robot_state_publisher phát)
-
-Ba hệ quả phải nhớ, khác hẳn thời camera treo tường:
-
-  1. NAV2 LÀ BẮT BUỘC, không còn là tuỳ chọn. Perception publish người trong
-     frame `map` (target_frame), chuỗi TF bây giờ là
-     map -> odom -> base_footprint -> ... -> camera_depth_link. Cạnh map -> odom
-     do AMCL phát, tức terminal 4. Thiếu nó thì mọi khung hình bị bỏ kèm log lỗi
-     tra cứu TF, /people rỗng.
-
-  2. ROBOT PHẢI HƯỚNG VỀ PHÍA NGƯỜI thì mới thấy. FOV 87 x 70 độ, người ở
-     world (0, +0.8) và (0, -0.8) còn robot spawn ở (-3, -2) quay yaw 0 -> cặp
-     người nằm sát rìa khung hình. Cách quay robot về phía họ là GỬI GOAL, chạy
-     ở terminal thứ 5 sau khi Nav2 đã lên (toạ độ trong frame `map`, tức là đã
-     trừ đi chỗ spawn: cặp người ở map (3, 2.8) và (3, 1.2)):
-
-         ros2 topic pub --once /goal_pose geometry_msgs/msg/PoseStamped \
-           "{header: {frame_id: map},
-             pose: {position: {x: 1.2, y: 0.8, z: 0.0},
-                    orientation: {z: 0.291, w: 0.957}}}"
-
-     Đích này cách trung điểm cặp người 2.16 m và quay mặt về phía họ
-     (yaw = 0.59 rad = atan2(2, 3)).
-
-     ĐỪNG dùng `spawn_yaw:=...` để làm việc này. gazebo.launch.py phát TF
-     world -> map với đúng yaw đó, mà cafe_vlm.pgm lại được dựng từ chỗ robot
-     xuất phát với yaw 0. Đổi spawn_yaw là xoay cả bản đồ so với thế giới, AMCL
-     hết khớp scan và robot tự định vị sai.
-
-  3. GẦN QUÁ THÌ MẤT ĐẦU. Camera cao 0.255 m ngẩng 11.5 độ: ở 3 m khung hình phủ
-     từ mặt đất tới 3.4 m, ở 1.5 m chỉ tới 1.83 m (ngang cổ), dưới ~1.0 m thì
-     đầu người ra khỏi khung và VLM mất căn cứ để trả lời. Giữ cặp hội thoại ở
-     1.5 m trở lên khi tinh chỉnh.
-
-Bản CHẠY THẬT không đổi: camera vẫn cắm vào máy trạm và đứng cố định
-(social_vlm_perception_real.yaml + TF map -> camera_link). Xem mục CHẠY THẬT.
+Trong RViz, `/social_perception/person_markers` vẽ đường và các chấm cyan dự
+báo vị trí người tại 0.50, 1.00, 1.50 và 2.00 giây trong frame `odom` ở Gazebo.
+SocialLayer tự đổi chúng sang frame costmap (`map` ở global, `odom` ở local).
+Chúng chỉ hiện khi tốc độ tracker đạt ít nhất `prediction_min_speed_mps`
+(mặc định 0.10 m/s).
 
 -------------------------------------------------------------------------------
  THỨ TỰ CHẠY CHUNG (4 TERMINAL)
 -------------------------------------------------------------------------------
 
     # Terminal 1 - Gazebo (world mặc định lirs_test.world)
-    ros2 launch linorobot2_gazebo gazebo.launch.py
+    __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia ros2 launch linorobot2_gazebo gazebo.launch.py run_ekf:=false
 
-    #    KHÔNG thêm run_ekf:=false ở đây. Plugin diff_drive đặt
-    #    <publish_odom_tf>false</publish_odom_tf>, nên EKF là thứ DUY NHẤT
-    #    phát transform odom -> base_footprint. Tắt nó đi thì frame `odom`
-    #    không tồn tại, và terminal 4 chết câm: local_costmap báo
-    #    'Timed out waiting for transform from base_link to odom' mãi mãi,
-    #    AMCL vứt sạch scan, robot không điều hướng được. Cờ đó chỉ dùng khi
-    #    chạy Gazebo để THU DỮ LIỆU RGB-D, không chạy Nav2.
-    #
-    #    Mặc định đã là cấu hình nhanh: gzserver render trên card rời
-    #    (gpu_render:=true). Xem mục TỐC ĐỘ SUY LUẬN VLM ở cuối file.
-    #    Thêm gui:=false nếu không cần cửa sổ 3D Gazebo.
-
-    # Terminal 2 - perception: YOLO + depth + VLM (+ RViz)
-    ros2 launch social_navigation social_bringup.launch.py rviz:=true
+    # Terminal 2 - perception + skeleton/body-yaw RViz. Cần local YOLO Pose checkpoint.
+    ros2 launch social_navigation social_bringup.launch.py rviz:=true \
+        yolo_model_path:=<duong_dan_local_toi_yolo_pose.pt>
 
     # -> ĐỢI dòng log:
-    #    "SẴN SÀNG: camera + YOLO hoạt động, VLM đã nạp xong"
+    #    "SẴN SÀNG: camera + YOLO hoạt động, VLM đã tắt (enable_vlm=false)"
     #    rồi mới sang terminal 3.
+
+    # Optional: chạy Qwen ở process riêng, không làm chậm Block B. Sao chép
+    # social_vlm_interaction.yaml thành file cấu hình local, đặt enable_vlm:
+    # true và trỏ vlm_adapter_path/vlm_base_model tới checkpoint có sẵn.
+    ros2 launch social_navigation social_bringup.launch.py \
+      vlm_interaction:=true \
+      vlm_interaction_config:=<duong_dan_yaml_vlm_local>
 
     # Terminal 3 - THẢ NGƯỜI (chọn 1 trong 2 kịch bản bên dưới)
     ros2 launch social_navigation social_sim.launch.py scenario:=talking 
 
     # Terminal 4 - Nav2 + social costmap layer (KHÔNG bật rviz ở đây)
     ros2 launch linorobot2_navigation navigation.launch.py sim:=true \
-        map:=/home/son/ninorobot2/linorobot2_navigation/maps/cafe_vlm.yaml
-
-    #    BẮT BUỘC từ khi camera chuyển lên robot: AMCL trong terminal này là
-    #    thứ duy nhất phát TF map -> odom, mà camera bây giờ treo dưới
-    #    base_link. Không chạy terminal 4 thì perception không đổi được toạ độ
-    #    người sang frame map và /people rỗng.
+        map:=/home/son/social_ninorobot/linorobot2_navigation/maps/cafe_vlm.yaml
 
 -------------------------------------------------------------------------------
  TRƯỜNG HỢP 1 - NGƯỜI ĐỨNG NÓI CHUYỆN  (terminal 3)
 -------------------------------------------------------------------------------
 
 Hai actor `m_sweater` và `m_mechanic` đứng đối diện nhau tại (0, +0.8) và
-(0, -0.8), giữ nguyên suốt phiên. Dùng để tinh chỉnh chính vùng xã hội O-P-R.
+(0, -0.8), giữ nguyên suốt phiên để kiểm tra detection/tracking.
 
     ros2 launch social_navigation social_sim.launch.py scenario:=talking
 
@@ -140,12 +101,44 @@ Hoặc gọn hơn, vì talking là mặc định:
 
 Vẫn hai actor đó, nhưng xuất phát ngoài khung hình tại (0, +3.5) và (0, -3.5):
 đi vào -> nói chuyện -> tản ra -> khuất camera -> lặp lại. Đây là ca kiểm tra
-costmap vừa TẠO được vùng xã hội vừa XOÁ được nó.
+costmap thêm/xóa từng người theo detection.
 
     ros2 launch social_navigation social_sim.launch.py scenario:=gathering
 
+-------------------------------------------------------------------------------
+ TRƯỜNG HỢP 3 - MỘT NGƯỜI ĐI NGANG QUA CAMERA  (terminal 3)
+-------------------------------------------------------------------------------
+
+`walker_1` đi theo đường y=-2 (A) -> y=+2 (B) tại world x=+1. Với spawn robot
+mặc định ở world x=-3, đường này xấp xỉ map x=+4: vùng sàn rộng sau cửa hẹp,
+để Nav2 còn không gian lách tránh thay vì người bị ép đúng giữa lối đi. Đến B,
+actor được dịch chuyển ngay về A rồi đi tiếp tới B (không đi ngược B -> A).
+Đây là scenario để kiểm tra body-yaw, vận tốc và quỹ đạo dự báo với đúng một
+người.
+
+    ros2 launch social_navigation social_sim.launch.py scenario:=crossing
+
+-------------------------------------------------------------------------------
+ TRƯỜNG HỢP 4 - MỘT NGƯỜI ĐỨNG YÊN (terminal 3)
+-------------------------------------------------------------------------------
+
+Actor `m_sweater` đứng tại Gazebo `world` (0, -1.4), hướng +y nhìn kệ sách
+tại (0,0), feet đặt trên sàn cafe. Đây là scenario để kiểm tra Gaussian tĩnh.
+Model không có clip
+`idle`, nên plugin khóa clip `talk` tại frame 0: tay và thân không cử động,
+giúp đầu vào RGB-D ổn định hơn.
+
+    ros2 launch social_navigation social_sim.launch.py scenario:=standing
+
+`scenario/state` phát `standing`. Khởi động Block D với mode `waiting`.
+Tâm là người, trục dài quay từ người tới kệ sách; không dùng vận tốc/yaw nhiễu:
+
+    ros2 launch social_perception social_constraint_grounding.launch.py \
+      expected_frame:=odom use_sim_time:=true \
+      social_state:=waiting
+
 Chu kỳ mặc định 96 giây: đi tới 8s, nói chuyện 60s, tản ra 8s, khuất camera 20s.
-Nếu VLM của bạn cần lâu hơn để trả lời, sửa trong
+Nếu cần giữ người trong khung lâu hơn để kiểm tra tracking, sửa trong
 linorobot2_gazebo/worlds/lirs_test.world:
 
     <plugin name="animated_people_factory" filename="libanimated_people_release.so">
@@ -156,15 +149,15 @@ linorobot2_gazebo/worlds/lirs_test.world:
     </plugin>
 
 -------------------------------------------------------------------------------
- ĐỔI KỊCH BẢN GIỮA CHỪNG - KHÔNG CẦN NẠP LẠI VLM
+ ĐỔI KỊCH BẢN GIỮA CHỪNG - KHÔNG CẦN KHỞI ĐỘNG LẠI PERCEPTION
 -------------------------------------------------------------------------------
 
 Đây là lợi ích chính của việc tách terminal:
 
-    Ctrl+C ở terminal 3          -> người biến mất, costmap phải xoá vùng xã hội
+    Ctrl+C ở terminal 3          -> người biến mất, costmap phải xoá người đó
     chạy lại với scenario khác   -> người xuất hiện lại theo kiểu mới
 
-Terminal 1, 2, 4 giữ nguyên, VLM không phải nạp lại.
+Terminal 1, 2, 4 giữ nguyên; perception và Nav2 không cần khởi động lại.
 
 -------------------------------------------------------------------------------
  BIẾN THỂ HAY DÙNG
@@ -173,12 +166,17 @@ Terminal 1, 2, 4 giữ nguyên, VLM không phải nạp lại.
     # Chỉ thả người, không chạy perception (test nhanh Gazebo, bỏ terminal 2)
     ros2 launch social_navigation social_sim.launch.py scenario:=gathering
 
-    # Chạy 2 terminal cùng lúc, để actor tự đợi VLM nạp xong rồi mới xuất hiện
+    # Chạy 2 terminal cùng lúc, để actor đợi YOLO/camera sẵn sàng rồi mới xuất hiện
     ros2 launch social_navigation social_sim.launch.py \
         scenario:=talking wait_for_perception:=true ready_timeout:=600.0
 
     # Perception không kèm RViz (chạy headless / qua ssh)
     ros2 launch social_navigation social_bringup.launch.py
+
+    # Recorder ảnh RGB gốc + JSON metadata; chạy ở terminal riêng sau perception
+    ros2 launch social_perception social_dataset_recorder.launch.py \
+        rgb_topic:=/camera/color/image_raw \
+        output_directory:=recordings/social_perception_sim
 
     # Đổi giao diện RViz
     ros2 launch social_navigation social_bringup.launch.py \
@@ -189,54 +187,6 @@ Terminal 1, 2, 4 giữ nguyên, VLM không phải nạp lại.
         config_file:=<đường dẫn .yaml>
 
 Chỉ bật RViz ở MỘT chỗ - hoặc social_bringup, hoặc navigation.launch.py.
-
--------------------------------------------------------------------------------
- TÁCH VLM SANG MÁY TRẠM (camera + YOLO trên robot, model trên laptop)
--------------------------------------------------------------------------------
-
-Robot mang camera nhưng không mang GPU. Đặt `vlm_remote: true` trong profile
-(social_vlm_perception_real.yaml đã đặt sẵn) thì node perception không nạp
-model nữa: nó cắt ảnh cặp người rồi hỏi máy trạm.
-
-    robot     -> /social_perception/vlm_request        VlmRequest  (crop+prompt)
-    máy trạm  -> /social_perception/vlm_response       VlmResponse (câu trả lời)
-    máy trạm  -> /social_perception/vlm_worker_ready   latched, chốt "SẴN SÀNG"
-
-    # MÁY TRẠM - nạp model, đợi ảnh cắt (nạp ~10-40s tuỳ page cache)
-    ros2 launch social_perception social_vlm_worker.launch.py
-
-    # -> ĐỢI "SẴN SÀNG: VLM đã nạp xong, đang đợi ảnh cắt từ robot"
-
-    # ROBOT - camera + YOLO + depth + tracking + vùng O/P/R
-    ros2 launch social_perception social_vlm_perception.launch.py \
-        config_file:=<...>/social_vlm_perception_real.yaml
-
-Node perception KHÔNG bỏ cuộc nếu máy trạm chưa lên: nó in
-"Đang đợi social_vlm_worker.py trên máy trạm (Ns)" mỗi 5 giây rồi chạy tiếp khi
-máy trạm sẵn sàng. Chờ mãi mà không thấy thì kiểm tra ROS_DOMAIN_ID hai máy có
-giống nhau không, và ROS_LOCALHOST_ONLY đã bỏ chưa.
-
-Chỉ ảnh cắt đi qua mạng - đo được 12.7-13.9 KB mỗi lần suy luận, so với ~12 MB/s
-nếu đẩy RGB-D thô ở 8 Hz. Mọi quyết định VỀ Ý NGHĨA câu trả lời vẫn nằm ở node
-perception (chọn cặp nào để hỏi, khung hình mới huỷ kết quả cũ ra sao, một câu
-phủ định đáng giá bao nhiêu). Worker không giữ trạng thái gì: khởi động lại nó
-chỉ tốn đúng một lần suy luận.
-
-Đo trên máy này (một laptop chạy cả hai node, Gazebo + Nav2 cùng chạy):
-
-    chế độ                      tb mỗi lần suy luận    số lần
-    vlm_remote: false           9.35 s                 4
-    vlm_remote: true            2.72 s                 10
-
-Chênh lệch này ĐO SƠ BỘ, chưa truy đến cùng nguyên nhân. Nghi là tranh chấp GIL
-và ml_execution_lock giữa YOLO và VLM khi ở chung một tiến trình Python - tách
-tiến trình bỏ được cả hai. Đừng trích số này như kết luận cho tới khi đo lại có
-kiểm soát.
-
-Ở chế độ tách, log chia đôi: máy trạm in ">>> VLM BẮT ĐẦU ... (13.9 KB qua
-mạng)" và thời gian model, robot in "<<< VLM XONG ... (từ lúc bắt đầu tới khi
-có kết quả)". Hiệu hai số đó chính là chi phí mạng + JPEG (đo trên loopback:
-2.82 - 2.79 = 0.03 s).
 
 -------------------------------------------------------------------------------
  CHẠY THẬT (camera cố định trên máy trạm, robot chỉ điều hướng)
@@ -268,19 +218,96 @@ node khác phát TF đó rồi.
 
     ros2 param list /global_costmap/global_costmap | grep social  # plugin đã nạp
     ros2 topic echo /social_perception/ready --once               # perception sẵn sàng
-    ros2 topic echo /people_groups --once                         # VLM thấy hội thoại
     ros2 topic hz /people                                         # người được bám vết
 
-Camera trên robot - kiểm tra theo đúng thứ tự này, sai ở đâu dừng ở đó:
+-------------------------------------------------------------------------------
+ RECORD DATASET / KIỂM TRA TOPIC (SIMULATION)
+-------------------------------------------------------------------------------
 
-    ros2 topic hz /camera/color/image_raw          # ~8 Hz, camera có render
-    ros2 topic hz /camera/depth/image_rect_raw     # ~8 Hz, cùng nhịp với RGB
-    ros2 run tf2_ros tf2_echo base_link camera_depth_link   # URDF đã nạp
-    ros2 run tf2_ros tf2_echo map camera_depth_link         # AMCL đã lên chưa
+Sau khi Terminal 1 (Gazebo), Terminal 2 (perception) và Terminal 3 (scenario)
+đã chạy, các topic record chuẩn là:
+
+    /camera/color/image_raw      sensor_msgs/Image
+    /camera/depth/image_raw      sensor_msgs/Image
+    /yolo/people                 vision_msgs/Detection2DArray
+    /people/tracks               social_perception/msg/People
+    /people/tracked_state_json   std_msgs/String (Block-B: map state + trajectory)
+    /odom/unfiltered             nav_msgs/Odometry (lệnh Gazebo ở trên dùng run_ekf:=false)
+    /tf                          tf2_msgs/TFMessage
+    /scenario/ground_truth       social_perception/msg/People
+    /scenario/state              std_msgs/String (approaching/talking/dispersing/away)
+
+`/camera/...` là alias record do social_perception relay từ camera Gazebo;
+`/scenario/ground_truth` là pose thật actor trong frame `world`. `/people`
+vẫn là output tương thích Nav2, còn `/people/tracks` là topic record rõ nghĩa.
+Khi dùng `run_ekf:=false`, record `/odom/unfiltered`; chỉ có `/odom` khi bật
+EKF bằng `run_ekf:=true`.
+
+    # Terminal 5 (terminal mới) - kiểm tra tất cả publisher/type trước khi record
+    for topic in /camera/color/image_raw /camera/depth/image_raw /yolo/people /people/tracks /people/tracked_state_json /odom/unfiltered /tf /scenario/ground_truth /scenario/state; do ros2 topic info "$topic"; done
+
+    # Terminal 5 - xem dữ liệu một lần từng topic
+    ros2 topic echo /yolo/people --once
+    ros2 topic echo /people/tracks --once
+    ros2 topic echo /people/tracked_state_json --once
+    ros2 topic echo /scenario/ground_truth --once
+    ros2 topic echo /scenario/state --once
+    ros2 topic echo /odom/unfiltered --once
+
+    # Terminal 6 (terminal mới) - record rosbag2. Ctrl+C để dừng và ghi metadata bag.
+    mkdir -p recordings
+    ros2 bag record -o recordings/social_scenario \
+      /camera/color/image_raw /camera/depth/image_raw \
+      /yolo/people /people/tracks /people/tracked_state_json \
+      /odom/unfiltered /tf /tf_static /scenario/ground_truth /scenario/state
+
+    # Terminal 7 - export RGB + depth PNG + JSON semantic VLM dataset.
+    # Fine-tune dùng rgb_path -> vlm_target.scene_semantics. Empty frame là
+    # class no_people; pose ground truth chỉ nằm trong evaluation_only.
+    ros2 launch social_perception social_dataset_recorder.launch.py \
+        output_directory:=recordings/social_perception_sim \
+        scenario_name:=gathering episode_id:=conversation_0042 \
+        dataset_split:=train scene_objects_csv:=shelf_right \
+        save_empty_frames:=true
+
+-------------------------------------------------------------------------------
+ THU NHANH ẢNH RGB-D + BLOCK-B KHI ROBOT QUAY QUANH NGƯỜI
+-------------------------------------------------------------------------------
+
+Sau khi Gazebo, perception và scenario `talking` đang chạy, launch này chọn
+người gần nhất từ `/people/tracks`, đưa robot tới các pose cực quanh người và
+chỉ ghi ảnh khi robot đã đứng yên ở mỗi pose. Mỗi metadata JSON có
+`runtime_context.block_b` đồng bộ đúng timestamp RGB, gồm state và quỹ đạo
+dự báo 2 giây tại bốn mốc thời gian.
+
+    # 8 góc, cùng khoảng cách 1.5 m; mỗi pose ghi khoảng 3 frame (3 Hz × 1 s)
+    ros2 launch social_perception social_collection.launch.py \
+      output_directory:=recordings/orbit_0001 \
+      capture_distances_m:=1.5 \
+      capture_angles_deg:='0,45,90,135,180,-135,-90,-45' \
+      capture_duration_s:=1.0 sample_rate_hz:=3.0
+
+Muốn thay khoảng cách tại từng ảnh thì đưa một giá trị cho mỗi góc. Góc là
+góc tuyệt đối quanh người trong frame `map`; robot luôn quay mặt về người.
+
+    ros2 launch social_perception social_collection.launch.py \
+      output_directory:=recordings/orbit_near_far \
+      capture_distances_m:='1.0,1.5,2.0,1.5' \
+      capture_angles_deg:='0,90,180,-90' \
+      capture_duration_s:=1.2 sample_rate_hz:=2.0
+
+Chọn đúng người nếu có nhiều người bằng ID ByteTrack hiện tại:
+
+    ros2 launch social_perception social_collection.launch.py \
+      target_track_id:=17 capture_distances_m:=1.5 \
+      capture_angles_deg:='0,45,90,135,180,-135,-90,-45'
+
+`run_ekf:=true` là bắt buộc cho collection này để TF `map -> base_link` cập
+nhật khi robot di chuyển. Không chạy Nav2 hay teleop cùng lúc, vì collection
+runner là publisher duy nhất của `/cmd_vel` trong phiên thu.
 
 Trong RViz:
-    Social O-P-R Regions  /social_spaces                          3 vòng O/P/R
-    Tracked People        /social_perception/person_markers       trụ xanh mỗi người
+    Tracked People        /social_perception/person_markers       trụ theo track_id ByteTrack
     Global Costmap        /global_costmap/costmap                 chi phí planner dùng
     YOLO Annotated        /social_perception/annotated_image      ảnh kèm bbox
     Depth View            /social_perception/depth_visualization  ảnh độ sâu
@@ -288,85 +315,90 @@ Trong RViz:
 Fixed Frame là `map` cho cả hai môi trường.
 
 -------------------------------------------------------------------------------
- TỐC ĐỘ SUY LUẬN VLM (nút thắt là CPU, không phải GPU)
+ BLOCK D - GROUNDING BLOCK-B THÀNH TRƯỜNG RÀNG BUỘC XÃ HỘI
 -------------------------------------------------------------------------------
 
-Một lần suy luận chỉ có phần prefill/decode chạy trên GPU. Decode ảnh ROS, cắt
-khung, và Qwen2VLProcessor băm ảnh thành visual token đều chạy trên CPU. Nên khi
-CPU bão hoà, `nvidia-smi` vẫn báo GPU-Util thấp trong lúc thời gian suy luận
-phình lên -- GPU đang chờ CPU nạp dữ liệu.
+Node D mặc định vẽ các vòng đồng mức 90/75/60/45/30/15% đỉnh, không phát
+heatmap (publish_cost_grid=false). Input /people/tracked_state_json là
+std_msgs/String, chứa vị trí/vận tốc theo track_id trong cùng expected_frame.
+D bỏ qua prediction.trajectory_m; không tạo vùng tương lai.
 
-Đo trên máy này (i7-10750H 6 nhân, Quadro T1000 4 GiB, prime-select on-demand),
-kịch bản `talking`, cửa sổ 150 s, chạy đủ 4 terminal ở trên:
+Chọn social_state trong social_perception/config/social_constraint_grounding.yaml:
+    auto (mặc định): 1 track -> crossing; 2 track -> một cặp talking;
+                    0 hoặc >2 track -> xoá vòng, không tự chọn cặp
+    talking: đúng HAI track -> MỘT Gaussian chung, w=0.9
+    crossing: mỗi người một Gaussian theo vận tốc, w=0.5
+    waiting: đúng MỘT người nhìn object YAML, Gaussian ellipse, w=0.7
+    stationary: đúng MỘT người, Gaussian tròn cố định, w=0.5
+Auto chọn case theo SỐ NGƯỜI Block B nhận được, không nhận diện hành vi thật.
+Hai người bất kỳ sẽ được coi là cặp talking trong chế độ thử này. Khi một
+người bị che/mất depth, auto có thể chuyển về crossing; chọn talking thủ công
+nếu cần bắt buộc giữ điều kiện hai người. Khi đổi scenario, giữ nguyên auto
+và D đang chạy; không cần chỉnh YAML/restart D mỗi lần.
+Talking cần hai ID khác nhau, vị trí hữu hạn và khoảng cách >1e-6 m. Nếu
+thiếu người, nhiều hơn hai người hoặc cặp không hợp lệ, D xoá vòng chung;
+không giữ người mất dấu, không ghép cặp tuỳ tiện, không cần body-yaw.
 
-    update_rate   gzserver render   tb suy luận   số lần/150s   loadavg
-    15 Hz         Intel iGPU          13.96 s          6         7.6-8.7
-     8 Hz         Intel iGPU           7.93 s         12         6.7-8.3
-     8 Hz         Quadro (mặc định)    6.85 s         13         5.5-6.9
+Với talking:
+    sep = hypot(x2-x1, y2-y1)                  # mét, khoảng cách hai tâm
+    centre = ((x1+x2)/2, (y1+y2)/2)           # cùng frame với Block B
+    yaw = atan2(y2-y1, x2-x1)                 # rad, trục nối hai người
+    sigma_h = sigma_r = [1+a*(1-c)]*(sep+d0)/4
+    sigma_s = sigma_h/3
+Công thức dùng (sep+d0)/4.
+Tâm chung thay hai Gaussian cá nhân trong case talking; không cộng trùng.
+Với sep=1.5 m, a=.1, c=.9, d0=.5 m: h=r=.505 m, s=.168 m.
+Vòng ngoài 15% dài khoảng 1.97 m, rộng .66 m; nhãn PAIR ghi ID, sep, sigma
+và kích thước vòng NGOÀI. Công thức talking vẫn có thể tạo vùng lớn.
 
-Nhanh hơn 2.04 lần, và quan trọng hơn là đều hơn: dao động giữa các lần suy luận
-giảm từ ~6.9 s xuống ~1.2 s. Với điều khiển robot thì độ trễ đều đáng giá hơn độ
-trễ thấp trung bình.
+Crossing giữ hình học cá nhân:
+    sigma_h = [1+a*(1-c)]*(d0+k*vh), sigma_s=sigma_r=sigma_h/3
+Waiting dùng công thức người-vật, với `d_obj` là khoảng cách người tới kệ:
+    yaw = atan2(y_obj-y_person, x_obj-x_person)
+    sigma_h = sigma_r = [1+a*(1-c)]*(d_obj+d0)/2
+    sigma_s = sigma_h/3
+Stationary không dùng vận tốc, body-yaw hay bookshelf:
+    sigma_h = sigma_r = sigma_s = stationary_sigma_m = 0.5 m
+    yaw = 0 (vòng tròn nên yaw không ảnh hưởng)
+YAML contour_levels: [0.90, 0.75, 0.60, 0.45, 0.30, 0.15] chọn vòng hiển thị.
+Mỗi vòng alpha có bán trục sigma*sqrt(-2*ln(alpha)); vòng ngoài 15% ~=1.948*sigma.
+Các mức tính theo đỉnh đã nhân trọng số: talking đỉnh 90 -> 15% là cost 13.5;
+crossing đỉnh 50 -> 15% là cost 7.5, trước làm tròn. Không phải ngưỡng cost 15.
+D vẽ đường đỏ, nhãn % trên từng vòng, không tô heatmap. Đặt contour_levels:
+[0.15] để chỉ xem vòng ngoài. Các đường này không cắt đuôi Gaussian về 0.
+zone_cost() vẫn tính C=maximum_cost*w_state*exp(-q/2), q=(u/sigma)^2+(v/sigma_s)^2.
+Nếu chủ động bật publish_cost_grid=true, /current_grid và /grid phát cùng
+nav_msgs/OccupancyGrid hiện tại; làm tròn/lọc integer cost và giới hạn grid
+có thể làm mất phần đuôi rất nhỏ. Mặc định không tính hoặc publish grid.
 
-Hai thay đổi tạo ra kết quả đó:
+    # Terminal scenario: Ctrl+C crossing trước nếu đang chạy, rồi thả cặp
+    ros2 launch social_navigation social_sim.launch.py scenario:=talking
 
-  1. <update_rate> của camera RGB-D 15 -> 8. Worker VLM chạy tuần tự một lần
-     mỗi ~2 s (vlm_inference_interval), nên khung hình quá 8 Hz chỉ được render
-     ra để bị bỏ. Đây là phần lớn hiệu quả (-43%). Số đo trên lấy hồi camera
-     còn nằm trong lirs_test.world; giá trị 8 Hz nay ở
-     linorobot2_description/urdf/sensors/depth_sensor.urdf.xacro.
+    # Terminal D: YAML mặc định social_state: auto, chỉ cần khởi động một lần
+    ros2 launch social_perception social_constraint_grounding.launch.py \
+      expected_frame:=odom use_sim_time:=true
 
-  2. gazebo.launch.py: tách `gazebo` wrapper thành gzserver + gzclient riêng, và
-     chỉ offload gzserver sang card rời qua PRIME (-13.6%). Tốn 448 MiB VRAM,
-     tổng 2542/4096 MiB khi VLM đã nạp -- vẫn còn dư ~1.5 GiB.
+Trong RViz: tắt các Map /social_constraints/current_grid và /social_constraints/grid
+để xoá heatmap cũ; bật MarkerArray /social_constraints/markers. Block D vẽ
+vòng đỏ trong namespace social_constraint_contours, tâm/người màu vàng và
+nhãn social_constraint_info. Namespace static_obstacles là khối nâu biểu diễn
+đúng collision envelope của bookshelf Gazebo (0.90 x 0.40 x 1.20 m, tâm
+(0, -0.195, 0.60) trong odom), nên dùng để quan sát/debug RL mà không cần Nav2.
+Marker dùng cùng frame/timestamp với Block B. Fixed Frame có thể là map nếu TF
+nối map với odom, hoặc odom để xem trực tiếp.
+Chạy thật: expected_frame:=map use_sim_time:=false; không dùng Gazebo ground truth.
+Để đổi scenario: Ctrl+C terminal social_sim, rồi chạy lại scenario:=crossing,
+scenario:=talking hoặc scenario:=standing. Giữ D với social_state: auto; 1
+1 người mặc định dùng crossing; chạy `social_state:=waiting` để dùng ellipse
+người-tới-kệ;
+frame hợp lệ tiếp theo sẽ tự chọn hình học. Các chế độ thủ công vẫn dùng được
+khi chỉnh YAML và restart D.
 
-Đo đối chứng:
+    ros2 topic echo /people/tracked_state_json --once
+    ros2 topic echo /social_constraints/markers --once
+    ros2 run tf2_ros tf2_echo map odom
 
-    ros2 launch linorobot2_gazebo gazebo.launch.py gpu_render:=false
-
-Kiểm tra offload có ăn thua: `nvidia-smi` phải liệt kê gzserver dạng `G`.
-Nếu không thấy, PRIME chưa có hiệu lực (cần libGLX_nvidia.so.0 và
-/usr/share/glvnd/egl_vendor.d/10_nvidia.json).
-
--------------------------------------------------------------------------------
- THỜI GIAN NẠP MODEL (khác với thời gian suy luận)
--------------------------------------------------------------------------------
-
-Hoàn toàn chạy local: vlm_offline: true nên không hỏi huggingface.co. Nút thắt
-cũng lại là CPU. Đo riêng khi máy rảnh thì import mất 17 s và nạp base model chỉ
-4.1 s; chính hai bước đó mất 106 s và 66 s khi Gazebo + Nav2 + RViz cùng khởi
-động. Nên thứ tự chạy quan trọng hơn mọi tối ưu khác:
-
-  1. Bật Gazebo với gui:=false trong lúc VLM nạp (gzclient tốn ~119% CPU).
-  2. ĐỢI dòng "SẴN SÀNG: ... VLM đã nạp xong" rồi mới chạy Nav2 (terminal 4).
-  3. Đóng Chrome/VS Code khi chạy sim -- đo được chúng lấy ~82% CPU.
-
-Và đừng tắt terminal 2 giữa các lần thử: đổi kịch bản hay restart Nav2 không cần
-nạp lại model. Đó là lý do social_bringup tách khỏi social_sim.
-
-Model đã gộp (Saved_Model_merged)
----------------------------------
-Saved_Model chỉ chứa LoRA (82 MB, 392 tensor toàn lora_A/lora_B), nên mỗi lần
-khởi động phải nạp base 4-bit rồi gắn adapter. merge_vlm_adapter.py gộp sẵn một
-lần, và node tự dùng nó khi có (tham số vlm_merged_path):
-
-    python3 social_perception/scripts/merge_vlm_adapter.py
-    python3 social_perception/scripts/compare_vlm_merge.py \
-        --crops <thư_mục_ảnh_cắt>
-
-Đo được: nạp 144 s -> 128 s, suy luận 3.57 s -> 3.01 s, 22/22 câu trả lời giống
-hệt base+adapter. Chạy lại merge sau mỗi lần train lại adapter; đặt
-vlm_merged_path: "" để quay về base+adapter.
-
-Hai cái bẫy đã trả giá để biết, đều nằm trong merge_vlm_adapter.py:
-
-  * PHẢI gộp ở fp16 rồi mới quantize. Gộp thẳng vào bản 4-bit là vòng
-    dequantize->cộng delta->requantize, đo được 0/12 -- model trả lời "không"
-    cho mọi ảnh.
-  * compute_dtype PHẢI là bfloat16. float16 cho đúng câu trả lời nhưng prefill
-    7.76 s thay vì 2.31 s trên card Turing này. Với checkpoint đã quantize thì
-    config trong file thắng tham số truyền vào, nên nơi quyết định là script
-    merge, không phải node.
+Nav2 vẫn dùng SocialLayer qua /people. D chưa nối vào navigation/control.
 
 -------------------------------------------------------------------------------
  DỌN DẸP KHI KẸT
@@ -377,72 +409,10 @@ Hai cái bẫy đã trả giá để biết, đều nằm trong merge_vlm_adapte
     ros2 daemon stop && ros2 daemon start
 
 -------------------------------------------------------------------------------
- GHI CHÚ: CHƯA CÓ KỊCH BẢN "NGƯỜI ĐI NGANG QUA" RIÊNG
+ GHI CHÚ: KỊCH BẢN "NGƯỜI ĐI NGANG QUA"
 -------------------------------------------------------------------------------
 
-Hiện chỉ có đúng hai giá trị `talking` và `gathering`
-(social_navigation/scripts/release_animated_people.py, dict `topics`).
-
-World lirs_test.world đã khai báo sẵn actor `walker_1` với animation walk.dae,
-nhưng khối gọi SpawnWalkingActor(...) trong
-linorobot2_gazebo/src/animated_people_release.cpp (hàm SpawnPeople) đang bị
-comment. Muốn có người đi ngang qua thuần tuý thì bỏ comment khối đó rồi:
-
-    colcon build --packages-select linorobot2_gazebo
-
--------------------------------------------------------------------------------
- HUẤN LUYỆN RL (package social_rl) DÙNG LẠI ĐÚNG 4 TERMINAL Ở TRÊN
--------------------------------------------------------------------------------
-
-Package social_rl train policy "thấy người thì né" bằng Recurrent PPO + LSTM.
-Nó KHÔNG đụng gì tới luồng trong file này và cũng KHÔNG dùng lại đủ 4 terminal:
-vòng RL cố ý chạy độc lập, không VLM và không Nav2.
-
-    Terminal 1  ros2 launch linorobot2_gazebo gazebo.launch.py gui:=false
-    Terminal 2  ros2 launch social_rl rl_perception.launch.py
-                (cùng node perception, nhưng enable_vlm:=false và
-                 target_frame:=odom, nên không nạp VLM và không cần AMCL)
-    Terminal 3  ros2 launch social_navigation social_sim.launch.py \
-                    scenario:=gathering        <- vẫn dùng nguyên của package này
-    Terminal 4  ros2 launch social_rl rl_train.launch.py [render:=true]
-
-Cách chạy đầy đủ, cách xem robot trong Gazebo lúc train, cách đọc tensorboard và
-các lỗi hay gặp nằm ở social_rl/RUN_RL.txt.
-
-Policy đã train còn có chế độ deployment kết hợp: chọn Nav2 Goal trên map thì
-mux bật RL cho cả hành trình; /people rỗng hay có track đều không đổi controller,
-track người chỉ đi vào observation để policy né. Nếu stream /people chết thì
-mux fault_stop. Không chạy hai agent cùng ghi /cmd_vel. Dùng đúng launch:
-
-    ros2 launch social_rl nav2_rl_handoff.launch.py \
-        model_path:=/home/son/social_rl_runs/<run>/final_model.zip \
-        sim:=true map:=.../maps/cafe_vlm.yaml
-
-Chi tiết topic, watchdog và cách kiểm tra mode nằm ở mục
-"CHỌN GOAL TRÊN MAP..." trong social_rl/RUN_RL.txt.
-
--------------------------------------------------------------------------------
- KHỐI F - LÁ CHẮN CBF/QP  (thêm 28-08-2026)
--------------------------------------------------------------------------------
-
-Hai lá chắn, CHỌN MỘT - cả hai đều ghi /cmd_vel_safe:
-
-    ros2 launch social_navigation social_safety.launch.py    # filter cũ
-    ros2 launch social_navigation social_shield.launch.py    # khối F, CBF/QP
-
-social_velocity_filter SCALE lệnh xuống theo khoảng cách tới người: nó chỉ đi
-chậm lại trên đúng đường đang đi. social_safety_shield ràng buộc tốc độ thay
-đổi của hàm rào nên LÁI được, và nó đọc vùng của khối D nên biết phân biệt giữa
-hai người đang nói chuyện với sau lưng một người.
-
-WATCHDOG DỪNG CÓ HẠN (01-09-2026): cả hai lá chắn khi mất đầu vào đều phát
-lệnh 0 rồi NGỪNG sau `stop_broadcast_time: 1.0` giây, thay vì phát mãi mãi.
-Bản cũ của khối F phát 0 ở 20.3 Hz NGAY TỪ LÚC KHỞI ĐỘNG dù chưa ai lái, nên
-bật nó trong lúc train là đè lệnh của trainer. Chi tiết và số đo: RUN_RL.txt
-mục "BẪY: CHẠY rl_agent RỒI TẮT".
-
-Khối F cần /social_rl/constraint_field - do agent_node (hoặc trainer) publish.
-Không có field thì nó vẫn ràng buộc lidar và cho lệnh đi qua, và ghi log; đó là
-suy giảm thật, không phải im lặng bỏ qua.
-
-Chi tiết tham số, cách giải QP và số đo: social_rl/RUN_RL.txt mục KHỐI F.
+`scenario:=crossing` chỉ thả `walker_1`, đi y=-2 (A) -> y=+2 (B) tại x=0,
+sau đó dịch chuyển về A để lặp lại.
+Sửa waypoint trong `SpawnCrossingPerson()` của
+`linorobot2_gazebo/src/animated_people_release.cpp` nếu cần đổi đường đi.

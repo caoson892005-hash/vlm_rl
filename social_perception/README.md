@@ -1,168 +1,127 @@
 # social_perception
 
-ROS 2 package that owns the complete camera-side social-perception pipeline:
+Gói ROS 2 định vị và bám vết người từ RGB-D và YOLO Pose; **không dùng VLM**
+ở runtime, không tạo vùng O/P/R.
 
-1. YOLO detects people in the RGB image.
-2. Registered depth and `CameraInfo` localize each person in `target_frame`.
-3. Lightweight tracking assigns stable IDs and estimates velocity.
-4. Nearby person pairs are cropped and passed to the supplied Qwen2-VL LoRA
-   adapter with the Vietnamese "đang nói chuyện?" prompt.
-5. VLM-confirmed conversations are published as social regions. Their `center`
-   is the mean world position of the participating people.
+Luồng xử lý:
 
-The detector runs independently of the VLM worker. If the VLM dependencies or
-base model are unavailable, `/people` continues to be published and the node
-logs the VLM error instead of stopping camera perception.
+1. RGB + depth + `CameraInfo` đi vào node.
+2. YOLO Pose tìm nhiều người và 17 COCO keypoints mỗi người (cần pose checkpoint).
+3. Median depth biến keypoint/torso 2-D thành điểm 3-D; TF biến chúng sang
+   `target_frame` (mặc định `map`).
+4. Tracker giữ ID ổn định. Khi profile mặt thấy rõ, horizontal `nose → shoulder`
+   cho heading trực tiếp; còn lại yaw là weighted circular average hip, shoulder,
+   nose-to-torso và được lọc theo `track_id` trong RViz.
+5. Node xuất người đã định vị/tracking sang `/people`; `SocialLayer` của Nav2
+   dùng từng người riêng lẻ.
 
-Both profiles run YOLO and Qwen2-VL on CUDA: sharing the card costs ~50 MiB
-next to the VLM's ~2.0 GiB, while leaving YOLO on the CPU makes it contend with
-the decode loop in this one process (10.1 s per inference against 3.6 s). VLM
-pair crops are capped at 256 merged visual tokens, only the nearest pair is
-processed, and an unchanged pair is refreshed every 15 seconds. A new pair or
-a position change of at least 0.25 m triggers an earlier inference. Each run
-prints `VLM latency ...` with its elapsed time and crop size.
-With `vlm_require_cuda: true`, loss of CUDA disables only the VLM worker rather
-than silently falling back to very slow CPU generation.
+VLM/Qwen cũ còn nằm trong source dưới nhãn `LEGACY / DISABLED` để tham khảo,
+nhưng node ép `enable_vlm` thành `false`: không tải model, không tạo crop ảnh,
+không chạy GPU inference. Các tham số `vlm_*` trong YAML chỉ được giữ để các
+file cấu hình cũ không lỗi.
 
-`vlm_offline: true` loads the checkpoint straight from `~/.cache/huggingface`
-instead of asking huggingface.co whether the cached copy is still current.
-Measured on this machine, startup drops from ~32.5 s to ~27.8 s; on a robot
-that is offline or behind a captive portal the saving is however long the HTTP
-timeout takes. A machine with an empty cache still downloads the model once,
-with a warning, rather than failing.
+## Topic input
 
-### Where the time goes
+- `/camera/color/image_raw` (`sensor_msgs/Image`): ảnh RGB cho YOLO Pose.
+- `/camera/depth/image_raw` (`sensor_msgs/Image`): depth theo pixel RGB.
+- `/camera/color/camera_info` (`sensor_msgs/CameraInfo`): intrinsics RGB dùng
+  để đổi pixel sang 3-D.
+- `/camera/depth/camera_info` (`sensor_msgs/CameraInfo`): metadata depth riêng,
+  optional. Depth vẫn phải được register/aligned với RGB trước khi đưa vào node.
 
-Measured on a Quadro T1000 with the 4-bit base model, a single inference is
-~1.8 s of prefill plus ~0.36 s per generated token — decoding, not the image,
-is the bottleneck. Two consequences shape the defaults:
+Tên cụ thể là parameter `rgb_topic`, `depth_topic`, `camera_info_topic` và
+`depth_camera_info_topic`; profile Gazebo giữ namespace camera mô phỏng hiện có.
 
-- `vlm_force_answer_prefix: true` starts the assistant turn at
-  `{"talking":"` so only the decisive word is generated instead of the whole
-  7-token JSON object. Measured 3.97 s → 2.51 s per inference, with the same
-  answer, and it also rules out the malformed replies (`{"talking":"có}`,
-  `{"talking":true}`) that previously cost an entire inference to recover
-  from. `vlm_max_new_tokens` applies only when this is `false`.
-- The model is warmed up with one throwaway inference at load time. The first
-  generate() call costs ~9.4 s against ~4.0 s for every call after it, so
-  paying it during startup keeps the first real conversation at steady-state
-  latency.
+Hai profile simulation và camera thật được giữ đồng bộ tại
+`config/social_vlm_perception.yaml` và
+`config/social_vlm_perception_real.yaml`.
 
-Lowering `vlm_max_pixels` helps far less than it looks: 256 → 128 → 64 merged
-visual tokens moved a full inference only from 4.05 s to 3.55 s to 2.98 s, so
-it costs image detail for a modest gain. Try it only after the two settings
-above.
-
-Queued and running VLM work carries a scene-generation ID. Losing a tracked
-person or receiving `/animated_people/hide` advances that ID, so an answer from
-an older image is discarded even if GPU generation finishes later.
-
-## Model setup
-
-`Saved_Model` is a PEFT/LoRA adapter, not a standalone model. Its
-`adapter_config.json` points to
-`unsloth/Qwen2-VL-2B-Instruct-bnb-4bit`, so the base model must also be present
-in the Hugging Face cache (or downloadable on the first run).
-
-Install the Python inference dependencies in the Python environment used by
-ROS 2:
+## Cài dependency, build và chạy
 
 ```bash
 python3 -m pip install -r social_perception/requirements.txt
-```
-
-The default config resolves `Saved_Model` and `yolov8n.pt` from the workspace
-root. Set `vlm_adapter_path` and `yolo_model_path` explicitly for an installed
-deployment. Set `enable_vlm: false` to test only RGB-D localization on a machine
-without the VLM stack.
-
-## Build and launch
-
-```bash
 source /opt/ros/humble/setup.bash
 colcon build --symlink-install --packages-up-to social_perception social_navigation
 source install/setup.bash
-ros2 launch social_perception social_vlm_perception.launch.py
+ros2 launch social_navigation social_bringup.launch.py rviz:=true
 ```
 
-## Splitting the model off onto another machine
+## Topic chính
 
-The robot carries the camera but not the GPU, so the model can run elsewhere.
-Set `vlm_remote: true` in the profile (already the case in
-`social_vlm_perception_real.yaml`) and start the other half on the workstation:
+- `/people`: mọi người đã được định vị 3-D trong frame navigation.
+- `/people_observations`: bbox YOLO, confidence, 17 keypoints 2-D, các
+  keypoint 3-D hợp lệ, depth torso và yaw của từng `track_id`.
+- `/camera/color/image_raw`, `/camera/depth/image_raw`: RGB/depth thô để
+  record. Trong Gazebo, RGB-D được gắn trên robot và phát trực tiếp hai topic
+  này; camera thật cũng dùng cùng tên chuẩn.
+- `/yolo/people` (`vision_msgs/Detection2DArray`): bbox, `id` track (khi có
+  depth/TF) và confidence YOLO.
+- `/people/orientation`: `body_yaw_rad` và trạng thái valid của từng `track_id`.
+- `/people/tracks` (`social_perception/People`): pose, velocity và heading của
+  mỗi người. `/people` vẫn được phát song song cho SocialLayer/Nav2 cũ.
+- `/scenario/ground_truth` (`social_perception/People`): nhãn pose actor thật
+  do Gazebo phát trong frame `world`; actor đang bị ẩn sẽ không có trong mảng.
+- `/odom/unfiltered` (khi mô phỏng chạy `run_ekf:=false`), hoặc `/odom` (khi
+  bật EKF), cùng `/tf`: pose robot do Gazebo/robot localization phát, không
+  phải dữ liệu perception tạo ra.
+- `/social_perception/person_markers`: người, keypoint 3-D, skeleton và mũi
+  tên body-yaw khi hai vai có depth hợp lệ.
+- `/social_perception/detections_2d`, `/social_perception/annotated_image`,
+  `/social_perception/depth_visualization`: topic debug camera.
+
+`/social_perception/vlm_person_states` (`VlmPersonStates`) là output optional
+của VLM. Node lấy 4 RGB frame có overlay ByteTrack ID, rồi xuất state semantic
+theo từng track, ví dụ `track_id: 12, state: crossing`. Hiện Nav2 không dùng
+topic này để tạo costmap. `/social_perception/talking_interactions` chỉ còn là
+topic legacy của nhánh VLM cũ đã tắt.
+
+`/social_perception/vlm_input_image` là frame RGB mới nhất đã vẽ bbox và
+`ID <track_id>` trước khi Qwen nhận nó. Mở topic này trong RViz để xác nhận
+format ảnh runtime tương thích với format đã dùng khi fine-tune.
+
+## Lưu dataset RGB-D và JSON semantic
+
+Recorder chạy tách khỏi YOLO. Nó chỉ ghi một sample khi RGB, depth,
+`/people_observations` và `/people/tracks` cùng timestamp đã đến đủ. Kết quả là
+`rgb/<sample_id>.jpg`, `depth/<sample_id>.png` (16-bit mm) và
+`metadata/<sample_id>.json`.
+
+Schema `social_semantics_v1` được tối ưu cho semantic VLM: fine-tune loader chỉ
+cần `rgb_path` làm image input và `vlm_target.scene_semantics` làm target.
+Gazebo phát `/scenario/state` với `approaching`, `talking`, `dispersing`,
+`away`, được map thành `people_approaching`, `two_people_conversing`,
+`people_dispersing`, `no_people`. Vì vậy label không do recorder đoán từ ảnh.
+
+`runtime_context` giữ track ID, vị trí tương đối robot, distance, body heading,
+speed, motion direction, confidence, pair features và object tĩnh cho các thử
+nghiệm prompt/social logic. `evaluation_only` giữ pose actor thật và pose robot;
+fine-tune/inference không được đưa block này vào input VLM. `scene_objects_csv`
+là metadata scene tĩnh do người chạy scenario khai báo.
+
+`social_collection.launch.py` là collector cho Gazebo: robot chạy tới các pose
+`capture_distances_m` và `capture_angles_deg` quanh một người đã track, quay
+mặt về họ rồi mới mở recorder. Mỗi file metadata `social_semantics_v2` chứa
+Block-B đồng bộ ở `runtime_context.block_b`. Collector mặc định chỉ lưu RGB +
+metadata; depth vẫn dùng để perception định vị người nhưng không ghi ra đĩa.
+Đặt `save_depth:=true` nếu cần xuất depth PNG. Ví dụ 4 pose gần/xa:
 
 ```bash
-# workstation
-ros2 launch social_perception social_vlm_worker.launch.py
-
-# robot
-ros2 launch social_perception social_vlm_perception.launch.py \
-    config_file:=<...>/social_vlm_perception_real.yaml
+ros2 launch social_perception social_collection.launch.py \
+  output_directory:=recordings/orbit_near_far \
+  capture_distances_m:='1.0,1.5,2.0,1.5' \
+  capture_angles_deg:='0,90,180,-90' \
+  capture_duration_s:=1.2 sample_rate_hz:=2.0
 ```
-
-Only the crop of a candidate pair crosses the network, measured at 13-14 KB per
-inference, against the ~12 MB/s that shipping raw RGB-D at 8 Hz would cost:
-
-```text
-robot        /social_perception/vlm_request   (VlmRequest: crop + prompt)
-workstation  /social_perception/vlm_response  (VlmResponse: raw answer)
-workstation  /social_perception/vlm_worker_ready  (latched, gates "SẴN SÀNG")
-```
-
-The split is deliberately lopsided. Every rule about what an answer *means* —
-which pair is worth asking about, what a newer camera frame invalidates, how
-much a contrary reply weighs against a region already on the costmap — stays in
-the perception node. The worker is stateless: it holds no track ids and no
-cache, so restarting it costs one inference rather than a rebuilt world model.
-`vlm_backend.py` is imported by whichever side loads the model, so the robot
-never needs `transformers`/`peft` and the workstation never needs
-`ultralytics`.
-
-With `vlm_remote: false` the model runs inside the perception node exactly as
-before; that is what the simulation profile does.
-
-## Parameters
-
-`config/social_vlm_perception.yaml` (simulation) and
-`config/social_vlm_perception_real.yaml` (camera on the workstation) are the
-only place parameters are defined; the node carries no defaults of its own and
-declares whatever the profile it was launched with contains. A parameter
-missing from the profile therefore raises at startup instead of running on a
-hidden value. Consequently the node must always be started with a profile —
-`social_vlm_perception.launch.py` passes one through its `config_file`
-argument, and `social_bringup.launch.py` picks the right one from `sim:=`.
-Keep the two profiles in step: a setting added to one belongs in the other.
-
-## Topics
-
-- `/people` (`social_perception/msg/People`): localized people and velocity.
-- `/people_groups` (`social_perception/msg/Groups`): VLM-confirmed social
-  regions, including center and O/P/R radii for the Nav2 layer.
-- `/social_perception/talking_interactions`
-  (`social_perception/msg/TalkingInteractions`): `talking`/`not_talking`
-  decision, member IDs, each person's pose and velocity, center, confidence,
-  source-image timestamp, inference-completion timestamp, and raw VLM response.
-- `/social_perception/vlm_request` (`social_perception/msg/VlmRequest`) and
-  `/social_perception/vlm_response` (`social_perception/msg/VlmResponse`): the
-  JPEG pair crop and the model's raw answer, only when `vlm_remote: true`.
-- `/social_perception/detections_2d`: YOLO boxes.
-- `/social_perception/annotated_image`: RGB image with detections and track IDs.
-- `/social_perception/depth_visualization`: colored depth image.
-- `/social_perception/person_markers`: localized people for RViz.
-- `/social_spaces`: O/P/R outlines for each VLM-confirmed region in RViz.
-
-The social-navigation costmap consumes only `/people` and `/people_groups`, so
-the VLM implementation can evolve without changing the costmap plugin.
-
-With `log_vlm_results: true` (the default), each completed inference is also
-printed to the launch terminal, for example:
-
-```text
-VLM RESULT [NÓI CHUYỆN] pair=(person_1, person_2) confidence=0.90 ...
-```
-
-Inspect the complete timestamped output with:
 
 ```bash
-ros2 topic echo /social_perception/talking_interactions
+# Camera thật, chạy sau khi perception đã chạy
+ros2 launch social_perception social_dataset_recorder.launch.py \
+  output_directory:=recordings/social_perception
+
+# Gazebo: giữ empty frame để có class no_people.
+ros2 launch social_perception social_dataset_recorder.launch.py \
+  output_directory:=recordings/social_perception_sim \
+  scenario_name:=gathering episode_id:=conversation_0042 \
+  dataset_split:=train scene_objects_csv:=shelf_right \
+  save_empty_frames:=true
 ```

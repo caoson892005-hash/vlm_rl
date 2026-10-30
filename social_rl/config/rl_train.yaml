@@ -14,10 +14,11 @@
 # một khoá thì chương trình báo lỗi ngay lúc khởi động chứ không im lặng bỏ qua.
 
 env:
-  # Ghi thẳng vào topic mà plugin diff_drive nghe, bỏ qua
-  # social_velocity_filter: nếu để filter ở giữa thì lệnh thực thi khác lệnh
-  # policy chọn, và policy học nhầm quyết định của người khác.
-  cmd_vel_topic: /cmd_vel_safe
+  # 11-09-2026: plugin diff_drive giờ nghe thẳng /cmd_vel (bỏ remap
+  # cmd_vel:=cmd_vel_safe trong diff_drive.urdf.xacro), nên ghi vào đây luôn
+  # là ghi đúng topic - không còn social_velocity_filter nào ở giữa để lệch
+  # lệnh thực thi khỏi lệnh policy chọn.
+  cmd_vel_topic: /cmd_vel
   scan_topic: /scan
 
   # --- khối B + C: người ở đâu, đang làm gì ---
@@ -192,6 +193,20 @@ env:
   # 0 = ngẫu nhiên mỗi lần chạy. Khác 0 để lặp lại đúng một run khi truy lỗi.
   vlm_seed: 0
 
+  # 11-09-2026: scene_confidence bốc đều trong [min, max] mỗi lần phán quyết
+  # được vẽ lại (cùng nhịp vlm_period ở trên), thay vì luôn 1.0 như ground
+  # truth thật. Đây là cách DUY NHẤT trong lúc train khiến các vùng Gaussian
+  # POLICY NHÌN THẤY co giãn kích thước ngẫu nhiên - confidence chạy thẳng vào
+  # factor = 1 + expansion_a*(1-c) của constraint_field.py. Reward vẫn tính
+  # trên danh sách sự thật (confidence 1.0 cố định) nên không bị ảnh hưởng, xem
+  # ground_truth.SimulatedVLM.
+  #
+  # CHỈ có tác dụng khi vlm_noise: true ở trên (cùng curriculum: bật SAU khi
+  # policy đã biết lái). vlm_noise vẫn đang false ở trên - đặt true khi tới
+  # lúc, đừng bật cả hai cùng lúc từ bước 0 (xem mục CURRICULUM, RUN_RL.txt).
+  vlm_confidence_min: 0.7
+  vlm_confidence_max: 0.9
+
   # --- DANH SÁCH ĐẦY ĐỦ CHO REWARD + ĐO CHÉO (01-09-2026) ---
   # Mỗi bước ground_truth tính thêm K_soc trên MỌI người, không nón camera và
   # không che khuất. Chính intrusion này đi vào reward với nguyên social_penalty
@@ -266,9 +281,23 @@ env:
   odom_timeout: 0.5
   startup_timeout: 60.0
 
-  max_linear_speed: 0.5      # bằng max_vel_x trong nav_sim.yaml
+  # m/s. RL policy command cap; Nav2's separate nav_sim limit is unchanged.
+  max_linear_speed: 0.5
   max_angular_speed: 1.0
   allow_reverse: false       # không có cảm biến phía sau, lùi là lùi mù
+
+  # Policy xuất (v_target, w_target), rồi CHÍNH bộ giới hạn có trạng thái này
+  # tạo command thực thi trước khi Gazebo chạy một step. Agent node đọc lại
+  # env_config.yaml được lưu cạnh checkpoint, nên khi test/robot dùng CHÍNH
+  # cùng thuật toán và các số dưới đây; không được chỉ bật khi deployment.
+  #
+  # control_period = 0.2 s, nên mỗi tick đổi nhiều nhất 0.10 m/s và 0.25 rad/s.
+  # Các giới hạn lấy từ rollout checkpoint 375k: angular 1.25 rad/s² chặn
+  # khoảng 11% chuyển tiếp w đột ngột nhưng vẫn cho quay 0 -> 1 rad/s trong
+  # 0.8 s. Zero khẩn cấp (mất scan/odom/field, shutdown) bypass limiter.
+  velocity_smoothing_enabled: true
+  max_linear_acceleration: 0.50   # m/s²; > 0, practical effect: smooth speed ramp
+  max_angular_acceleration: 1.25  # rad/s²; > 0, practical effect: suppress yaw shake
 
   # --- bước 5: vòng lặp step/reset có kiểm soát thời gian mô phỏng ---
   # true = mỗi step: gửi lệnh -> unpause -> chờ đúng control_period thời gian
@@ -287,6 +316,26 @@ env:
   # Đầu mỗi tập: dịch chuyển robot về một tư thế trong start_poses rồi nạp lại
   # EKF (/set_pose) và AMCL (/initialpose).
   randomize_start: true
+  # Radian, +/-. Với episode dùng `start_poses` (như `none`), robot quay về
+  # goal của tuyến rồi nhận nhiễu này; `waiting` dùng waiting_yaw_noise riêng.
+  # Hợp lệ [0, pi]. 1.0472 rad = 60 độ: vẫn buộc policy học chỉnh hướng,
+  # nhưng không thể spawn quay ngược 180 độ với goal ở phía tây.
+  random_start_yaw_limit: 1.0471975512
+  # true: với các scenario dùng start_poses/goals (none, talking), bốc một
+  # tuyến hợp lệ rồi đảo start<->goal 50%. Không tạo các cặp start-start hoặc
+  # goal-goal. false (mặc định mã) giữ hành vi cũ chỉ đi start -> goal.
+  reverse_list_routes: false
+  # rad, [0, pi/2], mặc định 0. Chỉ cho `talking`: robot bắt đầu nhìn đúng
+  # theo start->goal (tâm cặp người), nên vùng xã hội ở phía trước. Chỉ tăng
+  # khi cố ý train recovery từ vùng hơi lệch camera.
+  talking_start_yaw_noise: 0.0
+  # m, > 0. Tâm cặp `talking` bắt buộc cách điểm goal ít nhất số này, để vùng
+  # hoàn thành goal (reward.goal_distance = 0.35 m) không nằm trong lõi K_soc.
+  talking_goal_clearance: 1.9
+  # m, phải >= talking_goal_clearance / 0.55 = 3.455. Chỉ lọc route `talking`;
+  # route ngắn hơn không đủ chỗ để giữ clearance goal ở trên khi tâm cặp phải
+  # nằm từ 45% tuyến trở đi. `none` không đổi.
+  talking_minimum_route_distance: 3.5
   entity_name: linorobot2
   set_entity_state_service: /set_entity_state
   ekf_set_pose_service: /set_pose
@@ -479,13 +528,138 @@ env:
   # rơi vào đúng kịch bản "học tệ hơn" chứ không phải "học né". Về 3:1:1:1
   # (`none` 50%, giữa 67% và 25%) làm bước đệm, cùng với tăng social_penalty
   # bên dưới để phần thưởng né mạnh hơn ngay cả khi tập có người ít gặp hơn.
+  # --- 12-09-2026: G2a, kiến trúc mới (bỏ dự đoán + Gaussian + reward theo
+  # báo cáo) - fork từ checkpoint G1 (chỉ `none`, học lái/quay đầu/né vật cản).
+  # Mọi lịch sử 4 kịch bản (1:1:1:1, 6:1:1:1...) phía trên là của kiến trúc CŨ
+  # (5 kênh K_soc dự báo), KHÔNG resume được sang đây - xem RUN_RL.txt.
+  #
+  # 13-09-2026: tăng lên 65% none / 35% talking (13:7, ước lượng nguyên gần
+  # nhất của 65:35 = 13:7 sau khi rút gọn theo GCD 5) theo yêu cầu, sau khi
+  # --eval 20 tập deterministic ở 80/20 cho none_goal 47.1% -> 61.1% qua hai
+  # đợt resume (77500 -> 147500) và hit_obstacle đã về 0% - nút thắt giờ là
+  # timeout, không còn là va chạm, nên tăng tỉ lệ talking để đẩy mạnh hơn tín
+  # hiệu K_soc mà không nhảy thẳng lên 1:1:1:1 (bài học 05-09-2026 phía trên:
+  # tăng tỉ lệ người quá đột ngột làm policy học tệ đi trước khi học né).
+  #
+  # 65/35 -> 50/50 (14-09-2026, theo yêu cầu). Resume từ checkpoint 125000
+  # (run 20260914_073223) - --eval 40 tập deterministic: goal 85.0%,
+  # hit_obstacle 0.0%, tốt nhất trong các checkpoint đã đo ở nhánh này. Tăng
+  # tỉ lệ talking lên một nấc nữa (không nhảy thẳng 1:1:1:1 kiểu 4 kịch bản
+  # cũ vì hiện chỉ có 2 kịch bản none/talking, 50/50 đã là mức đặc nhất còn
+  # lại trước khi đảo tỷ lệ sang phía talking nhiều hơn none).
+  #
+  # 50/50 -> 65/35 (14-09-2026, theo yêu cầu, TRẢ VỀ). Nhánh 50/50 (run
+  # 20260914_120920, ent_coef 0.0003) --eval 40 tập cả ba checkpoint
+  # (127500/142500/170000) đều THUA checkpoint xuất phát 125000 trên cả
+  # outcome/goal (65-75% so với 85%) lẫn none_goal (64.7-71.4% so với
+  # 85.7%) - không có bằng chứng 50/50 giúp gì, và hai biến (scenario +
+  # ent_coef) đổi cùng lúc nên không tách được cái nào gây tụt. Trả
+  # scenarios về đúng 65/35 (13:7) để cô lập biến, chỉ còn ent_coef
+  # 0.0003->0.001 là thay đổi duy nhất cho lần resume tiếp theo từ 125000.
+  #
+  # 65/35 -> 55/45 (14-09-2026, theo yêu cầu). Nhánh 65/35+ent_coef 0.001
+  # (run 20260914_155442) cũng THUA 125000 (final_model/150000/142500 đều
+  # goal 75-77.5% so với 85%) - ent_coef=0.001 đã bị loại hai lần (xem đoạn
+  # ent_coef phía dưới, trả về 0.0005). Lần này CHỈ đổi scenarios, giữ
+  # ent_coef đúng mức đã train ra 125000, để biết riêng tỉ lệ talking cao
+  # hơn có tự nó giúp/hại hay không - chưa từng đo sạch một biến này. Tăng
+  # từng nấc (55/45, tỉ lệ 11:9) thay vì nhảy lại 50/50, đúng bài học
+  # 05-09-2026: tăng đột ngột dễ "học tệ hơn" chứ chưa chắc "học né".
+  #
+  # 55/45 -> 80/20 (15-09-2026, theo yêu cầu, train lại TỪ ĐẦU). Kiến trúc
+  # đổi (d0/talking/progress_gain), train lại từ trọng số ngẫu nhiên - quay
+  # về đúng chủ trương "học lái trước, học né vật tĩnh trước, học né xã hội
+  # sau" (GIAI ĐOẠN C cũ): `none` chiếm đa số ngay từ đầu thay vì áp tỉ lệ đã
+  # tối ưu cho fine-tune một checkpoint biết lái sẵn.
+  #
+  # 80/20 -> 70/30 (16-09-2026, theo yêu cầu). Sau 130352 bước (train từ đầu
+  # 100k + resume thêm 30k), `scenario/none_goal` đã ổn định 74-88% qua toàn
+  # bộ 6 checkpoint đã --eval, vượt xa ngưỡng qua giai đoạn (>=0.6) - đúng lúc
+  # tăng talking theo curriculum. CHỈ đổi scenarios lần này, GIỮ NGUYÊN
+  # learning_rate (0.0003) - theo đúng bài học 14-09-2026 ở trên (đổi 2 biến
+  # cùng lúc thì không tách được cái nào gây tụt/tăng). Tăng một nấc vừa phải
+  # (70/30, không nhảy thẳng 60/40) vì bước 80->40 (gấp đôi) lớn hơn mọi bước
+  # tăng đã từng thử an toàn trong lịch sử file này (~10-15 điểm %/lần).
+  #
+  # 70/30 -> 55/45 (16-09-2026, theo yêu cầu). Sau 40000 bước ở 70/30 (run
+  # 20260916_123330, resume từ 143525/final_model.zip), --eval 30 tập
+  # deterministic checkpoint 125352 và 135352: none_goal 85.0%/86.4%,
+  # talking_goal 80.0%/87.5% - cả hai đều PASS 3/4 tiêu chí xã hội, chỉ còn
+  # thiếu none_goal (>90%). Tăng tiếp một nấc theo đúng nhịp curriculum, GIỮ
+  # NGUYÊN learning_rate để cô lập biến như mọi lần trước.
+  #
+  # 55/45 -> 40/60 (16-09-2026, theo yêu cầu). Sau 40000 bước ở 55/45 (run
+  # 20260916_160820), --eval 30 tập checkpoint 165352 ra none_goal 89.5%
+  # nhưng --eval LẠI 60 tập cùng checkpoint đó tụt còn 83.9% (talking_goal
+  # 81.8% -> 65.5%) - bài học: n=30 không đủ tin, và talking_goal vẫn còn
+  # thấp/nhiễu. Lần này `talking` LẦN ĐẦU chiếm đa số (60% > 50%), kèm CÙNG
+  # LÚC offset pair thu hẹp 0.7-0.9 -> 0.3-0.5 (xem animated_people_release.cpp)
+  # - HAI BIẾN đổi cùng lúc, phá quy tắc cô lập biến đã theo suốt file này,
+  # nhưng đây là yêu cầu trực tiếp kèm lý do rõ ràng (đảm bảo gặp người +
+  # tăng tín hiệu học né), không phải suy đoán. Nếu kết quả đổi (tốt hay xấu)
+  # thì KHÔNG tách được là do tỉ lệ hay do offset - phải test lại tách biệt
+  # nếu cần biết chính xác cái nào có tác dụng.
+  #
+  # 40/60 -> 30/70 (18-09-2026, theo yêu cầu). Sau khi hạ learning_rate
+  # 3e-4->1e-4 (xem mục train: phía dưới) và trả offset về 0.7-0.9, checkpoint
+  # 230352 (run 20260918_020756) --eval 60 tập lần đầu tiên PASS đủ 4/4 tiêu
+  # chí: none_goal 95.5%, talking_goal 78.9%, clear_episodes 61.7%,
+  # peak_unseen-peak_intrusion -0.009. none_goal đã vững, đúng lúc tăng tiếp
+  # talking theo curriculum. CHỈ đổi scenarios lần này, GIỮ NGUYÊN
+  # learning_rate=1e-4 và offset=0.7-0.9 (cả hai vừa được xác nhận có tác
+  # dụng, không đụng vào) - resume từ 230352, không phải checkpoint khác.
+  #
+  # 30/70 -> 40/60 (19-09-2026, theo yêu cầu). Run 20260918_180359 (30/70,
+  # resume 230352) KHÔNG cải thiện: --eval 60 tập ở offset train, 280352 FAIL
+  # (clear_episodes 55.0%), 265352 PASS ngang 230352 (cả hai 61.7%). Quay về
+  # đúng 40/60 mà 230352 đã train ra, và resume LẠI từ 230352 - kèm offset
+  # 0.7-0.9 -> 0.5-0.6 (xem animated_people_release.cpp). So với điều kiện đã
+  # train ra 230352 thì CHỈ offset đổi. Lưu ý: --eval mặc định giờ cũng dùng
+  # 0.5-0.6, không còn so ngang hàng được với các con số eval 0.7-0.9 cũ.
+  #
+  # 40/60 -> 30/70 (23-09-2026, theo yêu cầu). Chỉ đổi tỷ lệ scenario: 3/10
+  # tập không có người để giữ kỹ năng lái tới đích, 7/10 tập `talking` để tăng
+  # mật độ học tránh cặp người. Giữ nguyên goal, reward và learning_rate.
+  #
+  # 30/70 talking -> 40/60 waiting (28-09-2026) -> 70/30 waiting (29-09-2026,
+  # train lại TỪ ĐẦU) -> 60/40 waiting (29-09-2026, resume từ
+  # recurrent_ppo_100000_steps.zip của run 70/30) -> 50/50 waiting (01-10-2026,
+  # resume từ recurrent_ppo_252500_steps.zip của run 60/40, checkpoint đầu
+  # tiên PASS đủ 4 tiêu chí ACCEPTANCE) -> VỀ LẠI 60/40 (01-10-2026, resume từ
+  # 252500, ra recurrent_ppo_345000_steps.zip: goal 95.0%, none_goal 100.0%,
+  # waiting_goal 88.2%, clear_episodes 57.5% - trượt sát đúng 1 tiêu chí) ->
+  # 100% waiting (02-10-2026) -> VỀ LẠI 60/40, GIỮ `none` (02-10-2026, theo
+  # yêu cầu - bỏ hẳn none rủi ro mất none_goal như ghi ở dòng ~997 lịch sử
+  # file này). Yêu cầu còn lại (người đứng cố định một kiểu như ảnh mẫu,
+  # không đổi route/khoảng cách ngẫu nhiên mỗi tập) CHƯA làm - xem hỏi lại
+  # bên dưới trước khi đụng animated_people_release.cpp / waiting_routes.
+  # `talking` KHÔNG còn trong danh sách nên kỹ năng né cặp người không được
+  # củng cố nữa. Kịch bản `waiting` có đảo start<->goal 50% mỗi tập (xem
+  # ros_env.py, 29-09-2026).
+  # 60/40 -> 50/50 (02-10-2026, theo yêu cầu, resume từ 345000). LƯU Ý: lần
+  # 50/50 trước (01-10-2026, resume từ 252500) không ra checkpoint PASS nào
+  # qua 4 lần --eval (315000, 345000, 360000, 385000): none_goal tụt xuống
+  # 58.8-77.8%, clear_episodes kẹt đúng 45.0% cả 4 lần, dù waiting_goal tăng
+  # (72.7-86.4%). Lần này resume từ 345000 (none_goal 100%, waiting_goal
+  # 88.2%, đã train với 5 tuyến mặt -1 đồng nhất thay vì 1 tuyến) nên có thể
+  # khác, nhưng --eval none_goal/clear_episodes kỹ sau khi train, đừng chỉ
+  # nhìn waiting_goal tăng mà kết luận tốt lên.
+  # 50/50 -> 60/40 (02-10-2026, theo yêu cầu, resume từ 252500 của run
+  # 20260930_093119 - checkpoint KHÁC nhánh, train TRƯỚC cả dãy 6 kệ và
+  # trước S7/goal sửa hôm nay). Chưa có số đo cho tổ hợp resume này.
+  # Mix train talking: 10 phần tử cho xác suất chính xác 5 `none` / 5
+  # `talking`. Không lấy `waiting` ở đợt train này.
   scenarios:
     - none
     - none
     - none
+    - none
+    - none
     - talking
-    - passing
-    - passing
+    - talking
+    - talking
+    - talking
+    - talking
   scenario_settle_time: 0.6
 
   # Toạ độ trong frame `map` (robot spawn ở world (-3, -2) nên map = world + 3, +2).
@@ -493,16 +667,367 @@ env:
     - [0.0, 0.0, 0.0]
     - [0.5, 0.5, 0.6]
     - [1.0, 0.0, 0.3]
-    - [0.0, 1.5, -0.4]
+    # S4 moved south-east from (0.0, 1.0): this keeps 0.93 m clearance from
+    # the nearby static obstacle on waiting_rl_train instead of 0.51 m.
+    - [0.3, 0.7, -0.4]
+    # Opposite-side starts. These are the former east-side goals, so episodes
+    # also approach the open left side without enabling random route reversal.
+    - [3.0, -1.0, 0.0]
+    - [4.0, 0.5, 0.0]
+    - [6.0, 0.5, 0.0]
   # Mỗi đích phải cách chân bàn `ban_cafe` (map 4.0, 3.0) ít nhất 0.65 m
   # (= obstacle_collision_distance 0.30 + goal_distance 0.35), nếu không vùng
   # "đã tới đích" chồng lên vùng "va chạm" và robot bị chấm hit_obstacle ngay
   # trước khi tới nơi.
+  #
+  # 4 -> 7 goal (20-09-2026, theo yêu cầu): tăng tỉ lệ tập có |bearing| > 90 độ
+  # từ 12.7% lên ~35% mà KHÔNG mở rộng yaw (vẫn (-pi/2, pi/2), ros_env.py). 4
+  # goal cũ đều nằm về +x/+y so với 4 start (hướng tuyến -9..+54 độ) nên yaw
+  # ±90 độ chỉ đẩy được 12.7% tập quá 90 độ. 3 goal mới thêm hướng tuyến
+  # ~148 / ~67 / ~-130 độ. Mô phỏng 400000 lần bốc: |bearing|>45 65.9%, >90
+  # 34.8%, >135 15.8%; khoảng cách start->goal vẫn 3.18-5.80 m. Kiểm với
+  # map_train_rl-1.pgm: 3 goal mới cách vật cản 1.30 / 3.07 / 2.25 m, đường
+  # thẳng từ cả 4 start tới chúng cách vật cản >= 1.17 m. Chưa kiểm bằng mắt
+  # trong Gazebo/RViz. Lệch trái nhiều hơn phải (22.8% vs 11.9% cho bearing
+  # >+90 vs <-90): vùng trống của map này ít chỗ hợp lệ cho goal phía dưới-phải.
+  # Hệ quả: số eval sau mốc này không so ngang hàng được với số cũ.
+  #
+  # 7 -> 5 goal (20-09-2026, theo yêu cầu, LÙI một nấc curriculum). Bản 7 goal
+  # không học lên: 2 run (20260920_001825 + 20260920_081645, ~100k bước) goal
+  # rate phẳng ~0.78 (độ dốc -0.005 +- 0.006 mỗi 10k), timeout nhích lên
+  # 0.09 -> 0.15-0.19. Kịch bản `none` (không người) vẫn timeout ở goal mới:
+  # (-2.25, -2.5) 6/14 = 43%, (-3.25, 2.75) 6/30 = 20%, 5 goal còn lại 9-12%
+  # => thiếu kỹ năng quay đầu, không phải chuyện né người. Tiền lệ: ros_env.py
+  # (04-09) yaw cả vòng làm none_goal kẹt ~0.6. Bỏ 2 goal quay đầu, giữ lại 4
+  # goal cũ + (2.25, 5.0) (hướng ~67 độ, về đích 78% ở 332852). |bearing| > 90
+  # kỳ vọng ~18% (trước 12.7%). approx_kl 0.03 / clip_fraction 0.13 nên KHÔNG
+  # phải LR quá thấp, giữ 1e-4. Resume từ 252852 (run 20260919_150810), trước
+  # mọi lần đổi goal.
+  #
+  # 5 -> 6 goal (20-09-2026, theo yêu cầu, THÊM LẠI một goal quay đầu NHẸ hơn).
+  # Sau 5 goal: 332852 (run 20260920_101406) là bản PASS 4/4 ở offset=0, train
+  # tiếp 50k bước (run 20260920_191037) KHÔNG vượt nó (350352 / 375352 / final
+  # đều FAIL, timeout 12-17%). Thêm [-1.5, -3.0] (hướng tuyến ~ -119 độ, kỳ
+  # vọng 66% tập của goal này vượt 90 độ) thay cho 2 goal đã thất bại
+  # (-2.25,-2.5) ~ -130 độ (timeout 43% ở `none`) và (-3.25, 2.75) ~ 148 độ.
+  # Chỉ 1 goal / 6 nên phần khó chiếm ~17% số tập (bản 7 goal: 29%). Mô phỏng
+  # 300000 lần bốc: |bearing|>90 25.8% (5 goal: 17.6%, 7 goal: 34.8%), >135
+  # 9.2% (7 goal: 15.8%), khoảng cách vẫn 3.18-5.80 m. Kiểm map_train_rl-1.pgm:
+  # goal cách vật cản 1.72 m, đường thẳng từ 4 start cách >= 0.99 m; cặp
+  # `talking` rơi sát/trong vật cản (<0.20 m) chỉ 0.1% lần bốc. Đã loại
+  # (-0.5, -3.25) (milder, ~-104 độ) vì 10.3% lần bốc đặt người vào vật cản.
+  # Chưa kiểm bằng mắt trong Gazebo/RViz. learning_rate GIỮ 1e-4 (chỉ đổi
+  # đúng một biến: phân phối goal).
+  #
+  # OFFSET CẶP `talking` 0.0-0.4 -> 0.0 (23-09-2026, theo yêu cầu; hằng số
+  # nằm trong animated_people_release.cpp, KHÔNG có khoá YAML). Tâm cặp người
+  # nằm đúng trên đường đi của robot. Cùng
+  # ngày sửa lỗi offset DÍNH trong plugin (sau một lệnh `offset 0 0` mọi lệnh
+  # sau vẫn offset 0 tới khi khởi động lại gzserver): các ô eval "offset train"
+  # sau ô đầu tiên của mỗi lô trước đó thực ra chạy ở offset 0, và run
+  # 20260920_235537 (checkpoint 335k-412k) train cả run ở offset 0 cố định.
+  # Đã đo 24 lần bốc trên Gazebo thật sau khi sửa. Phải KHỞI ĐỘNG LẠI Gazebo
+  # để nạp plugin mới. Resume từ 412852 (run 20260920_235537).
+  #
+  # 6 -> 4 goal (28-09-2026, theo yêu cầu): bỏ [4.5, 2.0] và [3.8, 1.5]. Kệ
+  # BookshelfA_01_002 được dời tay tới world (0.606, 0.186) yaw 1.624 (map
+  # (3.61, 2.19), footprint map x 2.85-4.36, y 1.79-2.58), nên hai goal này cách
+  # kệ 0.15 m / 0.33 m, dưới ngưỡng 0.65 m (obstacle_collision_distance 0.30 +
+  # goal_distance 0.35) và đường thẳng từ start [0, 1.5] tới [4.5, 2.0] xuyên qua
+  # kệ. Bốn goal còn lại cách kệ 1.07-6.5 m. Phân phối bearing/khoảng cách của
+  # tập chưa đo lại; số eval sau mốc này không so ngang hàng được với số cũ.
+  #
+  # [4.0, 4.2] -> [4.0, 2.5], [2.25, 5.0] -> [6.0, 3.0] (02-10-2026, theo yêu
+  # cầu). Cùng nguyên nhân lặp lại lần hai: kệ neo dịch tiếp, lần này tới world
+  # (1.458, 2.421) (map (4.46, 4.42)) để nhường chỗ cho dãy 6 kệ nhân bản (xem
+  # cảnh báo ở env.waiting_routes). Đo được TRÊN RUN ĐANG CHẠY
+  # (20261002_215344, resume 377500k): outcome/hit_obstacle 0.00 -> 0.20-0.31,
+  # scenario/none_goal 0.86-1.00 -> 0.60-0.78, ep_rew_mean 16.9 -> 9.5 trong
+  # vòng 10k bước đầu sau resume - [4.0, 4.2] (world 1.0, 2.2) chỉ cách kệ mới
+  # 0.51 m (dưới ngưỡng 0.65 m), [2.25, 5.0] (world -0.75, 3.0) nằm sau dãy kệ
+  # (dãy trải world y 2.0-2.6, x -6.9..1.46; đầu tây sát tường ShopWindow x=
+  # -7.74, chỉ còn đầu đông mới vòng được) nên từ cả 4 start pose phải vòng
+  # ~8 m mới tới. [4.0, 2.5] (world 1.0, 0.5) cách kệ ~1.98 m, nằm NAM dãy kệ.
+  # [6.0, 3.0] (world 3.0, 1.0) nằm ĐÔNG đầu dãy kệ, cách kệ ~2.10 m, không
+  # cần vòng. CHƯA nhìn bằng mắt trong Gazebo/RViz, CHƯA --eval - dừng run
+  # 20261002_215344 và kiểm lại trước khi train tiếp trên goal mới.
+  #
+  # [4.0, 2.5] -> [4.0, 0.5], [6.0, 3.0] -> [7.5, 1.0] (03-10-2026, theo yêu
+  # cầu, "robot đi sát kệ sách nhiều lần rồi timeout"). Dù cả hai đều qua
+  # ngưỡng an toàn va chạm 0.65m (đo được cách MẶT kệ 1.53m / 1.35m - gần
+  # nhất trong 4 goal, so với 3.26m / 6.70m của 2 goal còn lại), none_goal
+  # vẫn thấp (40-60%) và quan sát trực tiếp nhiều tập thấy robot vòng sát
+  # dãy 6 kệ (vật cản lớn, mới dựng, policy còn ít thời gian tiếp xúc) rồi
+  # timeout. Dời cả hai ra hẳn vùng sàn trống, cách CẢ kệ LẪN tường >= 3.2m:
+  #   goal1 (world 1.0, 0.5) -> (1.0, -1.5): cách kệ 3.52m, cách tường 4.04m
+  #   goal3 (world 3.0, 1.0) -> (4.5, -1.0): cách kệ 3.85m, cách tường 3.27m
+  # Thí nghiệm có kiểm soát: nếu none_goal tăng rõ sau khi đổi thì xác nhận
+  # đúng nguyên nhân là vị trí gần vật cản, không phải policy yếu chung.
+  # Dời xong none_goal 0.40 -> 0.80-1.00 (run 20261003_233401 ngay sau
+  # restart) - xác nhận đúng 2 goal này là nguồn timeout chính.
+  #
+  # 4 -> 2 goal (04-10-2026, theo yêu cầu, "bỏ 2 goal ý đi"). Bỏ hẳn [4.0,
+  # 0.5] và [7.5, 1.0] (2 goal vừa dời ở trên) thay vì chỉ dời xa vật cản -
+  # loại hẳn rủi ro còn sót thay vì tin vào khoảng cách đo tay. Còn lại 2
+  # goal x 4 start_pose = 8 tổ hợp (giảm từ 16), ít đa dạng hướng/khoảng
+  # cách hơn cho kịch bản `none`. CHƯA nhìn bằng mắt trong Gazebo/RViz.
+  #
+  # 2 -> 8 goal (06-10-2026): khôi phục [4.0, 0.5] và [7.5, 1.0], đồng thời
+  # thêm bốn goal quanh các cụm cũ để tăng đa dạng vị trí mà không quay lại
+  # vùng kệ phía bắc. Các goal MỚI đã được kiểm trên cả map_train_rl-1,
+  # map_waiting và map_waiting_rl: clearance tĩnh nhỏ nhất là 1.51 m, lớn hơn
+  # rõ rệt ngưỡng goal-an-toàn 0.65 m (= collision 0.30 + goal 0.35).
+  # Các goal khôi phục vẫn được giữ theo yêu cầu; phải đánh giá lại trên Gazebo
+  # vì chúng từng làm policy timeout khi dãy kệ vừa được dựng.
+  #
+  # 06-10-2026: `none` giữ random start x goal, nhưng thay start (0.0, 1.5)
+  # vì chỉ cách mặt dãy kệ 0.29 m (< obstacle_collision_distance 0.30 m).
+  # Start mới (0.0, 1.0) cách kệ 0.79 m. Bỏ các goal x=7.5--8.0 quá xa;
+  # bảy goal dưới tạo 28 cặp có độ dài 2.24--6.02 m. Quét cả ba map RL và
+  # footprint dãy kệ hiện tại: clearance nhỏ nhất dọc đường thẳng là 0.73 m,
+  # không cặp nào sát hơn ngưỡng an toàn 0.65 m. Goal (-1.5, -2.5) giữ hướng
+  # tây-nam để policy vẫn phải học quay, không chỉ đi về phía đông. Bỏ goal
+  # đó ở ablation 07-10-2026: scenario `none` chỉ củng cố lái tiến tới goal;
+  # `waiting_routes` không đổi và vẫn là bài toán né người riêng.
   goals:
-    - [4.5, 2.0]
-    - [4.0, 4.2]
+    - [3.0, -1.0]
+    - [3.5, 0.0]
+    - [4.0, 0.5]
     - [4.5, 0.8]
-    - [3.8, 1.5]
+    - [5.5, -0.2]
+    - [6.0, 0.5]
+    # West-side endpoints for the added starts. Their static-map clearance is
+    # 1.25--1.76 m, well above the 0.65 m goal/collision requirement.
+    - [-1.5, -0.5]
+    - [-1.0, 0.0]
+    - [-0.5, -0.5]
+  # 28-09-2026: tuyến RIÊNG của kịch bản `waiting` (map frame), mỗi phần tử
+  # [start_x, start_y, goal_x, goal_y]. Mỗi tập `waiting` bốc một tuyến thay
+  # cho tổ hợp start_poses x goals; yaw robot hướng tới goal rồi nhiễu
+  # +-waiting_yaw_noise. Plugin đặt người ở MẶT -y của kệ (cố định, không đổi
+  # phía theo tuyến), sát đường thẳng start -> goal của tuyến đó.
+  #
+  # Bản 1 (goal cố định) và bản 2 (5 tuyến theo bản vẽ, có 2 tuyến đi phía +y)
+  # đã bỏ. Đo trên run 20260928_164237 (bản 2): tuyến goal map (6.3, 3.6) đâm
+  # vật cản 4/4 tập vì goal cách tường bắc chỉ 0.65 m; người đổi sang mặt +y
+  # tuỳ tuyến; robot đi vòng cách người 2.0-3.4 m ở hầu hết tập.
+  #
+  # Bản 3, 4 (tuyến tôi tự chỉnh cho đẹp, start ở chỗ không có trong hình) đã
+  # bỏ: người dùng yêu cầu robot xuất phát ĐÚNG chỗ các nét đen trong ảnh vẽ tay
+  # 16:09 28-09.
+  #
+  # Bản 5: start/goal lấy TRỰC TIẾP từ đầu mút 5 nét đen (tách nét bằng ngưỡng
+  # màu + làm mỏng ảnh, quy pixel ra world bằng camera dựng từ 5 đèn trần, sai
+  # số ~0.2 m), đầu dưới là start, đầu trên là goal. Đầu mút vẽ tay (world):
+  #   S1 (-3.41,  1.82) -> ( 2.07, -2.83)   S2 (-2.27, -2.00) -> ( 3.27,  1.82)
+  #   S3 (-2.62, -1.98) -> ( 1.48,  2.31)   S4 (-2.67,  0.26) -> ( 3.89, -0.61)
+  #   S5 (-3.62, -1.10) -> ( 3.14, -0.91)
+  # Chỉ nhích những chỗ bắt buộc (World = map - (3, 2)):
+  #   S1 start -> (-2.4, 1.0): đầu vẽ nằm ngay trong khối trắng BookshelfC_004,
+  #      robot sẽ spawn đè lên nó; dời 1.2 m dọc theo chính nét vẽ.
+  #   S2 goal -> (2.6, 1.3): đầu vẽ cách tường bắc chỉ 0.43 m (goal cách tường
+  #      0.65 m từng làm 4/4 tập đâm vật cản); lùi 0.9 m dọc nét vẽ, cách 0.95 m.
+  #   S3 goal -> (1.3, 3.4): đầu vẽ (1.48, 2.31) trùng đúng chỗ người đứng ở
+  #      mặt +y (người cách goal 0.19 m); dời lên 1.1 m, cách tường x = 2.4 1.1 m.
+  #   S1, S2, S4, S5 và S3 start làm tròn 0.1 m.
+  # Phần tử thứ 5 = MẶT kệ người đứng: -1 hướng về world -y, 1 hướng về +y.
+  # Bốn tuyến dùng mặt -y; S3 đi vòng phía +y của kệ (đầu trên nằm ở +y) nên
+  # dùng mặt +y - đo: S3 với mặt -y chỉ cắt vùng với đỉnh 0.03, với mặt +y 0.58+.
+  # Muốn người luôn ở một phía thì đổi số này thành -1 hết.
+  # Robot xuất phát quay về phía goal +- waiting_yaw_noise (khác kịch bản khác).
+  # Tuyến `waiting` seed EKF trong frame odom (xem RUN_RL.txt, mục SEED EKF):
+  # trước đó goal bị hiểu tương đối so với chỗ xuất phát nên robot đi tới một
+  # đích khác hẳn tuyến vẽ và người đứng cách đường đi thật 2-3 m.
+  #
+  # Mô phỏng 1200 tập/tuyến (D 0.8-1.5, thuật toán đặt người của plugin, công
+  # thức sigma/2), đường thẳng start -> goal: S1 và S5, S3 cắt vùng với đỉnh
+  # trường >= 0.58 ở 100% tập; S2 và S4 chạy sát mặt kệ (0.1-0.5 m, đường thẳng
+  # cắt góc đầu kệ) nên đi qua khe giữa người và kệ với đỉnh trường 0.29-0.36
+  # (>= 0.3 ở 96-98% tập) - đó là đúng cái robot phải học né. Người cách goal
+  # >= 1.59 m (S3), >= 1.61 m (S1). Start/goal cách tường >= 0.95 m và cách
+  # BookshelfC >= 1.05 m (BookshelfC coi như bán kính 0.6 m; tường bắc y = 2.25
+  # với x > 2.4, x = 2.4 với y > 2.25). CHƯA nhìn trong Gazebo có robot.
+  # CHỈ CÒN S1 (02-10-2026) -> KHÔI PHỤC CẢ 5 TUYẾN (02-10-2026, theo yêu
+  # cầu), nhưng ĐỔI face của S3 từ 1 -> -1: trước đó S3 là tuyến DUY NHẤT
+  # cho người đứng mặt +y (đi vòng phía +y của kệ); yêu cầu "người chỉ đứng
+  # như S1" nghĩa là mặt kệ người đứng phải nhất quán -1 ở cả 5 tuyến, chỉ
+  # start/goal (đường đi robot) khác nhau. CẢNH BÁO: comment đo đạc phía
+  # trên (dòng 729-735, "S3 cắt vùng với đỉnh trường >= 0.58", "người cách
+  # goal >= 1.59 m (S3)") đo trên S3 mặt +y - CHƯA đo lại S3 với mặt -1, vị
+  # trí người dọc theo kệ (thuật toán plugin chọn chỗ gần đường thẳng
+  # start->goal nhất, ±0.6 m) có thể đổi khi đổi mặt, nên các con số đó
+  # không còn chắc đúng cho S3 nữa - cần đo lại bằng mắt trong Gazebo trước
+  # khi tin tưởng.
+  # S6 thêm 02-10-2026, theo yêu cầu (robot "né sang kệ thay vì né ra sau
+  # người" theo hướng này). Đo bằng tay: robot ở spawn mặc định (map 0,0),
+  # bấm "2D Goal Pose" trong RViz -> agent log "new goal: (7.34, 0.14) in
+  # odom" -> quy map<-odom lúc đó (dịch (0.13, 1.07), xoay -9.3 deg) ra map
+  # (7.40, 0.02), đối chiếu khớp vị trí robot thật sau "goal reached" (world
+  # (4.28,-2.16) -> map (7.28,-0.16)). CẢNH BÁO: đường thẳng (0,0)->(7.4,0.0)
+  # cách TÂM kệ (map ~3.6, 2.19) hơn 2m ở điểm gần nhất - xa hơn hẳn S1-S5
+  # (0.1-1.0m) - CHƯA chắc người (plugin đặt trong ±0.6m dọc kệ, gần đường
+  # thẳng nhất) sẽ đủ gần đường đi để robot thực sự phải né. CHƯA nhìn bằng
+  # mắt trong Gazebo có robot - kiểm tra trước khi tin số liệu đỉnh trường.
+  #
+  # CẢNH BÁO (02-10-2026, LỊCH SỬ): BookshelfA_01_002 (kệ "neo" waiting_
+  # object_model bên dưới) bị dịch tay trong Gazebo đang chạy, từ world
+  # (0.606, 0.186) -> (1.458, 2.421) (map cũ (3.61, 2.19) -> map mới
+  # (4.46, 4.42), lệch +0.85/+2.24 m), làm chỗ cho dãy 6 kệ nhân bản mới
+  # (BookshelfA_01_002_clone..clone_4, đã lưu vào bookstore.world). S1, S2,
+  # S4, S5, S6 lúc đó còn tính trên vị trí kệ CŨ (cách kệ MỚI 1.57-4.42 m,
+  # đo thực tế sau khi người dùng báo "goal/start... xa người waiting quá").
+  # TÍNH LẠI GOAL (02-10-2026, giữ nguyên START, chỉ đổi GOAL, face vẫn -1),
+  # dò bằng lưới số trên world, mục tiêu điểm gần nhất của đường thẳng cách
+  # TÂM kệ mới (1.458, 2.421) 0.5-1.1 m về phía NAM (cùng phía face -1), và
+  # bản thân goal cách tâm kệ >= 0.9 m (không trộn goal với điểm ép sát):
+  #   S1 goal world (2.1,-2.8)  -> (2.85, 2.10): path 0.60 m, goal 1.43 m
+  #   S2 goal world (2.6, 1.3)  -> (2.95, 2.20): path 1.10 m, goal 1.51 m
+  #   S4 goal world (3.9,-0.6)  -> (2.50, 2.15): path 0.60 m, goal 1.08 m
+  #   S5 goal world (3.1,-0.9)  -> (2.80, 2.20): path 0.81 m, goal 1.36 m
+  #   S6 goal world (4.4,-2.0)  -> (3.00, 2.20): path 1.07 m, goal 1.56 m
+  # CHƯA nhìn bằng mắt trong Gazebo/RViz, CHƯA --eval - kiểm trước khi tin,
+  # nhất là S2/S6 (độ ép yếu hơn S1/S4, gần mức biên 1.0-1.1 m).
+  #
+  # S7 thêm 02-10-2026, theo yêu cầu ("goal bên phải trong ảnh, người đứng
+  # cùng bên, ép không đi vòng"). Tính HOÀN TOÀN BẰNG TAY trên map mới
+  # (map = world + 3, +2, xem đầu env.start_poses), CHƯA bấm "2D Goal Pose"
+  # kiểm lại như cách làm S6 - PHẢI kiểm bằng mắt trong Gazebo/RViz trước
+  # khi tin:
+  #   start map (1.0, 3.6) -> goal map (7.5, 3.5): đường thẳng cách TÂM kệ
+  #   mới (map 4.46, 4.42) ~0.87 m ở điểm gần nhất, lệch về phía NAM kệ
+  #   (mặt -y, cùng phía người đứng trong face -1) ~0.51 m kể từ MẶT kệ
+  #   (nửa bề dày 0.36 m) - đủ gần để vào vùng ép buộc (d0=0.8, sigma nền
+  #   0.4) mà chưa chắc chạm vật cản. goal nằm map x=7.5 (phía ĐÔNG/"phải"
+  #   trong ảnh, cùng hướng x lớn hơn kệ và hơn start), nằm trong vùng x đã
+  #   xác nhận đi được của S6 (map x=7.4). Khoảng cách start->goal 6.5 m.
+  #
+  # S7 start SỬA 03-10-2026 (theo yêu cầu, "robot xuất hiện sát tường... vào
+  # vùng va chạm"). map (1.0, 3.6) -> (1.0, 2.8). Đo được qua /model_states
+  # (đọc thụ động, không đụng training đang chạy): start cũ (world -2.0, 1.6)
+  # chỉ cách TÂM BookshelfA_01_002_clone_0 (world -1.415, 2.262) 0.88 m -
+  # quy theo trục vuông góc mặt kệ (nửa bề dày 0.36) thì mặt kệ chỉ còn cách
+  # 0.27 m, DƯỚI ngưỡng va chạm 0.30 m. S7 đo bằng tay TRƯỚC khi dãy 6 kệ
+  # được dựng (02-10), sau đó không rà lại START - chỉ kiểm goal, bỏ sót
+  # start. Đã quét toàn bộ start/goal còn lại qua model_states, không chỗ
+  # nào khác dưới 1.1 m. Start mới cách kệ gần nhất 1.58-1.65 m, đường thẳng
+  # tới goal vẫn cách tâm vùng người (1.54, 0.91) 0.27 m - ép buộc còn tốt
+  # hơn bản cũ (0.64 m). CHƯA nhìn bằng mắt trong Gazebo/RViz.
+  #
+  # S5 goal SỬA 03-10-2026 (theo yêu cầu, "robot học đâm vào tường"). map
+  # (6.00, 4.05) -> (7.80, 3.50). Lần này đo TRỰC TIẾP từ mesh collision của
+  # tường (aws_RetailShopWall_01_collision.DAE, 46 đỉnh, đơn vị cm -> quy
+  # đổi /100 ra m, model ở world (0,0,0) nên toạ độ mesh = toạ độ world):
+  # tường có một góc lõm chữ L đúng tại world (2.45, 2.27) - khớp con số đã
+  # ghi trong lịch sử file ("tường bắc y=2.25 với x>2.4, x=2.4 với y>2.25"),
+  # giờ có toạ độ chính xác thay vì ước lượng. S5 goal cũ (world 3.0, 2.05)
+  # cách ĐỈNH góc tường 0.59 m, nhưng cách THẲNG xuống cạnh tường ngang (y=
+  # 2.27, x từ 2.45-7.8) chỉ 0.22 m - dưới hẳn ngưỡng va chạm 0.30 m, robot
+  # áp sát tường mới chạm được goal. Quét toàn bộ 20 điểm start/goal/`none`-
+  # goal còn lại qua đúng mesh này - không điểm nào khác dưới 1.3 m. Goal
+  # mới world (4.80, 1.50): cách đỉnh góc tường 2.47 m, đường thẳng vẫn cách
+  # tâm vùng người (1.54, 0.91) 0.40 m - ép buộc giữ nguyên. CHƯA nhìn bằng
+  # mắt trong Gazebo/RViz, nhưng độ tin cậy hình học cao hơn các lần trước
+  # vì đo thẳng từ mesh, không còn suy đoán qua model_states.
+  #
+  # S1/S2/S4/S6 goal SỬA THEO (03-10-2026, phát hiện khi rà lại S5 bằng mesh
+  # tường ở trên - rà luôn cả batch vì cùng một lỗi thiết kế: cả 5 goal lúc
+  # trước đều nhắm quanh world y~1.6-2.25 cho gần vùng người, TRÙNG khoảng
+  # tường ngang y=2.27). Đo khoảng cách TỪ CẠNH tường (không phải từ đỉnh),
+  # dùng cùng 2 đoạn tường mesh ở trên:
+  #   S2 cũ (world 4.40, 2.25): cách cạnh tường CHỈ 0.02 m - gần như ÁP SÁT
+  #   S4 cũ (world 4.15, 1.95): cách 0.32 m - trên ngưỡng va chạm 0.30 nhưng
+  #     dưới ngưỡng an toàn 0.65 m
+  #   S6 cũ (world 3.75, 1.65): cách 0.62 m - sát ngưỡng an toàn
+  #   S1 cũ (world 5.20, 1.60): cách 0.67 m - vừa đủ qua ngưỡng, không đổi
+  #     thì vẫn sống nhưng đổi luôn cho đồng bộ margin với batch này
+  # Tính lại cả 4, bắt buộc cách cạnh tường >= 0.9 m, giữ path cách tâm vùng
+  # người (1.54, 0.91) đúng 0.40 m như thiết kế:
+  #   S1 goal (world 4.80, 0.10) -> map (7.80, 2.10): cách tường 2.17 m
+  #   S2 goal (world 3.00, 1.35) -> map (6.00, 3.35): cách tường 0.92 m
+  #   S4 goal (world 5.40, 0.70) -> map (8.40, 2.70): cách tường 1.57 m
+  #   S6 goal (world 3.10, 1.30) -> map (6.10, 3.30): cách tường 0.97 m
+  # CHƯA nhìn bằng mắt trong Gazebo/RViz - kiểm cả 6 route (S1,S2,S4,S5,S6,S7)
+  # trước khi tin, đặc biệt các route cách tường dưới 1.2 m.
+  #
+  # S3 BỎ 02-10-2026 (theo yêu cầu, "có goal nào ở bên kia dãy sách không").
+  # [0.4, 0.0, 4.3, 5.4, -1] có goal (world 1.3, 3.4) nằm phía BẮC dãy kệ,
+  # đường thẳng start->goal cắt ngang qua đúng dải y 2.0-2.6 (chiều cao dãy
+  # kệ) ở x = 0.29-0.72 - rơi vào khe giữa kệ gốc (x=1.458) và kệ clone sát
+  # bên (x=0.062), tức path đi XUYÊN dãy kệ chứ không phải đi vòng. Cộng dồn
+  # với cảnh báo cũ ở trên (face đổi 1 -> -1 nhưng goal vẫn ở phía +y, người
+  # và đường đi gần như chắc chắn không còn gần nhau) và việc kệ neo đã dịch
+  # chỗ - ba vấn đề chồng lên nhau trên cùng một route. Bỏ hẳn thay vì sửa
+  # tiếp; thiết kế lại từ đầu nếu cần một tuyến vòng phía bắc kệ.
+  #
+  # SỬA LẠI S1/S2/S4/S5/S6 lần hai (02-10-2026, theo yêu cầu, "goal... quá
+  # gần vùng của người khi train"). Lần tính ở trên NEO SAI vào TÂM kệ
+  # (1.458, 2.421) - đọc animated_people_release.cpp (SpawnWaitingPeople,
+  # kWaitingDistanceMin/Max 0.8-1.5, kWaitingAlongLimit 0.6) thì người
+  # `waiting` đứng cách MẶT kệ (không phải tâm) 0.8-1.5 m, dọc kệ trong
+  # +-0.6 m quanh điểm gần đường đi nhất - tức một vùng chữ nhật world
+  # x in [0.92, 2.16], y in [0.53, 1.29] cho face -1, tâm (1.54, 0.91), THẤP
+  # hơn hẳn tâm kệ. Goal lần trước (y~2.10-2.20) nằm sát rìa bắc vùng này,
+  # tập nào người lệch góc là goal gần như chồng lên người. Tính lại trên
+  # VÙNG NGƯỜI đúng: đường thẳng cách TÂM vùng (1.54, 0.91) ~0.40 m (đi
+  # xuyên rìa vùng, ép buộc thật), goal cách tâm vùng >= 1.5 m (rõ ràng
+  # ngoài vùng, không chồng lên người ở episode nào). S7 không đổi, vốn đã
+  # cách tâm vùng người 3.02 m, không dính lỗi này.
+  #   S1 goal (world 2.85, 2.10) -> (5.20, 1.60): path 0.40 m, goal 3.72 m
+  #   S2 goal (world 2.95, 2.20) -> (4.40, 2.25): path 0.40 m, goal 3.16 m
+  #   S4 goal (world 2.50, 2.15) -> (4.15, 1.95): path 0.40 m, goal 2.81 m
+  #   S5 goal (world 2.80, 2.20) -> (3.00, 2.05): path 0.40 m, goal 1.85 m
+  #   S6 goal (world 3.00, 2.20) -> (3.75, 1.65): path 0.40 m, goal 2.33 m
+  # Toạ độ dựa trên hằng số/thuật toán ĐỌC ĐÚNG từ mã nguồn plugin (không
+  # còn đoán mò như lần trước), nhưng vẫn CHƯA nhìn bằng mắt trong
+  # Gazebo/RViz - kiểm trước khi tin.
+  #
+  # 06-10-2026: thay các cặp start/goal đầu. Các route cũ chỉ bảo plugin
+  # đặt người ở ĐIỂM GẦN đường nhất, nên R6 không đi qua vùng xã hội và các
+  # route khác thường chỉ lướt đuôi Gaussian. Mỗi route mới cắt dải người
+  # `waiting` ở mặt -y của BookshelfA_01_002; plugin vẫn random khoảng cách
+  # người-kệ 0.8--1.5 m và vị trí dọc kệ +-0.6 m. Mô phỏng 1,000 layout/route
+  # với đúng thuật toán SpawnWaitingPeople + Gaussian hiện hành: peak K_soc
+  # nhỏ nhất quan sát được 0.558 (p05 >= 0.610), nên mọi tập đều có một vùng
+  # xã hội mạnh trên đường thẳng start--goal. Quét map_train_rl-1,
+  # map_waiting và map_waiting_rl cho clearance tĩnh dọc đoạn thẳng >= 0.79 m.
+  # R5/R6 của batch này đã bỏ: gap người--đường ở p95 là 0.34/0.41 m, lớn hơn
+  # bốn route còn lại (0.21--0.29 m). ros_env.py đảo start <-> goal 50% mỗi
+  # tập, do đó mỗi tuyến được học từ cả hai phía, còn `face: -1` giữ người ở
+  # cùng mặt kệ.
+  # Ba route cuối thêm cùng ngày có goal thực sự ở phía tây/tây-nam của người
+  # (không phải bản sao đảo endpoint của bốn route đầu): chúng bổ sung các góc
+  # cắt khác cho curriculum. Cùng phép đo 1,000 layout/route cho peak K_soc
+  # nhỏ nhất 0.600 và clearance tĩnh dọc đường thấp nhất 0.81 m.
+  #
+  # 06-10-2026, sửa lần hai sau rollout: các route ở trên dài tới 9--11 m và
+  # một số endpoint map y=2.0--2.5 chạm cạnh tường collision world y=2.27.
+  # Sáu tuyến đầu bên dưới ngắn 4.86--5.37 m: robot phải tới, né người rồi quay
+  # lại goal, nhưng không dùng mục tiêu xa như bài global navigation. Endpoint
+  # phía đông y<=1.55, cách tường >=0.72 m (> 0.65 m); hai tuyến cuối có goal
+  # gốc ở phía tây. Mô phỏng 1,000 layout/route theo SpawnWaitingPeople cho
+  # peak K_soc thấp nhất 0.580.
+  #
+  # Hai tuyến cuối thêm 06-10-2026 theo yêu cầu: start nằm xa hơn về bên phải
+  # map (x=7.0/7.25), đi từ đông sang tây qua vùng người. Chúng dài 6.38 m,
+  # clearance tĩnh 0.92/0.96 m và endpoint cách người có thể spawn >=1.89 m,
+  # nên dạy thêm cách né khi tiếp cận từ phía phải mà không spawn/đích trong
+  # vùng xã hội. ros_env.py vẫn đảo chiều 50%, do đó cả hai hướng được học.
+  waiting_routes:
+    - [1.00, 0.00, 6.00, 1.50, -1]
+    - [1.25, 0.25, 6.25, 1.45, -1]
+    - [1.50, 0.50, 6.25, 1.55, -1]
+    - [1.00, 1.10, 6.25, 1.15, -1]
+    - [6.50, 1.55, 1.25, 0.40, -1]
+    - [6.30, 1.40, 1.00, 0.60, -1]
+    - [7.00, 1.45, 0.75, 0.15, -1]
+    - [7.25, 1.45, 1.00, 0.20, -1]
+  waiting_yaw_noise: 0.35
+  # Kệ mà người `waiting` nhìn vào: tên model trong world và nửa bề dày (trục x
+  # cục bộ, đo từ mesh visual: +-0.36 m). ground_truth.py tính d_obj từ đây.
+  # animated_people_release.cpp có cùng hai số này (kWaitingShelfName,
+  # kWaitingShelfHalfThickness) - đổi một nơi phải đổi nơi kia.
+  waiting_object_model: BookshelfA_01_002
+  waiting_object_half_thickness: 0.36
   minimum_goal_distance: 2.0
 
   # --- PHÂN PHỐI ĐÍCH (02-09-2026, quay lại list cố định + random yaw) ---
@@ -528,18 +1053,60 @@ env:
   # ngốn CPU nhất trong sim. Bật tạm bằng: rl_train.launch.py render:=true
   render: false
 
+# Bộ nghiệm thu tổng quát hoá: CHỈ `train_rl --eval ... --eval-unseen` mới đọc
+# khối này. Train luôn chỉ đọc `env` bên trên, nên không thể vô tình học thuộc
+# các vị trí đánh giá. Giữ observation/reward/smoother giống train; chỉ thay
+# hình học episode để đo chính xác khả năng lái sang start-goal chưa từng thấy.
+#
+# Kiểm trên map_train_rl-1, map_waiting và map_waiting_rl (06-10-2026): 4 x 4
+# cặp `none` dài 2.30--4.89 m, clearance đường thẳng >= 0.79 m. Năm route
+# `waiting` dài 5.12--5.89 m, clearance >= 0.89 m và đều khác route train.
+# Mọi endpoint waiting cách người có thể spawn >= 1.07 m, nên vùng hoàn thành
+# goal (0.35 m) không chồng lên vùng xã hội. Plugin vẫn đặt người ở mặt -y của
+# BookshelfA_01_002, cạnh tuyến thực tế.
+evaluation:
+  start_poses:
+    - [0.50, -0.25, 0.0]
+    - [1.00, -0.50, 0.0]
+    - [1.25, 0.50, 0.0]
+    - [0.50, 0.75, 0.0]
+  goals:
+    - [-1.00, -2.00]
+    - [4.00, -0.75]
+    - [5.00, 0.00]
+    - [5.25, 0.90]
+  waiting_routes:
+    - [0.50, -0.25, 6.20, 1.25, -1]
+    - [0.75, 0.00, 6.30, 1.20, -1]
+    - [1.25, 0.25, 6.25, 1.35, -1]
+    - [6.30, 1.30, 0.75, 0.10, -1]
+    - [6.20, 1.10, 1.00, -0.10, -1]
+  # Dùng cùng tỷ lệ 6 `none` / 4 `talking` như train, nhưng cả hai scenario
+  # đều dùng start/goal unseen ở trên.
+  scenarios:
+    - none
+    - none
+    - none
+    - none
+    - none
+    - none
+    - talking
+    - talking
+    - talking
+    - talking
+
 observation:
   # Lưới cục bộ, gốc ở robot, trục x hướng mũi robot lên phía trên ảnh.
   # 32 ô x 0.2 m = hộp 6.4 x 6.4 m quanh robot.
   #
-  # 6 KÊNH, chia theo đúng sơ đồ:
-  #   kênh 0     khối H - occupancy tĩnh do tia lidar chạm (nhị phân 0/1)
-  #   kênh 1..5  khối D - trường ràng buộc xã hội K_soc tại t+0.0, +0.5,
-  #              +1.0, +1.5, +2.0 s
+  # 2 KÊNH kể từ khi bỏ dự báo quỹ đạo (khối B chỉ còn tracking):
+  #   kênh 0  khối H - occupancy tĩnh do tia lidar chạm (nhị phân 0/1)
+  #   kênh 1  khối D - trường ràng buộc xã hội K_soc Gaussian tại hiện tại
+  #           (prediction_times chỉ còn [0.0])
   #
-  # Occupancy KHÔNG gộp vào K_soc: tường thì 2 giây nữa vẫn ở đó còn người thì
-  # không, mà nếu cho hai thứ chung một con số thì policy không cách nào học
-  # được khác biệt đó.
+  # Occupancy KHÔNG gộp vào K_soc: tường thì vẫn ở đó còn người thì di chuyển,
+  # mà nếu cho hai thứ chung một con số thì policy không cách nào học được
+  # khác biệt đó.
   #
   # Đổi grid_size hoặc số phần tử prediction_times thì mạng CNN đổi kích thước,
   # model cũ KHÔNG nạp lại được.
@@ -572,107 +1139,139 @@ observation:
   robot_frame: base_link
 
   # --- khối D: grounding + biên dịch trường ràng buộc xã hội ---
+  # 11-09-2026: bỏ dự báo quỹ đạo (khối B chỉ còn tracking) và đổi hình dạng
+  # vùng từ ellipse tuyến tính O/P/R sang Gaussian dị hướng, khớp công thức
+  # social_perception/scripts/social_constraint_grounding.py chạy trên robot
+  # thật - xem docstring đầu social_rl/social_rl/constraint_field.py để có
+  # công thức đầy đủ.
   constraint_field:
-    # Chân trời dự báo 2.0 s, bước 0.5 s, CỘNG mốc hiện tại t=0.0. SỐ PHẦN TỬ
-    # ở đây = số kênh xã hội.
+    # Chỉ còn mốc hiện tại t=0.0. SỐ PHẦN TỬ ở đây = số kênh xã hội, nên đổi
+    # độ dài list này đổi luôn kích thước CNN.
+    prediction_times: [0.0]
+
+    # Khoảng cách cá nhân cơ sở d0, và hệ số nở theo độ tin cậy tình huống:
+    # factor = 1 + expansion_a * (1 - scene_confidence). Ground-truth luôn cho
+    # confidence 1.0 nên factor = 1.0 khi train từ Gazebo.
     #
-    # VÌ SAO CÓ t=0.0 (đo 30-08-2026). Trước đây mốc này bị bỏ vì kênh t+0.5 s
-    # gần như phủ lên nó - đúng với người ĐỨNG, sai với người ĐANG ĐI. Đuôi
-    # vùng chỉ với tới 0.64 m sau lưng (r_rear 0.75 x scale 0.85 của
-    # `walking`), mà ở 1.0 m/s nó chạy 0.5 m mỗi mốc, tức nhanh hơn robot bám
-    # sau. Đo: robot đứng sau người đi 1.0 m/s 0.3 m thì hàm thưởng phạt 1.000
-    # trong khi CẢ BỐN kênh dự báo đọc ra 0.000. `crossing` 1.2 m/s và
-    # `approaching` 1.0 m/s thủng y hệt; `talking` thì không, vì người đứng im.
-    # Robot đi sau người trong hành lang rơi đúng vào hình học đó.
-    prediction_times: [0.0, 0.5, 1.0, 1.5, 2.0]
+    # 0.5 -> 0.8 (15-09-2026, theo yêu cầu). Cùng lúc constraint_field.py đổi
+    # công thức: base (1 người) sigma = d0/2 thay vì d0, talking (cặp) chia 3
+    # thay vì chia 4. d0 dùng chung cho MỌI scene_type (base/passing/waiting/
+    # talking) nên đổi số này phình to hết các loại vùng, không riêng gì một
+    # loại - xem constraint_field.py để có công thức đầy đủ theo từng nhánh.
+    d0: 0.8
+    expansion_a: 0.5
+    # Sigma phía trước nở theo tốc độ người đi: sigma_h = factor*(d0 + speed_gain_k*speed).
+    speed_gain_k: 0.5
 
-    # Hình học O/P/R lấy nguyên từ social_navigation/src/social_layer.cpp (chỗ
-    # đã tuning cho costmap Nav2), nhưng làm LIÊN TỤC thay vì ba mức chi phí
-    # rời rạc 254/250/100: policy học từ dốc trượt xuống được, không học tốt từ
-    # ba cao nguyên phẳng.
-    #
-    # o_radius: lõi trong, giá trị 1.0 ở mọi chỗ bên trong.
-    # r_*: ellipse ngoài, giá trị 0.0 trên biên. Lệch trước/sau vì vùng cá nhân
-    # vốn lệch: người ta để ý người đứng TRƯỚC MẶT hơn hẳn người đứng SAU LƯNG.
-    o_radius: 0.45
-    r_front: 1.5
-    r_side: 1.0
-    r_rear: 0.75
+    # Đỉnh Gaussian theo scene_type - đây chính là bước "grounding": CÙNG một
+    # người, CÙNG vị trí, CÙNG vận tốc nhưng scene_type khác thì độ ưu tiên
+    # tránh khác. Không có bảng này thì scene_type chỉ là đồ trang trí.
+    weights:
+      talking: 0.9
+      waiting: 0.7
+      passing: 0.5
+      walking: 0.5
+      '': 0.5
 
-    # Đây chính là bước "grounding": CÙNG một người, CÙNG vị trí, CÙNG vận tốc
-    # nhưng scene_type khác thì vùng ràng buộc khác. Không có bảng này thì
-    # scene_type chỉ là đồ trang trí.
-    # Thứ tự mỗi dòng: [trước, ngang, sau].
-    scene_scales:
-      talking:      [1.25, 1.0, 0.90]   # đang bận nói chuyện, vùng nghiêng về phía người kia
-      backs_turned: [1.00, 0.9, 0.45]   # quay lưng lại - đi vòng ra sau là ĐÚNG phép, nên cắt mạnh vùng sau
-      passing:      [1.10, 1.35, 0.80]  # người đi ngang qua (10-09-2026 gộp crossing+approaching, lấy hệ số crossing)
-      walking:      [1.15, 1.0, 0.85]
-      '':           [1.00, 1.0, 1.00]   # không biết gì (chạy khi chưa có khối C)
-
-    # O-space của NHÓM: hai người scene_type `talking` đứng gần nhau hơn
-    # group_max_distance thì khoảng giữa họ bị tô đặc. Đây là lý do tồn tại của
-    # cả kiến trúc này - chỗ DUY NHẤT robot không được đi qua.
+    # Hai người scene_type `talking` đứng gần nhau hơn khoảng này chia sẻ MỘT
+    # Gaussian ở điểm giữa (hard zone) - chỗ DUY NHẤT robot không được đi qua.
     group_max_distance: 3.0
-    group_margin: 0.35
 
-    # Dự báo càng xa càng kém tin, nên vùng NỞ RA theo thời gian thay vì giảm
-    # giá trị: nên giữ khoảng cách với chỗ người ta CÓ THỂ tới nhiều hơn là với
-    # chỗ người ta ĐANG đứng. 0.15 m/s => kênh t+2.0 s rộng hơn 0.30 m.
-    # Đặt 0.0 để xem dự báo vận tốc hằng thô.
-    uncertainty_growth: 0.15
-    # Dưới tốc độ này coi như đứng yên, để nhiễu tracker trên một người đang
-    # đứng không bôi vùng của họ dài 2 mét ở kênh t+2.0 s.
+    # 11-09-2026: KHÔNG còn neo vào toạ độ một vật thật trong Gazebo (đo
+    # trước đó khiến người `waiting` đứng đè lên kệ sách - không kiểm tra
+    # được hình học mesh bằng mắt); orientation lấy thẳng từ person.facing.
+    #
+    # 28-09-2026: d_obj lại là khoảng cách ĐO (ground_truth.py: người -> giữa
+    # mặt kệ), thay đổi theo từng tập. Số này chỉ còn là GIÁ TRỊ DỰ PHÒNG cho
+    # người không có d_obj (người được nhớ lại sau khi ra khỏi nón camera, hay
+    # tracker không biết pose vật). GIỮ 0.7: nó nằm trong nhóm `observation`
+    # nên check_resume_layout so nó với env_config.yaml của checkpoint, và đổi
+    # thành 1.15 (làm ngày 28-09) đã CHẶN --resume từ 412852 (đo 28-09-2026).
+    # Cũng là mặc định của dataclass, nên rl_agent*.yaml (không khai báo khoá
+    # này) nhận đúng cùng giá trị.
+    waiting_distance: 0.7
+
+    # Dưới tốc độ này coi như đứng yên -> nhận vùng tròn `base`, không phải
+    # `passing`, để nhiễu tracker trên người đứng im không bị đọc thành đang đi.
     still_speed: 0.1
 
 reward:
+  # 11-09-2026: TOÀN BỘ khối reward chia 10 (200/-200 -> 20/-20 theo yêu cầu,
+  # còn lại chia theo để giữ NGUYÊN mọi tỉ lệ/điểm hoà vốn đã tuning bên dưới -
+  # nhân cả hàm thưởng với một hằng số dương không đổi optimal policy). Mỗi số
+  # cũ vẫn giữ nguyên trong comment lịch sử của nó, chỉ giá trị cuối dòng đổi.
+  # Điều CHƯA đo: vf_coef (0.5, mục train: bên dưới) cân bằng value-loss (MSE,
+  # theo BÌNH PHƯƠNG biên độ reward) với policy-loss - reward nhỏ đi 10 lần thì
+  # value-loss nhỏ đi ~100 lần, vf_coef hiệu lực yếu đi tương đối. Không có
+  # VecNormalize nào tự bù (đã kiểm tra train.py). Không tự tăng vf_coef ở đây
+  # vì chưa có số đo; theo dõi explained_variance/value_loss trên TensorBoard
+  # sau lần train tới, báo lại nếu bất thường.
+  #
   # --- kết thúc tập ---
-  goal_reward: 200.0
+  # 12-09-2026: R_g/R_c đổi theo báo cáo (10/-10). Lịch sử đầy đủ của các lần
+  # đổi trước (200/-200 gốc -> 20/-20 ngày 11-09) nằm trong RUN_RL.txt, không
+  # chép lại ở đây. mọi hệ số shaping bên dưới CHIA TIẾP 1/2 theo cùng tỉ lệ để
+  # giữ nguyên điểm hoà vốn: progress_gain vẫn đúng 1/5 goal_reward,
+  # |step_penalty|*max_episode_steps vẫn đúng bằng |obstacle_collision_penalty|.
+  goal_reward: 10.0
   goal_distance: 0.35
 
-  # CHỈ va vật cản mới kết thúc tập. Luật "va người -> -200, kết thúc tập" đã
-  # BỎ (27-08-2026): nó biến mọi lần thử men ra sau lưng người thành vách vực.
+  # CHỈ va vật cản mới kết thúc tập. Luật "va người -> kết thúc tập" đã BỎ
+  # (27-08-2026): nó biến mọi lần thử men ra sau lưng người thành vách vực.
   # Xem RUN_RL.txt mục HÀM THƯỞNG.
-  obstacle_collision_penalty: -200.0
+  obstacle_collision_penalty: -10.0
   obstacle_collision_distance: 0.30   # robot_radius 0.26 + lề
 
-  # --- vùng xã hội: cùng phép K_soc, trên danh sách ground-truth ĐẦY ĐỦ ---
-  # Phạt mỗi step = social_penalty * độ sâu robot đang đứng trong K_soc
-  # (0.0 = ngoài mọi vùng, 1.0 = trong o-space của một người hoặc của một cuộc
-  # trò chuyện).
+  # --- vùng xã hội: 3 số hạng tách theo scene_type (12-09-2026, theo báo cáo
+  # "Công thức Gauss") thay cho social_penalty gộp MAX duy nhất trước đó ---
   #
-  # THAY THẾ dốc phạt theo khoảng cách cũ (0 ở 1.2 m, -8.0 ở 0.20 m) ngày
-  # 28-08-2026. Dốc cũ chỉ đo khoảng cách Euclid, nên nó tính TIỀN NHƯ NHAU cho
-  # việc chen giữa hai người đang nói chuyện và việc đi ngang sau lưng một
-  # người ở cùng cự ly - tức là mọi scene_type trong observation đều thành đồ
-  # trang trí mà policy không có lý do gì phải đọc. Thứ policy NHÌN THẤY và thứ
-  # policy BỊ PHẠT vẫn ra từ cùng phép K_soc trong constraint_field.py, nhưng
-  # observation dùng danh sách đã lọc còn reward dùng danh sách người đầy đủ.
+  #   r_social,t = -lambda_s * (w_talk*C_talk + w_view*C_view + w_cross*C_cross)
   #
-  # -8.0 giữ nguyên điểm hoà vốn đã tuning: chạy hết tốc độ, một step đi được
-  # 0.1 m, được +4.0 progress trừ -0.8 step penalty; đi xuyên giữa vùng thì
-  # -4.8 mỗi step. Vẫn lỗ, đủ để đi vòng có lợi hơn, nhưng CÓ CHẶN TRÊN - không
-  # cắt tập và cuốn theo mọi điểm tập đó còn có thể kiếm được.
+  # C_talk/C_view/C_cross: giá trị Gaussian (đã nhân weight riêng của từng
+  # zone: talking 0.9, waiting 0.7, còn lại 0.5) tại ĐÚNG vị trí robot, tách
+  # theo scene_type qua constraint_field.intrusion_by_type() - 'talking' riêng,
+  # 'waiting' riêng, còn lại (passing/walking/không rõ/backs_turned) dồn vào
+  # 'cross' để KHÔNG người nào thoát khỏi vòng phạt (đứng yên chưa rõ tình
+  # huống thì vẫn tính là vùng phải né, không phải không gian trống).
   #
-  # -8.0 -> -12.0 (05-09-2026). Run 20260905_091740 (resume 160000, 80k step ở
-  # 1:1:1:1, social_penalty vẫn -8.0): --eval-episodes 40 ra peak_intrusion
-  # 0.317, TỆ HƠN 160000 lúc xuất phát (0.081) - xuyên thẳng qua vùng người rẻ
-  # hơn hẳn so với vòng tránh với đúng mức phạt này khi tập có người dày hơn.
-  # -12.0: đi xuyên hết tốc độ giờ lỗ -8.8/step (+4.0 progress -0.8 step -12.0
-  # social) thay vì -4.8, nặng hơn ~1.8 lần nhưng vẫn KHÔNG kết thúc tập, không
-  # tạo vách vực như luật va-người cũ (xem ghi chú obstacle_collision_penalty ở
-  # trên) - chỉ đẩy điểm hoà vốn nghiêng hẳn về phía đi vòng.
-  social_penalty: -12.0
+  # w_talk/w_view/w_cross là trục ĐỘC LẬP với weight riêng của từng zone ở
+  # trên: cái đó định hình QUAN SÁT (CNN nhìn thấy gì), cái này định hình
+  # PHẠT (train quan trọng hoá loại tình huống nào hơn) - không cần khớp nhau.
+  #
+  # Bộ số khởi tạo từ báo cáo, λs chọn 3 trong {1,3,5}. Tại tâm một cặp
+  # `talking` (weight 0.9): -3*1.0*0.9 = -2.7/step. Đi xuyên hết tốc độ
+  # (+0.2 progress -0.04 step -2.7 social) = -2.54/step - vẫn lỗ, đủ để đi
+  # vòng có lợi hơn. CHƯA train lại để kiểm chứng con số này thật sự cân bằng
+  # đúng - xem RUN_RL.txt trước khi tin một run dựa trên bộ số này.
+  lambda_s: 3.0
+  w_talk: 1.0
+  w_view: 0.8
+  w_cross: 0.6
 
   # --- shaping: hai thứ duy nhất giữ cho bài toán học được ---
   # progress_gain là thứ DUY NHẤT làm robot chịu đi. 40 * 1 m = 40 = 1/5 phần
   # thưởng tới đích, đủ để dẫn đường mà không đủ để cày shaping thay vì về đích.
-  progress_gain: 40.0
-  # -0.8: một tập đứng yên trọn vẹn 250 bước tốn đúng -200, ngang với cái va
-  # chạm mà nó đang né. ĐỪNG đẩy quá 0.8 mà không hạ obstacle_collision_penalty
-  # tương ứng - hễ đứng yên đắt hơn đâm thì lao vào tường gần nhất thành lối
-  # thoát rẻ, và policy sẽ tìm ra nó.
-  step_penalty: -0.8
+  #
+  # 40.0 -> 4.0 (11-09-2026) -> 2.0 (12-09-2026, chia tiếp 1/2 theo R_g mới):
+  # vẫn đúng 1/5 goal_reward (10.0), tỉ lệ dẫn đường không đổi.
+  #
+  # 2.0 -> 3.0 (15-09-2026, theo yêu cầu, PHÁ tỉ lệ 1/5 CÓ CHỦ ĐÍCH). Train lại
+  # từ đầu trên kiến trúc d0 mới; muốn robot ưu tiên học đi tới đích trước, né
+  # vật tĩnh sau, né vùng xã hội sau cùng - đẩy 3/10 goal_reward thay vì 2/10.
+  # Route trung bình 3.18-5.80 m (giữa ~4.4 m): tổng progress một tập thành
+  # công ~3.0*4.4=13.2, CỘNG goal_reward 10.0 = ~23.2 - lớn hơn hẳn
+  # |obstacle_collision_penalty| (-10), nên mất tất cả vì một cú đâm giờ ĐẮT
+  # hơn trước (giá trị một tập trót lọt cao hơn), không phải rẻ hơn - tăng
+  # progress_gain kiểu này không mở lại đường "lao ẩu cho nhanh". CHƯA đo qua
+  # --eval, xem lại nếu goal vẫn không lên hoặc hit_obstacle bật lại.
+  progress_gain: 3.0
+  # Charged mỗi step, đây là thứ khiến đứng yên/lượn lờ tốn tiền.
+  #
+  # -0.8 -> -0.08 (11-09-2026) -> -0.04 (12-09-2026, chia tiếp 1/2). Kiểm tra
+  # ranh giới: 0.04 * 250 = 10.0 = |obstacle_collision_penalty| mới - vẫn
+  # đúng biên. ĐỪNG đẩy quá |obstacle_collision_penalty|/max_episode_steps -
+  # hễ đứng yên đắt hơn đâm thì lao vào tường gần nhất thành lối thoát rẻ.
+  step_penalty: -0.04
   # Thưởng theo radian mà |góc lệch tới đích| co lại trong một bước. progress_gain
   # bằng 0 khi robot xoay tại chỗ (khoảng cách tới đích không đổi), nên với yaw
   # start ngẫu nhiên 360 (02-09-2026) khoảng nửa số tập mở đầu bằng một cú xoay
@@ -697,7 +1296,14 @@ reward:
   # liều đâm. Trả lại 5.0. Nút thắt none_goal không nằm ở heading_gain: đã thử
   # 3.0/5.0/9.0, LR 3e-4/1e-4, scenario 1:1:1:1/6:1:1:1, đều plateau ~0.6. Đang
   # chuyển hướng sang curriculum yaw khởi động (xem sample yaw trong ros_env.py).
-  heading_gain: 5.0
+  #
+  # 5.0 -> 0.5 (11-09-2026) -> 0.25 (12-09-2026, chia tiếp 1/2). Vẫn đúng tỉ
+  # lệ với progress_gain mới (2.0): 0.2 rad/bước = +0.05, ròng +0.01 trên
+  # step_penalty mới (-0.04) - cùng biên độ tương đối như 5.0 từng có với
+  # progress_gain 40.
+  # 0.0 disables heading shaping; the policy is rewarded only for distance
+  # progress, terminal outcomes, and the social field.
+  heading_gain: 0.0
 
   # ĐÃ BỎ angular_penalty và smoothness_penalty. Cả hai đánh vào đúng hành vi
   # cần học: đi vòng qua người BẮT BUỘC phải xoay. Muốn lệnh mượt hơn thì hạ
@@ -721,7 +1327,7 @@ train:
   # nền đã thạo; nếu none_goal phẳng > 0.90 trước đó thì DỪNG (checkpoint_every
   # 2500). none_goal không hồi sau ~30k -> hạ learning_rate 3e-4 -> 1e-4, resume
   # LẠI từ chính 100k chứ không từ run 1b hỏng.
-  total_timesteps: 80000
+  total_timesteps: 100000
   # GIAI ĐOẠN 2: 512 -> 2048. Với 4 kịch bản bốc đều, n_steps 512 chỉ chứa
   # 2.2 tập (ep_len 233, run 164308) tới 3.0 tập (ep_len 171, run 222950) mỗi
   # lần cập nhật, nên XÁC SUẤT một rollout thấy đủ cả 4 kịch bản BẰNG 0%.
@@ -783,7 +1389,89 @@ train:
   # (~127.5k) để consolidate. Nếu none_goal vẫn < 0.70 sau ~30k thì lỗi nằm ở
   # sampling (yaw start đều 360, nửa số tập `none` không phải bài học xoay),
   # không phải LR - khi đó thiên yaw về |lệch| > 90 độ.
-  learning_rate: 0.0001
+  #
+  # 1e-4 -> 3e-4 (12-09-2026, theo yêu cầu). Đây là lần train TỪ ĐẦU trên kiến
+  # trúc mới (bỏ dự đoán + Gaussian + reward theo báo cáo), không phải resume
+  # fine-tune một checkpoint đã gần đỉnh như lần đo ở trên - 3e-4 vốn là mặc
+  # định của dự án, chỉ bị hạ vì lý do fine-tune-quá-mạnh SAU khi đạt đỉnh.
+  #
+  # 3e-4 -> 1e-4 (13-09-2026). Đúng chữ ký cũ lặp lại: run 20260913_061254
+  # (resume 147500, đổi tỉ lệ 65/35 none/talking) đạt đỉnh ep_rew_mean 9.468 /
+  # none_goal 0.80-0.83 ở step 157372, kèm approx_kl spike 0.472 (9.4x
+  # target_kl) NGAY tại đỉnh đó, rồi ep_rew_mean trượt 9.468 -> 6.143 qua ~25k
+  # step. Phục hồi tạm ở 186044-192188 (none_goal 0.92-1.00) rồi approx_kl
+  # spike lần hai (0.112 ở 194236) và sập lại (none_goal 0.462 ở 196284).
+  # --eval 20 tập deterministic trên checkpoint đỉnh phục hồi (191680) ra
+  # none_goal 53.8% - TỆ HƠN checkpoint xuất phát 147500 (61.1%), xác nhận 44k
+  # step vừa rồi là lùi ròng, không phải tiến. Về 1e-4, resume từ 147500 (đã
+  # qua --eval, không phải từ checkpoint bất ổn 191680).
+  #
+  # 1e-4 -> 3e-4 (13-09-2026, train lại TỪ ĐẦU). Lý do hạ xuống 1e-4 ở trên
+  # (chống overshoot khi FINE-TUNE một checkpoint đã gần đỉnh) không áp dụng
+  # cho weight ngẫu nhiên - chưa có đỉnh nào để overshoot qua. Về đúng mặc
+  # định 3e-4 đã dùng cho lần train từ đầu trước đó (run 20260912_182533).
+  #
+  # 3e-4 -> 1e-4 (14-09-2026, theo yêu cầu). Resume từ run 20260913_235941
+  # (100k step, 3e-4/ent_coef 0.001), checkpoint 97500 - --eval 40 tập
+  # deterministic FAIL none_goal (79.3%, cần >90%), ba tiêu chí xã hội đều
+  # PASS. Đây LẠI là fine-tune từ một checkpoint đã có đỉnh cục bộ, cùng tình
+  # huống đã ghi ở dòng 830 (3e-4 -> 1e-4) và 847, không phải train từ trọng
+  # số ngẫu nhiên - hạ lr theo đúng mẫu đã lặp lại hai lần trước.
+  #
+  # 1e-4 -> 3e-4 (15-09-2026, theo yêu cầu, train lại TỪ ĐẦU). Đổi công thức
+  # d0/talking + progress_gain, checkpoint cũ không resume được nữa (khác
+  # kích thước/ý nghĩa quan sát) - đúng tình huống "trọng số ngẫu nhiên" như
+  # 12-09-2026 và 13-09-2026 phía trên, về lại mặc định 3e-4 của dự án.
+  #
+  # 3e-4 -> 1e-4 (18-09-2026, theo yêu cầu). Resume từ checkpoint 177852 (run
+  # 20260917_153135, offset 0.7-0.9 vừa sửa đúng) - --eval 40 tập xác nhận đây
+  # là đỉnh cục bộ tốt: talking_goal 90.0% (n=40), none_goal 85.0%. Train tiếp
+  # 40k bước với 3e-4 (run 20260917_195901) làm none_goal lên 92.3% (PASS lần
+  # đầu) nhưng talking_goal SẬP còn 59.3% - đúng mẫu "fine-tune một đỉnh cục bộ
+  # bằng LR cao ghi đè mất kỹ năng vừa học", đã lặp lại ở dòng 928-933 và
+  # 916-921 phía trên. Hạ về 1e-4, GIỮ NGUYÊN scenarios 40/60 để cô lập đúng
+  # một biến, resume lại từ 177852 (không phải từ bản cuối 195901 đã tệ đi).
+  #
+  # 1e-4 -> 3e-4 (28-09-2026, theo yêu cầu), resume từ 412852 để học kịch bản
+  # `waiting`. LƯU Ý: 3e-4 từng làm talking_goal sập 90.0% -> 59.3% ở lần
+  # 18-09 phía trên; lần này `talking` không còn trong danh sách nên chưa biết
+  # nó có bị quên hay không - đo lại bằng --eval trên đúng file .zip.
+  #
+  # 3e-4 -> 1e-4 (01-10-2026, theo yêu cầu). Đúng mẫu lặp lại lần thứ ba:
+  # resume 252500 (PASS: none_goal 92.0%, clear_episodes 62.5%) -> train thêm
+  # 100k ở 3e-4, tỉ lệ waiting 50/50 -> --eval checkpoint 315000 và 345000 đều
+  # FAIL (none_goal 66.7%/72.2%, clear_episodes 45.0%/45.0%), dù waiting_goal
+  # tăng mạnh (72.7%/86.4%) - ghi đè mất none_goal/clear_episodes vừa học, hệt
+  # dòng 1095-1102 và 928-933. Hạ về 1e-4, resume từ 345000, thêm 80k bước.
+  #
+  # 1e-4 -> 3e-4 (02-10-2026, theo yêu cầu, lần thứ TƯ). Resume LẠI từ chính
+  # 252500 - đúng checkpoint đã FAIL ở 3e-4 lần trước (xem đoạn ngay trên).
+  # Khác lần trước: scenario 50/50 -> 60/40, goals/waiting_routes vừa viết
+  # lại cho khớp dãy 6 kệ mới - không cô lập biến learning_rate, nên nếu
+  # none_goal/clear_episodes sập lại thì KHÔNG thể kết luận chắc là do LR
+  # hay do goals/routes mới. --eval none_goal/clear_episodes sớm (không đợi
+  # hết 100k) để cắt lỗ sớm nếu thấy lặp lại đúng mẫu cũ.
+  #
+  # 3e-4 -> 1e-4 (03-10-2026, theo yêu cầu, lần thứ NĂM). Đúng mẫu lặp lại,
+  # lần này quan sát được ngay trong 30k bước đầu thay vì phải đợi hết ngân
+  # sách: resume checkpoint 92500 (run 20261003_003830, train TỪ ĐẦU, đỉnh
+  # goal 0.60/none_goal 0.69/rew 10.49) ở 3e-4 -> 30k bước sau (run
+  # 20261003_073330) goal rơi còn 0.20-0.35, none_goal 0.22-0.42, rew 10.49
+  # -> 1.04-1.16, timeout 0.36 -> 0.65, entropy_loss gần như đứng yên
+  # (-2.754 -> -2.735, policy không học thêm). approx_kl và explained_variance
+  # vẫn trong ngưỡng bình thường nên không phải nổ KL hay value phân kỳ -
+  # đúng chữ ký "LR quá cao đạp đổ chính sách chưa hội tụ", nặng hơn các lần
+  # trước vì checkpoint 92500 còn non (mới 60% goal, chưa có đỉnh ổn định để
+  # giữ). Hạ về 1e-4, BỎ run 20261003_073330, resume lại từ 92500 - không
+  # dùng checkpoint nào của nhánh 073330 vì toàn bộ đã tụt dần, không có
+  # điểm nào tốt hơn 92500 để resume tiếp.
+  # 3e-4 -> 1e-4 (07-10-2026, theo yêu cầu). Eval unseen 40 episode của
+  # checkpoint 145k cho waiting_goal 100% nhưng none_goal chỉ 79.2% (5 timeout,
+  # không va chạm): cần fine-tune nhỏ để bảo toàn lái cơ bản thay vì tiếp tục
+  # dịch policy mạnh theo các route waiting mới.
+  # 1e-4 -> 3e-4 (15-10-2026, theo yêu cầu), cùng đợt chuyển sang 6:4
+  # none/talking.
+  learning_rate: 0.0003
   gamma: 0.99
   gae_lambda: 0.95
   clip_range: 0.2
@@ -794,6 +1482,76 @@ train:
   # policy_gradient_loss chỉ khoảng -0.005: thưởng entropy đang lấn át gradient
   # policy, nên log_std không co lại được. Trả về 0.005 khi sang giai đoạn 2
   # nếu policy không còn thử hướng né nào khác.
+  #
+  # 0.001 -> 0.0003 (13-09-2026). CÙNG BỆNH LẶP LẠI ở ent_coef=0.001: run
+  # 20260913_162723 (resume 217500, 43k step) train/std đi từ 0.890 xuống
+  # 0.860 - gần như đứng yên. entropy_loss quanh -2.54, ent_coef*entropy_loss
+  # = 0.0025, trong khi policy_gradient_loss đo được chỉ 0.002-0.023 - CÙNG
+  # BẬC, entropy vẫn lấn át. std=0.86-0.89 trên [-1,1] nghĩa là lệnh gửi
+  # xuống robot vẫn bị nhiễu +-0.86-0.89 đè lên, gần hết cả biên độ điều
+  # khiển. Hệ quả đo qua log thật (không phải TensorBoard): outcome/goal kẹt
+  # 0.61-0.84 suốt 356 tập (rolling n=50), goal RIÊNG BIỆT y hệt nhau giữa
+  # none (73.2%) và talking (70.6%) - xác nhận đây là vấn đề Ở TẦNG NHIỄU
+  # HÀNH ĐỘNG, không phải né người/né vật cản, vì nếu là vấn đề xã hội thì
+  # hai kịch bản đã lệch nhau. outcome/timeout (23-24% cả hai loại) là nút
+  # thắt, không phải hit_obstacle (3-6%) - nhiễu lớn gây zigzag/tốn bước chứ
+  # chưa đủ gây va chạm. Hạ tiếp xuống 0.0003 để entropy không còn cùng bậc
+  # với policy_gradient_loss.
+  #
+  # ĐÍNH CHÍNH (13-09-2026): giả thuyết "std cao chặn goal lên" ở trên có lỗ
+  # hổng - dòng 669 (giai đoạn C, kiến trúc CŨ) đã ghi rõ "BỎ TIÊU CHÍ
+  # train/std <= 0.6 - nó SAI. Run 20260829_222950 kết thúc với std 0.964,
+  # gần như không co, mà vẫn về đích 88% ở none." Không lấy std làm mục tiêu
+  # hay tiêu chí nghiệm thu; chỉ đọc outcome/goal, none_goal qua --eval hoặc
+  # log thật. 0.001 -> 0.0003 -> 0.001 (14-09-2026, theo yêu cầu): train lại
+  # TỪ ĐẦU, không phải resume - ent_coef thấp lúc weight còn ngẫu nhiên có
+  # nguy cơ log_std co quá sớm, robot chưa kịp khám phá đường tới đích đã hết
+  # tò mò (đúng lỗi đã hỏng run 20260827_013703). Dùng lại 0.001, mức đã
+  # dùng cho lần train từ đầu gần nhất trên kiến trúc này (20260912_182533).
+  #
+  # 0.001 -> 0.0005 (14-09-2026, theo yêu cầu). Cùng lần resume từ checkpoint
+  # 97500 nói ở learning_rate phía trên - trọng số không còn ngẫu nhiên nên
+  # rủi ro "co entropy quá sớm" của đoạn ghi chú 14-09-2026 ở trên không áp
+  # dụng ở đây; hạ theo cùng logic đã dùng cho GIAI ĐOẠN C và 13-09-2026: bớt
+  # áp lực entropy khi resume fine-tune, chưa hạ hẳn về 0.0003 đã thử hỏng.
+  #
+  # 0.0005 -> 0.001 (14-09-2026, theo yêu cầu, RÚT LẠI ngay sau đó). Ý định
+  # ban đầu là nới entropy để "khám phá học né" khi scenarios lên 50/50 -
+  # nhưng đây là resume, không phải train từ trọng số ngẫu nhiên, nên đúng
+  # cảnh báo đã ghi ở đoạn 0.001->0.0003 phía trên (run 20260913_162723):
+  # ent_coef=0.001 lúc fine-tune làm entropy lấn át policy_gradient_loss,
+  # std đứng yên, outcome/goal kẹt, timeout thành nút thắt - không phải học
+  # né tốt hơn. Về 0.0003 (14-09-2026, theo yêu cầu), mức đã dùng khi sửa
+  # đúng lỗi này lần trước.
+  #
+  # 0.0003 -> 0.001 (14-09-2026, theo yêu cầu). Run 20260914_120920 (resume
+  # 125000, 0.0003, scenarios 50/50, 43k/50k step trước khi dừng tay): goal
+  # tụt thật giữa nửa đầu và nửa sau (74% -> 64% theo tensorboard),
+  # hit_obstacle trôi ngược từ 0% lên lại 10-15%, ep_rew_mean 9.7 -> 7.9.
+  # KHÁC dấu hiệu lần 0.001 hỏng trước: `train/std` vẫn giảm đều suốt run
+  # (không đứng khựng), còn `policy_gradient_loss` gần như 0 và đổi dấu liên
+  # tục quanh 0.000x - đọc là exploration co lại nhanh hơn tốc độ cải thiện
+  # thật, có thể đã hội tụ sớm vào một hành vi tầm trung. CẢNH BÁO: nới lại
+  # 0.001 đứng trước đúng rủi ro đã đo ở đoạn 0.001->0.0003 phía trên
+  # (entropy cùng bậc với policy_gradient_loss vốn đã rất nhỏ ở đây) - theo
+  # dõi entropy_loss*ent_coef so với policy_gradient_loss và train/std ở
+  # 10-15 update đầu sau resume; std đứng khựng lại là dấu hiệu lặp lại lỗi
+  # cũ, không phải đang khám phá tốt hơn.
+  #
+  # 0.001 -> 0.0005 (14-09-2026, theo yêu cầu, TRẢ VỀ). --eval 40 tập run
+  # 20260914_155442 (resume 125000, 65/35, ent_coef 0.001, đủ 50k step):
+  # final_model/150000/142500 đều goal 75-77.5%, THUA baseline 125000 (85%).
+  # Hai lần thử ent_coef=0.001 (kèm 50/50 rồi kèm 65/35) đều tụt so với
+  # 125000 - đủ bằng chứng để không thử tiếp ở mức này. Về đúng 0.0005, mức
+  # đã train ra 125000, để cô lập biến scenario (65/35 -> 55/45) trong lần
+  # resume tiếp theo.
+  #
+  # 0.0005 -> 0.001 (15-09-2026, theo yêu cầu, train lại TỪ ĐẦU). Cả hai lần
+  # 0.001 hỏng ở trên đều là RESUME/fine-tune một checkpoint đã hội tụ một
+  # phần - cảnh báo đó không áp dụng cho trọng số ngẫu nhiên (đúng phân biệt
+  # đã ghi nhiều lần trong file này: GIAI ĐOẠN C, 12-09-2026, 14-09-2026).
+  # d0/talking/progress_gain đổi nên đây chắc chắn là train từ đầu, không
+  # phải resume trá hình - 0.001 là mức đúng cho tình huống này.
   ent_coef: 0.001
   vf_coef: 0.5
   max_grad_norm: 0.5

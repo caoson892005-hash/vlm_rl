@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>social_camera_zmq</name>
+  <version>0.1.0</version>
+  <description>Low-latency ZeroMQ transport for RGB webcams and standard ROS RGB-D cameras.</description>
+  <maintainer email="user@example.com">ninorobot2</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>builtin_interfaces</depend>
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>python3-zmq</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

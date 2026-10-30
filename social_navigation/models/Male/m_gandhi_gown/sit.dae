@@ -12,28 +12,28 @@
   </asset>
   <library_images>
     <image id="middleage_lightskinned_male_diffuse" name="middleage_lightskinned_male_diffuse">
-      <init_from>textures/middleage_lightskinned_male_diffuse.png</init_from>
+      <init_from>/m_gandhi_gown/textures/middleage_lightskinned_male_diffuse.png</init_from>
     </image>
     <image id="short04_diffuse" name="short04_diffuse">
-      <init_from>textures/short04_diffuse.png</init_from>
+      <init_from>/m_gandhi_gown/textures/short04_diffuse.png</init_from>
     </image>
     <image id="brown_eye" name="brown_eye">
-      <init_from>textures/brown_eye.png</init_from>
+      <init_from>/m_gandhi_gown/textures/brown_eye.png</init_from>
     </image>
     <image id="eyebrow001" name="eyebrow001">
-      <init_from>textures/eyebrow001.png</init_from>
+      <init_from>/m_gandhi_gown/textures/eyebrow001.png</init_from>
     </image>
     <image id="Ghandi_gown_n" name="Ghandi_gown_n">
-      <init_from>textures/Ghandi_gown_n.png</init_from>
+      <init_from>/m_gandhi_gown/textures/Ghandi_gown_n.png</init_from>
     </image>
     <image id="Ghandi_gown_d" name="Ghandi_gown_d">
-      <init_from>textures/Ghandi_gown_d.png</init_from>
+      <init_from>/m_gandhi_gown/textures/Ghandi_gown_d.png</init_from>
     </image>
     <image id="tennisshoes_normals" name="tennisshoes_normals">
-      <init_from>textures/tennisshoes_normals.png</init_from>
+      <init_from>/m_gandhi_gown/textures/tennisshoes_normals.png</init_from>
     </image>
     <image id="tennisshoes" name="tennisshoes">
-      <init_from>textures/tennisshoes.png</init_from>
+      <init_from>/m_gandhi_gown/textures/tennisshoes.png</init_from>
     </image>
   </library_images>
   <library_effects>

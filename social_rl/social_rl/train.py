@@ -131,11 +131,73 @@ class OutcomeCallback(BaseCallback):
 def load_config(path: str) -> dict:
     with open(path, 'r') as handle:
         config = yaml.safe_load(handle) or {}
-    unknown = set(config) - {'env', 'observation', 'reward', 'train'}
+    unknown = set(config) - {
+        'env', 'evaluation', 'observation', 'reward', 'train'}
     if unknown:
         raise ValueError(f'unknown top-level sections in {path}: '
                          f'{sorted(unknown)}')
     return config
+
+
+EVALUATION_ENV_KEYS = frozenset(
+    ('start_poses', 'goals', 'waiting_routes', 'scenarios'))
+
+
+def unseen_evaluation_env_config(env_config: EnvConfig,
+                                 evaluation_config: dict) -> EnvConfig:
+    """Return an evaluation-only environment with novel episode geometry.
+
+    The observation, reward, velocity smoother, and all safety settings stay
+    identical to training.  Only reset geometry and scenario weighting change,
+    so this probes route generalisation instead of creating a second task.
+    """
+    if not isinstance(evaluation_config, dict):
+        raise ValueError('evaluation must be a mapping')
+    unknown = set(evaluation_config) - EVALUATION_ENV_KEYS
+    if unknown:
+        raise ValueError(
+            f'unknown evaluation keys: {sorted(unknown)}. Valid keys: '
+            f'{sorted(EVALUATION_ENV_KEYS)}')
+    missing = EVALUATION_ENV_KEYS - set(evaluation_config)
+    if missing:
+        raise ValueError(
+            f'evaluation is missing required keys: {sorted(missing)}')
+
+    geometry = {
+        'start_poses': (3, evaluation_config['start_poses']),
+        'goals': (2, evaluation_config['goals']),
+        'waiting_routes': (5, evaluation_config['waiting_routes']),
+    }
+    for name, (width, values) in geometry.items():
+        if not isinstance(values, list) or not values:
+            raise ValueError(f'evaluation.{name} must be a non-empty list')
+        if any(not isinstance(value, (list, tuple)) or len(value) != width
+               for value in values):
+            raise ValueError(
+                f'evaluation.{name} entries must each contain {width} values')
+        if any(not isinstance(number, (int, float)) or isinstance(number, bool)
+               for value in values for number in value):
+            raise ValueError(f'evaluation.{name} entries must be numeric')
+        # A supposedly unseen test set must not silently include trained
+        # endpoints/routes.  Tuples make the list entries hashable for this
+        # exact-coordinate check; the map safety review belongs in the YAML.
+        trained = {tuple(value) for value in getattr(env_config, name)}
+        overlap = trained & {tuple(value) for value in values}
+        if overlap:
+            raise ValueError(
+                f'evaluation.{name} overlaps training geometry: '
+                f'{sorted(overlap)}')
+
+    scenarios = evaluation_config['scenarios']
+    if not isinstance(scenarios, list) or not scenarios:
+        raise ValueError('evaluation.scenarios must be a non-empty list')
+    if any(not isinstance(value, str) for value in scenarios):
+        raise ValueError('evaluation.scenarios entries must be strings')
+    if not {'none', 'waiting'} <= set(scenarios):
+        raise ValueError(
+            'evaluation.scenarios must include both "none" and "waiting"')
+
+    return replace(env_config, **evaluation_config)
 
 
 def resolve_resume(path: str) -> str:
@@ -378,7 +440,10 @@ def report_evaluation(rows, env_config):
         print(f'  simulated block C    ON  (wrong '
               f'{env_config.vlm_wrong_label_prob:.2f}, abstain '
               f'{env_config.vlm_abstain_prob:.2f}, every '
-              f'{env_config.vlm_period:.2f} s; REWARD USES TRUE LABELS)')
+              f'{env_config.vlm_period:.2f} s, confidence '
+              f'[{env_config.vlm_confidence_min:.2f}, '
+              f'{env_config.vlm_confidence_max:.2f}]; '
+              f'REWARD USES TRUE LABELS)')
     else:
         print('  simulated block C    off')
     print('-' * 72)
@@ -487,11 +552,34 @@ def main():
                              'rest come from --config')
     parser.add_argument('--eval-episodes', type=int, default=40,
                         help='how many episodes --eval drives (default 40)')
+    parser.add_argument('--eval-unseen', action='store_true',
+                        help='EVAL ONLY: replace training start_poses, goals, '
+                             'waiting_routes, and scenario mix with the '
+                             'separate evaluation: suite in the YAML. This '
+                             'measures generalisation to novel routes; it '
+                             'requires --eval and never changes training.')
     parser.add_argument('--eval-stochastic', action='store_true',
                         help='sample actions instead of taking the mean. The '
                              'default is deterministic, which is what '
                              'rl_agent.yaml runs on the robot')
+    parser.add_argument('--eval-talking-offset', type=float, nargs=2,
+                        default=None, metavar=('LO', 'HI'),
+                        help='EVAL ONLY: force the `talking` pair\'s lateral '
+                             'offset from the route to this band instead of '
+                             'the trained [0.0, 0.0] (animated_people_release.'
+                             'cpp). "0 0" plants the pair dead-centre on the '
+                             'route -- the worst case for checking whether '
+                             'the policy actually detours, not just drives '
+                             'near the randomised training band. Requires '
+                             '--eval; never touches rl_train.yaml or a '
+                             'training run')
     args, ros_args = parser.parse_known_args()
+    if args.eval_talking_offset and not args.eval:
+        raise RuntimeError('--eval-talking-offset only makes sense with '
+                           '--eval; it does not apply to training')
+    if args.eval_unseen and not args.eval:
+        raise RuntimeError('--eval-unseen only makes sense with --eval; it '
+                           'does not apply to training')
 
     config = load_config(args.config)
     env_config = EnvConfig.from_dict(config.get('env', {}))
@@ -513,6 +601,12 @@ def main():
     if args.render:
         env_config = replace(
             env_config, render=args.render.lower() in ('true', '1', 'yes', 'on'))
+    if args.eval_unseen:
+        env_config = unseen_evaluation_env_config(
+            env_config, config.get('evaluation'))
+    if args.eval_talking_offset:
+        env_config = replace(
+            env_config, talking_offset_override=tuple(args.eval_talking_offset))
 
     device = resolve_device(str(train_config.get('device', 'cuda:0')))
     if args.eval:
@@ -521,6 +615,8 @@ def main():
         # line until the process exits.
         sys.stdout.reconfigure(line_buffering=True)
         print(f'[social_rl] eval    : {eval_path}')
+        if args.eval_unseen:
+            print('[social_rl] suite   : unseen start/goal/route geometry')
         print(f'[social_rl] episodes: {args.eval_episodes}, '
               f'{"stochastic" if args.eval_stochastic else "deterministic"}')
         rclpy.init(args=ros_args)
@@ -611,6 +707,26 @@ def main():
                                       tensorboard_log=run_dir,
                                       custom_objects=resume_overrides(
                                           resume_path, train_config))
+            # load() also restores policy.optimizer's state_dict -- Adam's
+            # per-parameter running averages of gradient and squared
+            # gradient, not just the weights. Measured 13-09-2026 across
+            # three chained resumes (20260912_182533 -> ... -> 302032,
+            # ent_coef 0.001 then 0.0003): train/std went 0.9943 -> 0.8495
+            # over 300k+ steps and its rate of decline HALVED after cutting
+            # ent_coef 3x, the opposite of what a cleaner entropy/signal
+            # ratio should do (entropy's pull on log_std is a constant, it
+            # does not taper off as std shrinks). Adam's own memory of 300k
+            # steps of a near-zero effective gradient on log_std is the only
+            # thing left that explains a slower response to a stronger
+            # signal. Rebuilding the optimizer keeps every learned weight
+            # (policy.state_dict() is untouched) and only drops that memory,
+            # for every parameter, not log_std alone -- there is no way to
+            # reset one parameter's Adam state without touching the rest.
+            model.policy.optimizer = model.policy.optimizer_class(
+                model.policy.parameters(), lr=model.lr_schedule(1),
+                **model.policy.optimizer_kwargs)
+            print('[social_rl] reset optimizer state (Adam moments) on '
+                  'resume; weights unchanged')
         else:
             model = RecurrentPPO(
                 'MultiInputLstmPolicy', env,

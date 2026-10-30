@@ -4,7 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from social_rl.train import evaluation_acceptance, report_evaluation
+from social_rl.ros_interface import EnvConfig
+from social_rl.train import (evaluation_acceptance, report_evaluation,
+                             unseen_evaluation_env_config)
 
 
 def row(*, scenario='talking', outcome='goal', intrusion=0.0, unseen=0.0,
@@ -126,3 +128,46 @@ def test_report_prints_checkpoint_verdict(capsys):
     assert '[PASS] mean closest, TRUE' in output
     assert '[PASS] none goal' in output
     assert 'VERDICT: PASS -- select this checkpoint' in output
+
+
+def test_unseen_evaluation_replaces_only_episode_geometry():
+    train_env = EnvConfig(
+        start_poses=[[0.0, 0.0, 0.0]],
+        goals=[[3.0, 0.0]],
+        waiting_routes=[[0.0, 0.0, 3.0, 0.0, -1]],
+        scenarios=['none', 'waiting'],
+        velocity_smoothing_enabled=True,
+        max_angular_acceleration=1.25)
+    suite = {
+        'start_poses': [[0.5, -0.25, 0.0]],
+        'goals': [[4.0, -0.75]],
+        'waiting_routes': [[0.5, -0.25, 4.0, -0.75, -1]],
+        'scenarios': ['none', 'waiting'],
+    }
+
+    evaluation_env = unseen_evaluation_env_config(train_env, suite)
+
+    assert evaluation_env.start_poses == suite['start_poses']
+    assert evaluation_env.goals == suite['goals']
+    assert evaluation_env.waiting_routes == suite['waiting_routes']
+    assert evaluation_env.scenarios == suite['scenarios']
+    # The evaluation has the same policy-to-robot dynamics as training.
+    assert evaluation_env.velocity_smoothing_enabled
+    assert evaluation_env.max_angular_acceleration == pytest.approx(1.25)
+
+
+def test_unseen_evaluation_rejects_a_trained_goal():
+    train_env = EnvConfig(
+        start_poses=[[0.0, 0.0, 0.0]],
+        goals=[[3.0, 0.0]],
+        waiting_routes=[[0.0, 0.0, 3.0, 0.0, -1]],
+        scenarios=['none', 'waiting'])
+    suite = {
+        'start_poses': [[0.5, 0.0, 0.0]],
+        'goals': [[3.0, 0.0]],
+        'waiting_routes': [[0.5, 0.0, 4.0, 0.0, -1]],
+        'scenarios': ['none', 'waiting'],
+    }
+
+    with pytest.raises(ValueError, match='overlaps training geometry'):
+        unseen_evaluation_env_config(train_env, suite)

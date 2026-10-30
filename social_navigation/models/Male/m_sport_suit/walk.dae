@@ -12,25 +12,25 @@
   </asset>
   <library_images>
     <image id="young_lightskinned_male_diffuse" name="young_lightskinned_male_diffuse">
-      <init_from>textures/young_lightskinned_male_diffuse.png</init_from>
+      <init_from>/m_sport_suit/textures/young_lightskinned_male_diffuse.png</init_from>
     </image>
     <image id="short01_diffuse" name="short01_diffuse">
-      <init_from>textures/short01_diffuse.png</init_from>
+      <init_from>/m_sport_suit/textures/short01_diffuse.png</init_from>
     </image>
     <image id="brown_eye" name="brown_eye">
-      <init_from>textures/brown_eye.png</init_from>
+      <init_from>/m_sport_suit/textures/brown_eye.png</init_from>
     </image>
     <image id="eyebrow001" name="eyebrow001">
-      <init_from>textures/eyebrow001.png</init_from>
+      <init_from>/m_sport_suit/textures/eyebrow001.png</init_from>
     </image>
     <image id="cl_male_sport_suit" name="cl_male_sport_suit">
-      <init_from>textures/cl_male_sport_suit.png</init_from>
+      <init_from>/m_sport_suit/textures/cl_male_sport_suit.png</init_from>
     </image>
     <image id="shoes06_diffuse" name="shoes06_diffuse">
-      <init_from>textures/shoes06_diffuse.png</init_from>
+      <init_from>/m_sport_suit/textures/shoes06_diffuse.png</init_from>
     </image>
     <image id="wristbands" name="wristbands">
-      <init_from>textures/wristbands.png</init_from>
+      <init_from>/m_sport_suit/textures/wristbands.png</init_from>
     </image>
   </library_images>
   <library_effects>

@@ -12,40 +12,40 @@
   </asset>
   <library_images>
     <image id="young_lightskinned_male_diffuse" name="young_lightskinned_male_diffuse">
-      <init_from>textures/young_lightskinned_male_diffuse.png</init_from>
+      <init_from>/m_polo/textures/young_lightskinned_male_diffuse.png</init_from>
     </image>
     <image id="brown_eye" name="brown_eye">
-      <init_from>textures/brown_eye.png</init_from>
+      <init_from>/m_polo/textures/brown_eye.png</init_from>
     </image>
     <image id="eyebrow001" name="eyebrow001">
-      <init_from>textures/eyebrow001.png</init_from>
+      <init_from>/m_polo/textures/eyebrow001.png</init_from>
     </image>
     <image id="Polo_Base_Color" name="Polo_Base_Color">
-      <init_from>textures/Polo_Base_Color.png</init_from>
+      <init_from>/m_polo/textures/Polo_Base_Color.png</init_from>
     </image>
     <image id="M_Trousers_02_NRM" name="M_Trousers_02_NRM">
-      <init_from>textures/M_Trousers_02_NRM.png</init_from>
+      <init_from>/m_polo/textures/M_Trousers_02_NRM.png</init_from>
     </image>
     <image id="M_Trousers_02" name="M_Trousers_02">
-      <init_from>textures/M_Trousers_02.png</init_from>
+      <init_from>/m_polo/textures/M_Trousers_02.png</init_from>
     </image>
     <image id="Shoes_Oxford_NRM" name="Shoes_Oxford_NRM">
-      <init_from>textures/Shoes_Oxford_NRM.png</init_from>
+      <init_from>/m_polo/textures/Shoes_Oxford_NRM.png</init_from>
     </image>
     <image id="Shoes_Oxford" name="Shoes_Oxford">
-      <init_from>textures/Shoes_Oxford.png</init_from>
+      <init_from>/m_polo/textures/Shoes_Oxford.png</init_from>
     </image>
     <image id="Glasses2" name="Glasses2">
-      <init_from>textures/Glasses2.png</init_from>
+      <init_from>/m_polo/textures/Glasses2.png</init_from>
     </image>
     <image id="fedora_normal" name="fedora_normal">
-      <init_from>textures/fedora_normal.png</init_from>
+      <init_from>/m_polo/textures/fedora_normal.png</init_from>
     </image>
     <image id="fedora_displacement" name="fedora_displacement">
-      <init_from>textures/fedora_displacement.png</init_from>
+      <init_from>/m_polo/textures/fedora_displacement.png</init_from>
     </image>
     <image id="fedora_texture" name="fedora_texture">
-      <init_from>textures/fedora_texture.png</init_from>
+      <init_from>/m_polo/textures/fedora_texture.png</init_from>
     </image>
   </library_images>
   <library_effects>

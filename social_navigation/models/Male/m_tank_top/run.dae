@@ -12,31 +12,31 @@
   </asset>
   <library_images>
     <image id="young_lightskinned_male_diffuse3" name="young_lightskinned_male_diffuse3">
-      <init_from>textures/young_lightskinned_male_diffuse3.png</init_from>
+      <init_from>/m_tank_top/textures/young_lightskinned_male_diffuse3.png</init_from>
     </image>
     <image id="short03_diffuse" name="short03_diffuse">
-      <init_from>textures/short03_diffuse.png</init_from>
+      <init_from>/m_tank_top/textures/short03_diffuse.png</init_from>
     </image>
     <image id="brown_eye" name="brown_eye">
-      <init_from>textures/brown_eye.png</init_from>
+      <init_from>/m_tank_top/textures/brown_eye.png</init_from>
     </image>
     <image id="eyebrow001" name="eyebrow001">
-      <init_from>textures/eyebrow001.png</init_from>
+      <init_from>/m_tank_top/textures/eyebrow001.png</init_from>
     </image>
     <image id="Tank_Top_01_NRM" name="Tank_Top_01_NRM">
-      <init_from>textures/Tank_Top_01_NRM.png</init_from>
+      <init_from>/m_tank_top/textures/Tank_Top_01_NRM.png</init_from>
     </image>
     <image id="Tank_Top_01" name="Tank_Top_01">
-      <init_from>textures/Tank_Top_01.png</init_from>
+      <init_from>/m_tank_top/textures/Tank_Top_01.png</init_from>
     </image>
     <image id="M_Trousers_02_NRM" name="M_Trousers_02_NRM">
-      <init_from>textures/M_Trousers_02_NRM.png</init_from>
+      <init_from>/m_tank_top/textures/M_Trousers_02_NRM.png</init_from>
     </image>
     <image id="M_Trousers_02" name="M_Trousers_02">
-      <init_from>textures/M_Trousers_02.png</init_from>
+      <init_from>/m_tank_top/textures/M_Trousers_02.png</init_from>
     </image>
     <image id="runningshoes" name="runningshoes">
-      <init_from>textures/runningshoes.png</init_from>
+      <init_from>/m_tank_top/textures/runningshoes.png</init_from>
     </image>
   </library_images>
   <library_effects>

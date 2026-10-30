@@ -1,0 +1,29 @@
+zmq_camera_receiver:
+  ros__parameters:
+    connect_endpoint: tcp://10.136.10.188:5555  # Replace with the Pi IP address.
+    rgb_topic: camera.rgb.v1
+    depth_topic: camera.depth.v1
+    camera_info_topic: camera.info.v1
+    status_topic: camera.status.v1
+    receive_hwm: 2
+    poll_period_ms: 5
+    stale_timeout_s: 1.0
+    # Maximum RGB/depth capture timestamp difference: 0.15 s.
+    max_pair_delta_s: 0.15
+    max_payload_bytes: 8388608
+
+    # RGB-only webcam mode. Set true only after the Pi is configured as source:=ros
+    # camera_mode:=rgbd and sends an aligned depth stream. With require_depth,
+    # RGB is held until a matching depth frame and both calibrations arrive.
+    receive_depth: false
+    require_depth: false
+
+    output_rgb_topic: /camera/color/image_raw
+    output_depth_topic: /camera/depth/image_raw
+    output_camera_info_topic: /camera/color/camera_info
+    output_depth_camera_info_topic: /camera/depth/camera_info
+
+    # Leave blank until the webcam has been calibrated. A standard ROS camera
+    # calibration YAML here is used only when the sender does not provide CameraInfo.
+    camera_info_file: ""
+    frame_id: camera_color_optical_frame

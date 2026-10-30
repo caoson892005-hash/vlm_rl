@@ -12,34 +12,34 @@
   </asset>
   <library_images>
     <image id="young_lightskinned_male_diffuse" name="young_lightskinned_male_diffuse">
-      <init_from>textures/young_lightskinned_male_diffuse.png</init_from>
+      <init_from>/m_camo/textures/young_lightskinned_male_diffuse.png</init_from>
     </image>
     <image id="male02_diffuse_black" name="male02_diffuse_black">
-      <init_from>textures/male02_diffuse_black.png</init_from>
+      <init_from>/m_camo/textures/male02_diffuse_black.png</init_from>
     </image>
     <image id="brown_eye" name="brown_eye">
-      <init_from>textures/brown_eye.png</init_from>
+      <init_from>/m_camo/textures/brown_eye.png</init_from>
     </image>
     <image id="eyebrow001" name="eyebrow001">
-      <init_from>textures/eyebrow001.png</init_from>
+      <init_from>/m_camo/textures/eyebrow001.png</init_from>
     </image>
     <image id="short_tail_camo_tee_nrml" name="short_tail_camo_tee_nrml">
-      <init_from>textures/short_tail_camo_tee_nrml.jpg</init_from>
+      <init_from>/m_camo/textures/short_tail_camo_tee_nrml.jpg</init_from>
     </image>
     <image id="short_tail_camo_tee_diff" name="short_tail_camo_tee_diff">
-      <init_from>textures/short_tail_camo_tee_diff.jpg</init_from>
+      <init_from>/m_camo/textures/short_tail_camo_tee_diff.jpg</init_from>
     </image>
     <image id="uniform_pants_normals" name="uniform_pants_normals">
-      <init_from>textures/uniform_pants_normals.png</init_from>
+      <init_from>/m_camo/textures/uniform_pants_normals.png</init_from>
     </image>
     <image id="uniform_pants" name="uniform_pants">
-      <init_from>textures/uniform_pants.png</init_from>
+      <init_from>/m_camo/textures/uniform_pants.png</init_from>
     </image>
     <image id="tennisshoes_normals" name="tennisshoes_normals">
-      <init_from>textures/tennisshoes_normals.png</init_from>
+      <init_from>/m_camo/textures/tennisshoes_normals.png</init_from>
     </image>
     <image id="tennisshoes" name="tennisshoes">
-      <init_from>textures/tennisshoes.png</init_from>
+      <init_from>/m_camo/textures/tennisshoes.png</init_from>
     </image>
   </library_images>
   <library_effects>

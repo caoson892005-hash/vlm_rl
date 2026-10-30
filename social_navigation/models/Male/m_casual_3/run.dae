@@ -12,34 +12,34 @@
   </asset>
   <library_images>
     <image id="young_lightskinned_male_diffuse" name="young_lightskinned_male_diffuse">
-      <init_from>textures/young_lightskinned_male_diffuse.png</init_from>
+      <init_from>/m_casual_3/textures/young_lightskinned_male_diffuse.png</init_from>
     </image>
     <image id="short01_diffuse" name="short01_diffuse">
-      <init_from>textures/short01_diffuse.png</init_from>
+      <init_from>/m_casual_3/textures/short01_diffuse.png</init_from>
     </image>
     <image id="brown_eye" name="brown_eye">
-      <init_from>textures/brown_eye.png</init_from>
+      <init_from>/m_casual_3/textures/brown_eye.png</init_from>
     </image>
     <image id="eyebrow001" name="eyebrow001">
-      <init_from>textures/eyebrow001.png</init_from>
+      <init_from>/m_casual_3/textures/eyebrow001.png</init_from>
     </image>
     <image id="Worn_out_sweater_normal" name="Worn_out_sweater_normal">
-      <init_from>textures/Worn_out_sweater_normal.png</init_from>
+      <init_from>/m_casual_3/textures/Worn_out_sweater_normal.png</init_from>
     </image>
     <image id="Worn_out_sweater_diffuse" name="Worn_out_sweater_diffuse">
-      <init_from>textures/Worn_out_sweater_diffuse.png</init_from>
+      <init_from>/m_casual_3/textures/Worn_out_sweater_diffuse.png</init_from>
     </image>
     <image id="uniform_pants_normals" name="uniform_pants_normals">
-      <init_from>textures/uniform_pants_normals.png</init_from>
+      <init_from>/m_casual_3/textures/uniform_pants_normals.png</init_from>
     </image>
     <image id="uniform_pants" name="uniform_pants">
-      <init_from>textures/uniform_pants.png</init_from>
+      <init_from>/m_casual_3/textures/uniform_pants.png</init_from>
     </image>
     <image id="sneaker_brown_diffuse" name="sneaker_brown_diffuse">
-      <init_from>textures/sneaker_brown_diffuse.PNG</init_from>
+      <init_from>/m_casual_3/textures/sneaker_brown_diffuse.PNG</init_from>
     </image>
     <image id="RucksackUV" name="RucksackUV">
-      <init_from>textures/RucksackUV.png</init_from>
+      <init_from>/m_casual_3/textures/RucksackUV.png</init_from>
     </image>
   </library_images>
   <library_effects>

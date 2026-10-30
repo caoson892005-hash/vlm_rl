@@ -45,6 +45,12 @@ def generate_launch_description():
             description='Use simulation time'
         ),
 
+        DeclareLaunchArgument(
+            name='xacro_args',
+            default_value='',
+            description='Optional xacro assignments, for example publish_odom_tf:=true'
+        ),
+
         Node(
             package='joint_state_publisher',
             executable='joint_state_publisher',
@@ -65,7 +71,8 @@ def generate_launch_description():
                     'use_sim_time': LaunchConfiguration('use_sim_time'),
                     # SỬA LỖI TẠI ĐÂY: Bọc Command trong ParameterValue
                     'robot_description': ParameterValue(
-                        Command(['xacro ', LaunchConfiguration('urdf')]),
+                        Command(['xacro ', LaunchConfiguration('urdf'), ' ',
+                                 LaunchConfiguration('xacro_args')]),
                         value_type=str
                     )
                 }

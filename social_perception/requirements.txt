@@ -1,8 +1,14 @@
-accelerate>=0.30
-bitsandbytes>=0.43; platform_system == "Linux"
-Jinja2>=3.1.0,<4
-peft>=0.19.1,<0.21
-Pillow>=9.1
-qwen-vl-utils>=0.0.8
-transformers>=4.45,<4.58
+# Runtime dependency for the active RGB-D + YOLO Pose social-geometry pipeline.
+# Keep the ROS Humble cv_bridge/SciPy ABI compatible while satisfying YOLO.
+numpy>=1.23,<1.25
 ultralytics>=8.0
+
+# Optional dependencies for the separate social_vlm_interaction node. Install
+# these only on the workstation that owns the local Qwen checkpoint; Block B
+# still runs without them when the VLM node is not launched.
+transformers>=4.45
+peft>=0.13
+Pillow>=9.0
+# Choose the PyTorch wheel matching the workstation CUDA version separately.
+# bitsandbytes is required only when vlm_load_in_4bit=true.
+bitsandbytes>=0.43

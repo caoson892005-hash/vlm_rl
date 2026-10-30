@@ -35,11 +35,15 @@ def main(args=None):
     # "talking"   : two actors stand face to face for the whole session.
     # "gathering" : they walk in, talk, walk out, and repeat, so the costmap
     #               has to both create and remove the social region.
+    # "crossing"  : one actor repeatedly walks across the RGB-D camera.
+    # "standing"  : one actor remains at the fixed bookshelf-test position.
     node.declare_parameter('scenario', 'talking')
     scenario = str(node.get_parameter('scenario').value).strip().lower()
     topics = {
         'talking': '/animated_people/release',
         'gathering': '/animated_people/gather',
+        'crossing': '/animated_people/crossing',
+        'standing': '/animated_people/standing',
     }
     if scenario not in topics:
         node.get_logger().error(
@@ -48,10 +52,9 @@ def main(args=None):
     release = node.create_publisher(Empty, topics[scenario], 1)
     hide = node.create_publisher(Empty, '/animated_people/hide', 1)
 
-    # Loading the VLM takes far longer than spawning actors. Waiting for the
-    # perception node to report itself ready means the people appear in front
-    # of a pipeline that can already see them, instead of standing around
-    # unobserved while a 2B model loads.
+    # Waiting for perception means people appear only after the RGB-D/YOLO
+    # pipeline can already see them, rather than standing unobserved during
+    # camera or model initialization.
     node.declare_parameter('wait_for_perception', False)
     node.declare_parameter('ready_timeout', 600.0)
     wait_for_perception = bool(node.get_parameter('wait_for_perception').value)
@@ -61,8 +64,7 @@ def main(args=None):
     def on_ready(message):
         ready['received'] = True
         node.get_logger().info(
-            'Perception is ready (VLM ' +
-            ('loaded' if message.data else 'unavailable') + '). Releasing actors.')
+            'Perception is ready. Releasing actors.')
 
     if wait_for_perception:
         node.create_subscription(
@@ -127,11 +129,11 @@ def main(args=None):
         if released and context.ok():
             # Give DDS discovery and Gazebo's world-update queue time to
             # receive the removal command before this process exits.
-            node.get_logger().info('Removing animated conversation pair...')
+            node.get_logger().info('Removing animated people...')
             for _ in range(5):
                 hide.publish(Empty())
                 executor.spin_once(timeout_sec=0.1)
-            node.get_logger().info('Animated conversation pair removed.')
+            node.get_logger().info('Animated people removed.')
         executor.remove_node(node)
         executor.shutdown(timeout_sec=1.0)
         node.destroy_node()

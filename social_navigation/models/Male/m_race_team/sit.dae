@@ -12,31 +12,31 @@
   </asset>
   <library_images>
     <image id="young_lightskinned_male_diffuse" name="young_lightskinned_male_diffuse">
-      <init_from>textures/young_lightskinned_male_diffuse.png</init_from>
+      <init_from>/m_race_team/textures/young_lightskinned_male_diffuse.png</init_from>
     </image>
     <image id="short03_diffuse" name="short03_diffuse">
-      <init_from>textures/short03_diffuse.png</init_from>
+      <init_from>/m_race_team/textures/short03_diffuse.png</init_from>
     </image>
     <image id="brown_eye" name="brown_eye">
-      <init_from>textures/brown_eye.png</init_from>
+      <init_from>/m_race_team/textures/brown_eye.png</init_from>
     </image>
     <image id="eyebrow001" name="eyebrow001">
-      <init_from>textures/eyebrow001.png</init_from>
+      <init_from>/m_race_team/textures/eyebrow001.png</init_from>
     </image>
     <image id="normals1" name="normals1">
-      <init_from>textures/normals1.png</init_from>
+      <init_from>/m_race_team/textures/normals1.png</init_from>
     </image>
     <image id="racesuittex10" name="racesuittex10">
-      <init_from>textures/racesuittex10.png</init_from>
+      <init_from>/m_race_team/textures/racesuittex10.png</init_from>
     </image>
     <image id="shoes02_diffuse" name="shoes02_diffuse">
-      <init_from>textures/shoes02_diffuse.png</init_from>
+      <init_from>/m_race_team/textures/shoes02_diffuse.png</init_from>
     </image>
     <image id="headset_norm" name="headset_norm">
-      <init_from>textures/headset_norm.png</init_from>
+      <init_from>/m_race_team/textures/headset_norm.png</init_from>
     </image>
     <image id="headset" name="headset">
-      <init_from>textures/headset.png</init_from>
+      <init_from>/m_race_team/textures/headset.png</init_from>
     </image>
   </library_images>
   <library_effects>

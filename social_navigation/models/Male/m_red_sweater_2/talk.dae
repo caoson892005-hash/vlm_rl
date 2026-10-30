@@ -12,28 +12,28 @@
   </asset>
   <library_images>
     <image id="middleage_darkskinned_male_diffuse" name="middleage_darkskinned_male_diffuse">
-      <init_from>textures/middleage_darkskinned_male_diffuse.png</init_from>
+      <init_from>/m_red_sweater_2/textures/middleage_darkskinned_male_diffuse.png</init_from>
     </image>
     <image id="male02_diffuse_black" name="male02_diffuse_black">
-      <init_from>textures/male02_diffuse_black.png</init_from>
+      <init_from>/m_red_sweater_2/textures/male02_diffuse_black.png</init_from>
     </image>
     <image id="brown_eye" name="brown_eye">
-      <init_from>textures/brown_eye.png</init_from>
+      <init_from>/m_red_sweater_2/textures/brown_eye.png</init_from>
     </image>
     <image id="eyebrow001" name="eyebrow001">
-      <init_from>textures/eyebrow001.png</init_from>
+      <init_from>/m_red_sweater_2/textures/eyebrow001.png</init_from>
     </image>
     <image id="shirt-knit" name="shirt-knit">
-      <init_from>textures/shirt-knit.png</init_from>
+      <init_from>/m_red_sweater_2/textures/shirt-knit.png</init_from>
     </image>
     <image id="M_Trousers_01_NRM" name="M_Trousers_01_NRM">
-      <init_from>textures/M_Trousers_01_NRM.png</init_from>
+      <init_from>/m_red_sweater_2/textures/M_Trousers_01_NRM.png</init_from>
     </image>
     <image id="M_Trousers_01" name="M_Trousers_01">
-      <init_from>textures/M_Trousers_01.png</init_from>
+      <init_from>/m_red_sweater_2/textures/M_Trousers_01.png</init_from>
     </image>
     <image id="sneaker_brown_diffuse" name="sneaker_brown_diffuse">
-      <init_from>textures/sneaker_brown_diffuse.PNG</init_from>
+      <init_from>/m_red_sweater_2/textures/sneaker_brown_diffuse.PNG</init_from>
     </image>
   </library_images>
   <library_effects>

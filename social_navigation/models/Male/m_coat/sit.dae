@@ -12,31 +12,31 @@
   </asset>
   <library_images>
     <image id="young_lightskinned_male_diffuse" name="young_lightskinned_male_diffuse">
-      <init_from>textures/young_lightskinned_male_diffuse.png</init_from>
+      <init_from>/m_coat/textures/young_lightskinned_male_diffuse.png</init_from>
     </image>
     <image id="short03_diffuse" name="short03_diffuse">
-      <init_from>textures/short03_diffuse.png</init_from>
+      <init_from>/m_coat/textures/short03_diffuse.png</init_from>
     </image>
     <image id="brown_eye" name="brown_eye">
-      <init_from>textures/brown_eye.png</init_from>
+      <init_from>/m_coat/textures/brown_eye.png</init_from>
     </image>
     <image id="eyebrow001" name="eyebrow001">
-      <init_from>textures/eyebrow001.png</init_from>
+      <init_from>/m_coat/textures/eyebrow001.png</init_from>
     </image>
     <image id="F_Coat_Duffle_NRM" name="F_Coat_Duffle_NRM">
-      <init_from>textures/F_Coat_Duffle_NRM.png</init_from>
+      <init_from>/m_coat/textures/F_Coat_Duffle_NRM.png</init_from>
     </image>
     <image id="F_Coat_Duffle" name="F_Coat_Duffle">
-      <init_from>textures/F_Coat_Duffle.png</init_from>
+      <init_from>/m_coat/textures/F_Coat_Duffle.png</init_from>
     </image>
     <image id="uniform_pants_normals" name="uniform_pants_normals">
-      <init_from>textures/uniform_pants_normals.png</init_from>
+      <init_from>/m_coat/textures/uniform_pants_normals.png</init_from>
     </image>
     <image id="uniform_pants" name="uniform_pants">
-      <init_from>textures/uniform_pants.png</init_from>
+      <init_from>/m_coat/textures/uniform_pants.png</init_from>
     </image>
     <image id="sneaker_brown_diffuse" name="sneaker_brown_diffuse">
-      <init_from>textures/sneaker_brown_diffuse.PNG</init_from>
+      <init_from>/m_coat/textures/sneaker_brown_diffuse.PNG</init_from>
     </image>
   </library_images>
   <library_effects>

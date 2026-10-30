@@ -1,180 +1,89 @@
 social_vlm_perception:
   ros__parameters:
-    # Real deployment: the RGB-D camera is plugged into the workstation, the VLM
-    # runs on the workstation GPU, and the robot only navigates. Nothing in this
-    # pipeline runs on the robot computer.
+    # Real deployment: RGB-D and YOLO detection run on the workstation; the robot
+    # only navigates. No VLM is loaded by this pipeline.
     use_sim_time: false
 
-    yolo_model_path: yolov8n.pt
+    # Local YOLO Pose checkpoint: its 17 COCO keypoints drive skeleton and
+    # shoulder-based body orientation in RViz.
+    yolo_model_path: ~/my_amr_thesis_test-main/src/my_amr_perception/weights/yolo26n-pose.pt
 
-    # Defaults below match librealsense (realsense2_camera). Point them at
-    # whatever your driver publishes; the depth image must be aligned to the
+    # Standard RGB-D input topics. The depth image must be registered to the
     # colour image, otherwise a bounding box samples the wrong distance.
     rgb_topic: /camera/color/image_raw
-    depth_topic: /camera/aligned_depth_to_color/image_raw
+    depth_topic: /camera/depth/image_raw
     camera_info_topic: /camera/color/camera_info
+    depth_camera_info_topic: /camera/depth/camera_info
     yolo_confidence: 0.25
-    # 320 rather than the simulation's 640, because this profile now runs on the
-    # robot's Pi 5 rather than on the workstation card. Every published Pi 5
-    # benchmark puts YOLOv8n at roughly 3.5x the frame rate at 320 than at 640;
-    # NOT measured on this robot yet, so treat it as a starting point and check
-    # it against the real machine before trusting the number.
-    yolo_image_size: 320
-    # There is no CUDA on a Pi 5. Leaving cuda:0 here fails at startup rather
-    # than falling back quietly, which is why it must change with the hardware.
-    # Export the model to NCNN (`yolo export model=yolov8n.pt format=ncnn`) and
-    # point yolo_model_path at the resulting yolov8n_ncnn_model directory: the
-    # published Pi 5 numbers put NCNN at ~3x PyTorch on the same CPU, and it
-    # drops the torch dependency from the robot entirely.
+    yolo_image_size: 640
+    # CPU works everywhere; switch to cuda:0 when the workstation has headroom.
     yolo_device: cpu
 
-    # People are published straight into the navigation frame. The camera is a
-    # link of the robot now, so the chain is
-    # map -> odom -> base_footprint -> ... -> camera_depth_link and comes from
-    # robot_state_publisher plus AMCL. Run social_bringup.launch.py with
-    # camera_tf:=false: its static map -> camera_link would give that frame a
-    # second parent and break the tree.
+    # People are published straight into the navigation frame. This requires a
+    # map -> camera_link transform: social_bringup.launch.py publishes it from
+    # the camera_x/camera_y/... arguments when sim:=false.
     target_frame: map
-    # Deliberately tighter than the simulation profile, which sits at 0.3. This
-    # threshold is a multiple of the camera's frame interval, not a fixed
-    # number: a RealSense at 30 Hz delivers every 0.033 s, so 0.15 still allows
-    # depth to be four frames behind, whereas the simulated camera runs at 8 Hz
-    # and needed 0.3 for the same slack. Rescale this if the driver is
-    # configured for a lower frame rate -- and prefer that to loosening it
-    # blindly, because a stale depth reading puts a person at the wrong
-    # distance rather than simply losing them.
     maximum_depth_age: 0.15
-    # How late a camera frame may be picked up and still be published on
-    # /people. Past this it is dropped, because the costmap layer would look
-    # its stamp up in a TF buffer that has already dropped it. Raise it only
-    # after checking why frames are arriving late.
-    maximum_frame_age: 0.5
     minimum_depth: 0.2
     maximum_depth: 12.0
-    tracking_max_distance: 1.0
-    # Two tracks this close are one person counted twice. Must stay
-    # well under the spacing of two people holding a conversation.
+    # ByteTrack owns detection-to-track association. Its thresholds and lost
+    # track buffer live in config/bytetrack.yaml.
+    bytetrack_config: config/bytetrack.yaml
+    # Avoid publishing a coasted track on top of a newly visible track.
     duplicate_merge_distance: 0.6
     # The robot driving across the observer camera's view hides a
     # person for seconds at a time. Dropping the track that fast
-    # reissued their id, which deleted the social region keyed on it.
+    # reissues their id and makes downstream tracking flicker.
     tracking_timeout: 6.0
-    # How long a vanished person can reclaim their old id on reappearing.
-    # Their id is the key every VLM decision is cached under, so losing it
-    # deletes the social region and costs a whole inference to rebuild.
-    reidentify_timeout: 30.0
-    # How many frames a track must be SEEN in before it is published as a
-    # person or allowed to coast. One stray box at 7.6 m used to become 49
-    # messages of /people -- six seconds of coasting from a single frame -- and
-    # its score was 0.87, so no confidence threshold separates it from a real
-    # person. Measured 01-09-2026. The cost is that somebody entering frame is
-    # published two frames late, 0.25 s at the 8 Hz measured here; a track that
-    # reclaims its id after being lost keeps its count and pays nothing.
-    minimum_track_hits: 3
     velocity_smoothing: 0.35
-
-    # --- block B: quỹ đạo dự báo ngắn ---
-    # Giữ BẰNG bản sim: policy được train với 5 mẫu 0.0 -> 2.0 s bước 0.5 s,
-    # đưa cho nó cửa sổ khác là đưa một quan sát nó chưa từng thấy.
-    prediction_horizon: 2.0
-    prediction_dt: 0.5
-    prediction_still_speed: 0.1
     robot_frame: base_link
+    odom_topic: /odom
+    maximum_odom_age: 0.2
+    tracked_state_topic: /people/tracked_state_json
+    # Constant-velocity prediction in the map frame.
+    # Four constant-velocity points at 0.50, 1.00, 1.50 and 2.00 seconds.
+    prediction_horizon_s: 2.0
+    prediction_step_s: 0.5
+    prediction_min_speed_mps: 0.10
+    prediction_marker_diameter_m: 0.08
+    keypoint_confidence: 0.35
+    keypoint_depth_window_px: 5
+    minimum_shoulder_width_m: 0.15
+    orientation_keypoint_confidence: 0.50
+    orientation_nose_confidence: 0.60
+    orientation_face_confidence: 0.40
+    minimum_face_direction_m: 0.04
+    minimum_face_alignment: 0.45
+    orientation_flip_frames: 4
+    # -1: keep the most recent valid body yaw until this track expires.
+    orientation_hold_frames: -1
+    maximum_shoulder_width_m: 0.60
+    minimum_hip_width_m: 0.15
+    maximum_hip_width_m: 0.50
+    body_yaw_smoothing: 0.30
+    orientation_marker_arrow_length_m: 0.45
+    # Exceeds the ~0.6 s perception frame interval and the 6 s track timeout.
+    orientation_marker_lifetime_s: 7.0
+    orientation_marker_arrow_color_r: 1.0
+    orientation_marker_arrow_color_g: 0.0
+    orientation_marker_arrow_color_b: 0.85
 
-    # Same contract as the simulation, so social_navigation needs no changes.
+    # Tracked-person output consumed by social_navigation.
     people_topic: /people
-    social_regions_topic: /people_groups
+    people_tracks_topic: /people/tracks
+    people_observations_topic: /people_observations
+    people_orientation_topic: /people/orientation
+    yolo_people_topic: /yolo/people
+    # These equal the driver inputs on hardware, so the node does not relay
+    # them and cannot feed an image topic back into itself.
+    rgb_record_topic: /camera/color/image_raw
+    depth_record_topic: /camera/depth/image_raw
     interactions_topic: /social_perception/talking_interactions
     # No Gazebo actors exist here, so there is nothing to clear on hide.
     clear_interactions_topic: ""
+    # No route-reset events exist for a real camera; retain occlusion coasting.
+    track_reset_topic: ""
 
-    enable_vlm: true
-    # true on the robot: the Pi carries the camera and runs YOLO, depth,
-    # tracking and the social regions, but the model itself answers from the
-    # workstation (social_vlm_worker.py). Only the pair crop crosses the
-    # network -- roughly 20-40 KB every few seconds against the ~12 MB/s that
-    # shipping raw RGB-D would cost. With this true the robot needs neither
-    # transformers nor peft nor a GPU; the ML import tree is never touched.
-    vlm_remote: true
-    # Must outlast one inference (~3 s) plus a WiFi hiccup. Expiring here
-    # discards the answer and the pair has to be asked about from scratch.
-    vlm_request_timeout: 30.0
-    # The crop is the model's only evidence: an accuracy knob, not just a
-    # bandwidth one. A typical pair crop is ~20-40 KB at 90.
-    vlm_crop_jpeg_quality: 90
-    # The paths below are only read when vlm_remote is false. They are kept so
-    # the same profile still runs the whole pipeline in one process, which is
-    # what the workstation-camera setup did and what a robot with its own GPU
-    # would do.
-    vlm_adapter_path: Saved_Model
-    # Preferred when present: the LoRA already folded into the base weights, so
-    # startup skips the `peft` import and the adapter-attach step (3.01 s per
-    # inference against 3.57 s, 22/22 identical answers). Rebuild it with
-    # social_perception/scripts/merge_vlm_adapter.py after retraining, or set
-    # this to "" to go back to base+adapter. This used to be absent here and
-    # the node filled it in from a default hidden in the Python file, so the
-    # real profile was quietly loading a merged model its config never named.
-    vlm_merged_path: Saved_Model_merged
-    vlm_base_model: unsloth/Qwen2-VL-2B-Instruct-bnb-4bit
-    vlm_load_in_4bit: true
-    vlm_require_cuda: true
-    # Never wait on huggingface.co to re-validate a pinned checkpoint; see the
-    # simulation config. This matters more on the robot, which may be on a
-    # captive Wi-Fi or offline entirely, where the check waits for a timeout.
-    vlm_offline: true
-    # Generate only the decisive word; see the simulation config for the
-    # measurement behind this.
-    vlm_force_answer_prefix: true
-    vlm_max_new_tokens: 12
-    vlm_min_pixels: 3136       # 56 * 56
-    vlm_max_pixels: 200704     # 256 * 28 * 28
-    vlm_inference_interval: 2.0
-    vlm_refresh_interval: 15.0
-    vlm_position_change_threshold: 0.25
-    vlm_crop_margin: 0.05
+    # Deprecated: Qwen now runs in social_vlm_interaction.py, not Block B.
+    enable_vlm: false
     maximum_talking_distance: 3.0
-    maximum_vlm_pairs: 1
-    # The VLM does not answer in one stable format, so a single
-    # unreadable or contrary reply must not delete a confirmed region
-    # while the two people are still standing there talking.
-    negative_answers_to_clear: 2
-    # 0 = a confirmed conversation ends only when the model says it ended.
-    # Any positive value is a stopwatch that deletes the region out from under
-    # two people who are simply still talking. Regions are still emitted only
-    # while both tracked people remain visible, which is what bounds this.
-    interaction_timeout: 0.0
-    log_vlm_results: true
-    # Draw the inference stopwatch on /social_perception/annotated_image. The
-    # per-inference times are logged either way; this only controls the overlay.
-    show_vlm_latency_overlay: true
-    talking_prompt: >-
-      Quan sát hai người trong ảnh. Họ có đang nói chuyện trực tiếp với nhau
-      không? Chỉ trả lời đúng một JSON: {"talking":"có"} hoặc
-      {"talking":"không"}.
-
-    group_o_space_min_radius: 0.45
-    group_p_space_margin: 0.45
-    group_r_space_margin: 1.0
-
-# Read by social_vlm_worker.py on the WORKSTATION. Both machines load this same
-# file: the robot reads the block above, the workstation reads this one. One
-# file rather than two so the checkpoint and the prompt cannot drift apart
-# between them -- a drifted prompt is invisible, because the model keeps
-# answering, just a different question.
-social_vlm_worker:
-  ros__parameters:
-    # Wall clock on both machines. There is no Gazebo here, and the two must
-    # agree about time anyway: run chrony/NTP, because every TF lookup on the
-    # robot is keyed on a stamp.
-    use_sim_time: false
-    vlm_adapter_path: Saved_Model
-    vlm_merged_path: Saved_Model_merged
-    vlm_base_model: unsloth/Qwen2-VL-2B-Instruct-bnb-4bit
-    vlm_load_in_4bit: true
-    vlm_require_cuda: true
-    vlm_offline: true
-    vlm_force_answer_prefix: true
-    vlm_max_new_tokens: 12
-    vlm_min_pixels: 3136       # 56 * 56
-    vlm_max_pixels: 200704     # 256 * 28 * 28
-    log_vlm_results: true

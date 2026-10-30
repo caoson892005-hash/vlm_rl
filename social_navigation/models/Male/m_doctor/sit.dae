@@ -12,52 +12,52 @@
   </asset>
   <library_images>
     <image id="young_lightskinned_male_diffuse3" name="young_lightskinned_male_diffuse3">
-      <init_from>textures/young_lightskinned_male_diffuse3.png</init_from>
+      <init_from>/m_doctor/textures/young_lightskinned_male_diffuse3.png</init_from>
     </image>
     <image id="short01_diffuse" name="short01_diffuse">
-      <init_from>textures/short01_diffuse.png</init_from>
+      <init_from>/m_doctor/textures/short01_diffuse.png</init_from>
     </image>
     <image id="brown_eye" name="brown_eye">
-      <init_from>textures/brown_eye.png</init_from>
+      <init_from>/m_doctor/textures/brown_eye.png</init_from>
     </image>
     <image id="eyebrow001" name="eyebrow001">
-      <init_from>textures/eyebrow001.png</init_from>
+      <init_from>/m_doctor/textures/eyebrow001.png</init_from>
     </image>
     <image id="whiteclothtile" name="whiteclothtile">
-      <init_from>textures/whiteclothtile.png</init_from>
+      <init_from>/m_doctor/textures/whiteclothtile.png</init_from>
     </image>
     <image id="M_Trousers_02_NRM" name="M_Trousers_02_NRM">
-      <init_from>textures/M_Trousers_02_NRM.png</init_from>
+      <init_from>/m_doctor/textures/M_Trousers_02_NRM.png</init_from>
     </image>
     <image id="M_Trousers_02" name="M_Trousers_02">
-      <init_from>textures/M_Trousers_02.png</init_from>
+      <init_from>/m_doctor/textures/M_Trousers_02.png</init_from>
     </image>
     <image id="USA_leotard_diffuse" name="USA_leotard_diffuse">
-      <init_from>textures/USA_leotard_diffuse.png</init_from>
+      <init_from>/m_doctor/textures/USA_leotard_diffuse.png</init_from>
     </image>
     <image id="stethoscope" name="stethoscope">
-      <init_from>textures/stethoscope.png</init_from>
+      <init_from>/m_doctor/textures/stethoscope.png</init_from>
     </image>
     <image id="headmirror_norm" name="headmirror_norm">
-      <init_from>textures/headmirror_norm.png</init_from>
+      <init_from>/m_doctor/textures/headmirror_norm.png</init_from>
     </image>
     <image id="headmirror" name="headmirror">
-      <init_from>textures/headmirror.png</init_from>
+      <init_from>/m_doctor/textures/headmirror.png</init_from>
     </image>
     <image id="Glasses2" name="Glasses2">
-      <init_from>textures/Glasses2.png</init_from>
+      <init_from>/m_doctor/textures/Glasses2.png</init_from>
     </image>
     <image id="munskydd-normal" name="munskydd-normal">
-      <init_from>textures/munskydd-normal.png</init_from>
+      <init_from>/m_doctor/textures/munskydd-normal.png</init_from>
     </image>
     <image id="munskydd" name="munskydd">
-      <init_from>textures/munskydd.png</init_from>
+      <init_from>/m_doctor/textures/munskydd.png</init_from>
     </image>
     <image id="Shoes_Oxford_NRM" name="Shoes_Oxford_NRM">
-      <init_from>textures/Shoes_Oxford_NRM.png</init_from>
+      <init_from>/m_doctor/textures/Shoes_Oxford_NRM.png</init_from>
     </image>
     <image id="Shoes_Oxford" name="Shoes_Oxford">
-      <init_from>textures/Shoes_Oxford.png</init_from>
+      <init_from>/m_doctor/textures/Shoes_Oxford.png</init_from>
     </image>
   </library_images>
   <library_effects>

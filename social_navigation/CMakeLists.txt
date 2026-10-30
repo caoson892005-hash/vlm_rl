@@ -7,8 +7,10 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_lifecycle REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav2_costmap_2d REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(nav2_util REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(social_perception REQUIRED)
@@ -26,7 +28,7 @@ target_include_directories(social_layer PUBLIC
   $<INSTALL_INTERFACE:include>)
 target_compile_features(social_layer PUBLIC cxx_std_17)
 ament_target_dependencies(social_layer
-  geometry_msgs nav2_costmap_2d nav2_util pluginlib rclcpp social_perception
+  geometry_msgs nav2_costmap_2d nav_msgs nav2_util pluginlib rclcpp rclcpp_lifecycle social_perception
   tf2 tf2_geometry_msgs)
 pluginlib_export_plugin_description_file(nav2_costmap_2d social_layer_plugin.xml)
 
@@ -42,7 +44,6 @@ install(DIRECTORY launch config models rviz DESTINATION share/${PROJECT_NAME}
 install(PROGRAMS
   scripts/release_animated_people.py
   scripts/social_velocity_filter.py
-  scripts/social_safety_shield.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_export_include_directories(include)

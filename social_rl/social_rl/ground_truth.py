@@ -35,15 +35,31 @@ from rclpy.qos import (QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile,
                        QoSReliabilityPolicy)
 from rclpy.time import Time
 from social_perception.msg import People
+from std_msgs.msg import String
 
 from social_rl.observation import RelativeEntity
 from social_rl.ros_interface import visible_to_camera
 
 # What block C will be able to say. '' is not in here: an abstention is drawn
 # separately, because "I could not tell" is a different failure from "I read it
-# wrong", and block D treats it differently -- '' selects the neutral (1,1,1)
-# scales rather than another situation's shape.
-VLM_LABELS = ('talking', 'backs_turned', 'passing', 'walking')
+# wrong", and block D treats it differently -- '' selects the base weight (0.5)
+# rather than another situation's shape.
+VLM_LABELS = ('talking', 'passing', 'waiting', 'walking')
+
+# The plugin no longer carries scene_type on Person.msg (block B is tracking
+# only). During training the situation is the scenario the trainer asked for,
+# read straight off /animated_people/scenario. Map every spawn name onto one of
+# block D's three geometries; the manual crossing/approaching commands and the
+# unused legacy names fall back sensibly.
+_SCENARIO_SCENE_TYPE = {
+    'talking': 'talking',
+    'passing': 'passing',
+    'crossing': 'passing',
+    'approaching': 'passing',
+    'waiting': 'waiting',
+    'none': '',
+    '': '',
+}
 
 
 class SimulatedVLM:
@@ -77,6 +93,13 @@ class SimulatedVLM:
     Held per track and only re-drawn every vlm_period seconds, which produces
     the latency and the flicker of a real 1-3 Hz video model without needing a
     separate parameter for either.
+
+    scene_confidence is drawn the same way (vlm_confidence_min/max), and it is
+    NOT diagnostic-only like the label: it flows into
+    constraint_field.ConstraintFieldConfig's `factor`, so a low draw actually
+    grows the Gaussian region the policy sees for that person. Ground truth
+    stays confidence 1.0 always -- see `relative_people` -- so the reward's
+    geometry never moves; only what the policy is shown does.
     """
 
     def __init__(self, env_config, logger=None):
@@ -91,8 +114,10 @@ class SimulatedVLM:
                 f'simulated block C is ON: every {env_config.vlm_period:.2f} s '
                 f'a ruling is re-drawn per person, wrong with probability '
                 f'{env_config.vlm_wrong_label_prob:.2f}, abstained with '
-                f'{env_config.vlm_abstain_prob:.2f}. The REWARD still uses the '
-                f'true labels -- see SimulatedVLM.')
+                f'{env_config.vlm_abstain_prob:.2f}, scene_confidence in '
+                f'[{env_config.vlm_confidence_min:.2f}, '
+                f'{env_config.vlm_confidence_max:.2f}]. The REWARD still uses '
+                f'the true labels -- see SimulatedVLM.')
         # track_id -> (stamp, label, facing_offset, facing_lost)
         self._held = {}
         self.corrupted = 0
@@ -116,7 +141,14 @@ class SimulatedVLM:
         # average out to the truth over a few frames.
         offset = self._rng.gauss(0.0, self._env.vlm_facing_sigma)
         lost = self._rng.random() < self._env.vlm_facing_lost_prob
-        return label, offset, lost
+        # Same held-per-ruling treatment: a real classifier's certainty on one
+        # sighting does not jitter step to step either. Feeds constraint_field
+        # factor = 1 + expansion_a*(1-c) directly, so this is what makes the
+        # Gaussian regions the POLICY sees vary in size during training instead
+        # of always sitting at factor 1.0.
+        confidence = self._rng.uniform(self._env.vlm_confidence_min,
+                                       self._env.vlm_confidence_max)
+        return label, offset, lost, confidence
 
     def corrupt(self, people, now, robot_yaw):
         """Return the list the POLICY sees. The caller keeps the true one.
@@ -139,11 +171,12 @@ class SimulatedVLM:
             if entry is None or elapsed >= self._env.vlm_period or elapsed < 0.0:
                 entry = (now,) + self._draw(person.scene_type)
                 self._held[person.track_id] = entry
-            _, label, offset, lost = entry
+            _, label, offset, lost, confidence = entry
             facing = -robot_yaw if lost else _wrap(person.facing + offset)
             if label != person.scene_type:
                 self.corrupted += 1
-            shown.append(replace(person, scene_type=label, facing=facing))
+            shown.append(replace(person, scene_type=label, facing=facing,
+                                 scene_confidence=confidence))
         for track_id in [key for key in self._held if key not in present]:
             del self._held[track_id]
         return shown
@@ -154,6 +187,28 @@ def _yaw(orientation) -> float:
         2.0 * (orientation.w * orientation.z + orientation.x * orientation.y),
         1.0 - 2.0 * (orientation.y * orientation.y
                      + orientation.z * orientation.z))
+
+
+def waiting_object_distance(person_x: float, person_y: float, object_pose,
+                            half_thickness: float) -> float:
+    """Distance from a person to the middle of the shelf face they look at.
+
+    28-09-2026. The same number the robot's grounding node computes as d_obj
+    (social_constraint_grounding.make_waiting_zone: the straight-line distance
+    from the person to one configured object point), with that point at the
+    middle of the shelf face on the person's side. The shelf's local x axis is
+    its thickness (measured from the visual mesh: +-0.36 m), so the face
+    normal is (cos yaw, sin yaw) and `half_thickness` walks out to the face.
+    All in the Gazebo world frame.
+    """
+    yaw = _yaw(object_pose.orientation)
+    normal_x, normal_y = math.cos(yaw), math.sin(yaw)
+    offset_x = person_x - object_pose.position.x
+    offset_y = person_y - object_pose.position.y
+    side = 1.0 if offset_x * normal_x + offset_y * normal_y >= 0.0 else -1.0
+    face_x = object_pose.position.x + side * normal_x * half_thickness
+    face_y = object_pose.position.y + side * normal_y * half_thickness
+    return math.hypot(face_x - person_x, face_y - person_y)
 
 
 class GroundTruthPeople:
@@ -173,10 +228,26 @@ class GroundTruthPeople:
             durability=QoSDurabilityPolicy.VOLATILE)
         self.people = None
         self.states = None
+        # scene_type source: the scenario the trainer is running. Latched so a
+        # reset that re-sends the same name still leaves it set for the first
+        # step. '' until the first scenario message, which is the neutral shape.
+        self._scene_type = ''
         node.create_subscription(People, env_config.ground_truth_people_topic,
                                  self._on_people, 10)
         node.create_subscription(ModelStates, env_config.model_states_topic,
                                  self._on_states, latest)
+        node.create_subscription(String, env_config.scenario_topic,
+                                 self._on_scenario, 10)
+        # The regular scenario command is transient in practice but not
+        # latched.  Deployment nodes can start after the actors are already
+        # configured, so also read the factory's latched current scenario.
+        # Training still receives its per-episode command on scenario_topic.
+        current_scenario_qos = QoSProfile(
+            depth=1, history=QoSHistoryPolicy.KEEP_LAST,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        node.create_subscription(String, '/animated_people/current_scenario',
+                                 self._on_scenario, current_scenario_qos)
         # Block C, simulated. Lives here rather than in ros_interface because
         # it is a simulation-only corruption of a simulation-only truth, and
         # the robot must never grow a copy of it: its block C will be wrong on
@@ -188,6 +259,13 @@ class GroundTruthPeople:
 
     def _on_states(self, message):
         self.states = message
+
+    def _on_scenario(self, message):
+        # The command is "<name>" or "<name> route x0 y0 x1 y1"; only the name
+        # decides the geometry. An unknown name keeps the previous type rather
+        # than blanking a scene mid-episode.
+        name = message.data.split()[0].strip().lower() if message.data else ''
+        self._scene_type = _SCENARIO_SCENE_TYPE.get(name, self._scene_type)
 
     def ready(self) -> bool:
         """Both feeds have arrived at least once.
@@ -222,6 +300,16 @@ class GroundTruthPeople:
         # pose is base_link and no further transform is needed.
         return (pose.position.x, pose.position.y, _yaw(pose.orientation))
 
+    def waiting_object_pose(self):
+        """The `waiting` shelf's Pose in the world frame, from /model_states."""
+        name = self._env.waiting_object_model
+        if self.states is None or name not in self.states.name:
+            raise RuntimeError(
+                f'no model "{name}" in {self._env.model_states_topic}. It is '
+                f'the shelf a `waiting` person looks at (env.waiting_object_'
+                f'model) and has to be in the world Gazebo is running.')
+        return self.states.pose[self.states.name.index(name)]
+
     def relative_people(self, apply_camera=True):
         """Everybody the camera could see, in the robot frame.
 
@@ -254,6 +342,8 @@ class GroundTruthPeople:
 
         robot_x, robot_y, robot_yaw = self.robot_pose()
         cos_yaw, sin_yaw = math.cos(robot_yaw), math.sin(robot_yaw)
+        object_pose = (self.waiting_object_pose()
+                       if self._scene_type == 'waiting' else None)
         people = []
         for person in message.people:
             delta_x = person.pose.position.x - robot_x
@@ -274,9 +364,17 @@ class GroundTruthPeople:
                 # is looking. The constraint field's asymmetric regions are
                 # built in the robot frame, so this has to be too.
                 facing=_wrap(_yaw(person.pose.orientation) - robot_yaw),
-                scene_type=person.scene_type,
+                # scene_type comes from the running scenario now, not from the
+                # message. confidence is 1.0: the situation is known here, not
+                # inferred. SimulatedVLM still corrupts both downstream.
+                scene_type=self._scene_type,
                 track_id=person.id,
-                scene_confidence=person.scene_confidence))
+                scene_confidence=1.0,
+                object_distance=(None if object_pose is None else
+                                 waiting_object_distance(
+                                     person.pose.position.x,
+                                     person.pose.position.y, object_pose,
+                                     self._env.waiting_object_half_thickness))))
         return people
 
     def corrupt(self, people, now):

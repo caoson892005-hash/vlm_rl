@@ -54,7 +54,7 @@ bt_navigator:
     robot_base_frame: base_link
     odom_topic: /odom
     # navigation.launch.py replaces this placeholder with the installed 2 Hz
-    # social-replanning behavior tree. Social regions move, so a plan computed
+    # social-replanning behavior tree. People move, so a plan computed
     # once at the start of the goal is stale by the time the robot gets there.
     default_nav_to_pose_bt_xml: SOCIAL_REPLANNING_BT_XML
     bt_loop_duration: 10
@@ -263,36 +263,26 @@ global_costmap:
       social_layer:
         plugin: "social_navigation::SocialLayer"
         enabled: true
-        # Published by social_perception running on the workstation. People are
-        # costed individually from /people whether or not the VLM groups them,
-        # so someone standing alone is still avoided.
+        # Published by social_perception running on the workstation.
+        # Each detected person is costed independently.
         people_topic: /people
-        # Only conversations confirmed by the VLM appear here.
-        groups_topic: /people_groups
-        individual_o_radius: 0.45
-        individual_p_front_radius: 1.1
-        individual_p_side_radius: 0.8
-        individual_p_rear_radius: 0.7
-        individual_r_front_radius: 1.5
-        individual_r_side_radius: 1.0
-        individual_r_rear_radius: 0.75
-        prediction_time: 1.5
-        moving_prediction_time: 2.5
-        moving_speed_threshold: 0.05
-        # Wide enough to clear both the 0.22 m footprint and its inflated
-        # lethal edge when a late VLM result appears around the robot.
-        overlap_escape_clearance: 0.55
-        prediction_steps: 3
-        o_space_cost: 254
-        p_space_cost: 250
-        # A confirmed conversation may not be used as a shortcut. When the
-        # robot is already inside, only the stateful corridor back out is 200.
-        group_p_space_cost: 253
-        group_escape_cost: 200
-        group_escape_corridor_half_width: 0.55
-        r_space_cost: 100
-        moving_p_space_cost: 252
-        moving_r_space_cost: 140
+        # Soft social preference for global routing. VoxelLayer keeps the body
+        # itself blocked, so this field must not turn all personal space into a
+        # lethal wall when the robot has room to pass in a narrow corridor.
+        cutoff: 10.0
+        amplitude: 200.0
+        covariance_front_height: 0.25
+        covariance_front_width: 0.16
+        covariance_rear_height: 0.16
+        covariance_rear_width: 0.16
+        covariance_right_height: 0.18
+        covariance_right_width: 0.15
+        covariance_when_still: 0.12
+        use_passing: true
+        use_vel_factor: true
+        speed_factor_multiplier: 2.0
+        velocity_still_threshold: 0.1
+        publish_occgrid: true
         # People detected over WiFi arrive later than in simulation. Keep a
         # slightly longer memory so a dropped frame does not blink the region
         # out and let the planner cut straight through it.
@@ -381,29 +371,22 @@ local_costmap:
         plugin: "social_navigation::SocialLayer"
         enabled: true
         people_topic: /people
-        groups_topic: /people_groups
-        individual_o_radius: 0.45
-        individual_p_front_radius: 1.1
-        individual_p_side_radius: 0.8
-        individual_p_rear_radius: 0.7
-        individual_r_front_radius: 1.5
-        individual_r_side_radius: 1.0
-        individual_r_rear_radius: 0.75
-        prediction_time: 1.5
-        # The rolling window is only 3 m wide, so a longer horizon than this
-        # just paints predictions outside the map.
-        moving_prediction_time: 2.0
-        moving_speed_threshold: 0.05
-        overlap_escape_clearance: 0.55
-        prediction_steps: 3
-        o_space_cost: 254
-        p_space_cost: 250
-        group_p_space_cost: 253
-        group_escape_cost: 200
-        group_escape_corridor_half_width: 0.55
-        r_space_cost: 100
-        moving_p_space_cost: 252
-        moving_r_space_cost: 140
+        # Local DWB needs a passable gradient to steer around a person. The
+        # RGB-D VoxelLayer still forbids collision with the body itself.
+        cutoff: 10.0
+        amplitude: 200.0
+        covariance_front_height: 0.25
+        covariance_front_width: 0.16
+        covariance_rear_height: 0.16
+        covariance_rear_width: 0.16
+        covariance_right_height: 0.18
+        covariance_right_width: 0.15
+        covariance_when_still: 0.12
+        use_passing: true
+        use_vel_factor: true
+        speed_factor_multiplier: 2.0
+        velocity_still_threshold: 0.1
+        publish_occgrid: true
         data_timeout: 1.5
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"

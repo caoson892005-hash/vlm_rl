@@ -13,11 +13,11 @@ the checkpoint keeps driving in the frame it was trained in.
   RViz 2D Goal Pose -> /rl_goal_pose -> agent -> /cmd_vel -> safety filter
   map_server + AMCL -> TF map -> odom (nothing else)
 
-people:=ground_truth points the agent at /social_gt/people instead of /people,
-for testing a trained policy in simulation while block C does not exist yet.
-The policy then reads the SAME labels it trained on -- scene_type filled, one
-stable id per person -- so a bad run is the policy's fault rather than a
-missing VLM's. It is not a second people source: same message type, same
+people:=ground_truth points the deploy field node at /social_gt/people instead
+of /people, for testing a trained policy in simulation while block C does not
+exist yet. The policy then reads the SAME labels it trained on -- scene_type
+filled, one stable id per person -- so a bad run is the policy's fault rather
+than a missing VLM's. It is not a second people source: same message type, same
 subscription, same camera-cone and occlusion filtering in the bridge; only the
 topic name changes, and social_rl/ground_truth.py stays out of the agent.
 
@@ -65,6 +65,9 @@ def generate_launch_description():
     model_path = LaunchConfiguration('model_path')
     sim = LaunchConfiguration('sim')
     use_localization = LaunchConfiguration('localization')
+    ground_truth_zones = IfCondition(PythonExpression(
+        ["'", LaunchConfiguration('zones'), "' == 'true' and '",
+         LaunchConfiguration('people'), "' == 'ground_truth'"]))
 
     # Empty unless people:=ground_truth, and empty means "use whatever topic
     # the run was configured with", which is the robot's own /people.
@@ -85,6 +88,7 @@ def generate_launch_description():
                 'goal_topic': LaunchConfiguration('goal_topic'),
                 'env_config': LaunchConfiguration('env_config'),
                 'people_topic_override': people_topic_override,
+                'constraint_field_topic': '/social_rl/constraint_field',
             }])
 
     def amcl(params_file, wanted_sim):
@@ -114,7 +118,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'map', default_value=PathJoinSubstitution([
                 FindPackageShare('linorobot2_navigation'),
-                'maps', 'cafe_vlm.yaml']),
+                'maps', 'waiting_rl_train.yaml']),
             description='Map loaded when localization:=true'),
         DeclareLaunchArgument(
             'rviz', default_value='false',
@@ -138,12 +142,9 @@ def generate_launch_description():
                         'cấu hình quan sát của chính checkpoint'),
         DeclareLaunchArgument(
             'zones', default_value='true',
-            description='Vẽ K_soc ra /social_rl/social_costmap và '
-                        '/social_rl/zone_markers cho RViz'),
-        DeclareLaunchArgument(
-            'prediction_times', default_value='[0.0]',
-            description='Mốc thời gian của K_soc đem vẽ. Mặc định chỉ hiện '
-                        'tại; [0.0,1.0,2.0] để soi cả dự báo'),
+            description='Vẽ vùng xã hội ra /social_rl/zone_markers. Với '
+                        'people:=ground_truth, waiting được dựng từ scenario '
+                        'Gazebo; các nguồn khác dùng ConstraintField deploy'),
         DeclareLaunchArgument(
             'goal_topic', default_value='/rl_goal_pose',
             description='Where the agent listens for goals. Point the RViz '
@@ -179,24 +180,48 @@ def generate_launch_description():
             parameters=[{'use_sim_time': ParameterValue(sim, value_type=bool)}],
             condition=IfCondition(LaunchConfiguration('rviz'))),
 
-        agent(sim_config, IfCondition(sim)),
-        agent(real_config, UnlessCondition(sim)),
-
-        # Khối D ra hình. Chạy cùng agent chứ không phải một terminal riêng:
-        # nó chỉ nghe /social_rl/constraint_field và vẽ, không nằm trong vòng
-        # điều khiển, nên quên bật nó chỉ có nghĩa là RViz trống - đúng cái
-        # bẫy tốn thời gian nhất khi xem một run.
-        #
-        # LƯU Ý: agent chỉ publish constraint_field KHI ĐANG CÓ ĐÍCH. Tới đích
-        # rồi thì nó ngừng, và vùng biến mất khỏi RViz. Không phải hỏng.
         Node(
             package='social_rl',
-            executable='zone_markers',
-            name='zone_markers',
+            executable='constraint_field_node',
+            name='social_rl_constraint_field',
             output='screen',
             parameters=[{
                 'use_sim_time': ParameterValue(sim, value_type=bool),
-                'prediction_times': LaunchConfiguration('prediction_times'),
-            }],
-            condition=IfCondition(LaunchConfiguration('zones'))),
+                'model_path': model_path,
+                'env_config': LaunchConfiguration('env_config'),
+                'people_topic_override': people_topic_override,
+                'field_topic': '/social_rl/constraint_field',
+                # ZoneMarkers owns this topic in ground-truth simulation.
+                # Otherwise both publishers send Marker.DELETEALL messages
+                # and make the waiting contours flicker in RViz.
+                'publish_zone_markers': ParameterValue(
+                    PythonExpression(
+                        ["'false' if '", LaunchConfiguration('people'),
+                         "' == 'ground_truth' else '",
+                         LaunchConfiguration('zones'), "'"]),
+                    value_type=bool),
+                'zone_markers_topic': '/social_rl/zone_markers',
+            }]),
+
+        # Ground truth has no scene_type field in Person.msg.  During
+        # simulation, ZoneMarkers recovers it from the latched Gazebo scenario
+        # and renders the same waiting Gaussian field used by training.  This
+        # is visualization only: the ConstraintField JSON consumed by PPO is
+        # still published exclusively by constraint_field_node above.
+        Node(
+            package='social_rl',
+            executable='zone_markers',
+            name='social_rl_ground_truth_zone_markers',
+            output='screen',
+            condition=ground_truth_zones,
+            parameters=[{
+                'use_sim_time': ParameterValue(sim, value_type=bool),
+                'model_path': model_path,
+                'env_config': LaunchConfiguration('env_config'),
+                'people_topic': ground_truth_people,
+            }]),
+
+        agent(sim_config, IfCondition(sim)),
+        agent(real_config, UnlessCondition(sim)),
+
     ])

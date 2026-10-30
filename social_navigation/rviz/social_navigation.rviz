@@ -62,19 +62,6 @@ Visualization Manager:
       Displays:
         - Class: rviz_default_plugins/MarkerArray
           Enabled: true
-          Name: Social O-P-R Regions
-          Namespaces:
-            {}
-          Topic:
-            Depth: 10
-            Durability Policy: Volatile
-            History Policy: Keep Last
-            Reliability Policy: Reliable
-            Value: /social_spaces
-          Value: true
-
-        - Class: rviz_default_plugins/MarkerArray
-          Enabled: true
           Name: Tracked People
           Namespaces:
             {}
@@ -161,6 +148,26 @@ Visualization Manager:
             Value: /local_costmap/costmap_updates
           Use Timestamp: false
           Value: false
+        - Alpha: 0.9
+          Class: rviz_default_plugins/Map
+          Color Scheme: costmap
+          Draw Behind: false
+          Enabled: true
+          Name: Social Gaussian (Local)
+          Topic:
+            Depth: 1
+            Durability Policy: Transient Local
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /local_costmap/social_grid
+          Update Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /local_costmap/social_grid_updates
+          Use Timestamp: false
+          Value: true
       Enabled: true
       Name: Costmaps
 

@@ -59,13 +59,23 @@ def generate_launch_description():
     )
 
     world_path = PathJoinSubstitution(
-        [FindPackageShare("linorobot2_gazebo"), "worlds", "bookstore.world"]
+        [FindPackageShare("linorobot2_gazebo"), "worlds", "talking_train.world"]
     )
 
     # Character meshes the animated-people plugin loads for the actors in
     # lirs_test.world.
     social_models_path = PathJoinSubstitution(
         [FindPackageShare("social_navigation"), "models"]
+    )
+
+    # aws_robomaker_retail_* models bookstore.world (the default world above)
+    # includes by model:// URI. Not on GAZEBO_MODEL_PATH otherwise -- the
+    # ament env hook (linorobot2_gazebo.sh.in) adds it too, but this
+    # SetEnvironmentVariable below replaces the process environment for
+    # everything launched from here, so the hook's value alone never reaches
+    # gzserver.
+    bookstore_models_path = PathJoinSubstitution(
+        [FindPackageShare("linorobot2_gazebo"), "bookstore", "models"]
     )
 
     # Keep Gazebo usable in a fresh terminal even when ~/.bashrc does not
@@ -79,10 +89,13 @@ def generate_launch_description():
         [FindPackageShare('linorobot2_description'), 'launch', 'description.launch.py']
     )
 
-    # The simulated diff-drive plugin only subscribes to /cmd_vel_safe, so this
-    # filter is the single bridge from /cmd_vel to the wheels. Starting it here
-    # keeps plain teleop and SLAM working without an extra terminal; it passes
-    # commands through untouched whenever /people is absent.
+    # 11-09-2026: the simulated diff-drive plugin now subscribes to plain
+    # /cmd_vel (diff_drive.urdf.xacro no longer remaps it to /cmd_vel_safe),
+    # so this filter is NOT a bridge to the wheels any more -- it still
+    # reads /cmd_vel and republishes to /cmd_vel_safe, but nothing listens
+    # there now, so enabling it has no effect on the robot at all. Kept only
+    # for social_navigation's own Nav2-comparison scenarios, which may still
+    # reference /cmd_vel_safe directly; not for anything in this launch file.
     social_safety_launch_path = PathJoinSubstitution(
         [FindPackageShare('social_navigation'), 'launch', 'social_safety.launch.py']
     )
@@ -95,7 +108,7 @@ def generate_launch_description():
         SetEnvironmentVariable(
             name='GAZEBO_MODEL_PATH',
             value=[os.pathsep.join(gazebo_model_paths), os.pathsep,
-                   social_models_path]
+                   social_models_path, os.pathsep, bookstore_models_path]
         ),
 
         DeclareLaunchArgument(
@@ -130,8 +143,16 @@ def generate_launch_description():
 
         DeclareLaunchArgument(
             name='social_safety',
-            default_value='true',
-            description='Bridge /cmd_vel to /cmd_vel_safe and limit speed near people'
+            # 11-09-2026: the diff-drive plugin no longer listens on
+            # /cmd_vel_safe at all (see diff_drive.urdf.xacro), so this arg
+            # no longer affects whether the robot moves -- true just starts
+            # social_velocity_filter writing to a topic nobody reads. Left
+            # here, default false, only because social_navigation's own
+            # Nav2-comparison scenarios may still expect it launchable this
+            # way; do not rely on it to bridge anything any more.
+            default_value='false',
+            description='(vestigial) start social_velocity_filter; it no '
+                        'longer reaches the robot, see comment above'
         ),
 
         DeclareLaunchArgument(
@@ -160,7 +181,10 @@ def generate_launch_description():
 
         DeclareLaunchArgument(
             name='spawn_y', 
-            default_value='-2.0',
+            # Waiting routes and the Gazebo shelf are calibrated with
+            # map = world + (3, 0).  Moving this spawn shifts every route
+            # while leaving the shelf/person strip fixed in the world.
+            default_value='0.0',
             description='Robot spawn position in Y axis'
         ),
 

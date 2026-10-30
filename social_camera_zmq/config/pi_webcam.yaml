@@ -1,0 +1,28 @@
+zmq_camera_sender:
+  ros__parameters:
+    # Direct USB webcam mode. This only transports RGB; it never fabricates depth.
+    source: v4l2
+    camera_mode: rgb
+    device: /dev/v4l/by-id/usb-046d_C922_Pro_Stream_Webcam_0332DF9F-video-index0
+    width: 640
+    height: 480
+    fps: 10.0
+    jpeg_quality: 65
+    # Seconds between USB camera reopen attempts; must be > 0.
+    reopen_interval_s: 2.0
+    frame_id: camera_color_optical_frame
+
+    bind_endpoint: tcp://0.0.0.0:5555
+    rgb_topic: camera.rgb.v1
+    depth_topic: camera.depth.v1
+    camera_info_topic: camera.info.v1
+    status_topic: camera.status.v1
+    send_hwm: 2
+    status_period_s: 1.0
+
+    # Used only with source:=ros after an RGB-D driver is installed on the Pi.
+    ros_rgb_topic: /camera/color/image_raw
+    # Set these explicitly to the vendor driver's *aligned* depth topics.
+    ros_depth_topic: ""
+    ros_camera_info_topic: /camera/color/camera_info
+    ros_depth_camera_info_topic: ""

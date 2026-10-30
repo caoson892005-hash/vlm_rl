@@ -12,40 +12,40 @@
   </asset>
   <library_images>
     <image id="young_lightskinned_male_diffuse" name="young_lightskinned_male_diffuse">
-      <init_from>textures/young_lightskinned_male_diffuse.png</init_from>
+      <init_from>/m_rescue_team/textures/young_lightskinned_male_diffuse.png</init_from>
     </image>
     <image id="short02_diffuse" name="short02_diffuse">
-      <init_from>textures/short02_diffuse.png</init_from>
+      <init_from>/m_rescue_team/textures/short02_diffuse.png</init_from>
     </image>
     <image id="brown_eye" name="brown_eye">
-      <init_from>textures/brown_eye.png</init_from>
+      <init_from>/m_rescue_team/textures/brown_eye.png</init_from>
     </image>
     <image id="eyebrow001" name="eyebrow001">
-      <init_from>textures/eyebrow001.png</init_from>
+      <init_from>/m_rescue_team/textures/eyebrow001.png</init_from>
     </image>
     <image id="rescueteam_jacket" name="rescueteam_jacket">
-      <init_from>textures/rescueteam_jacket.png</init_from>
+      <init_from>/m_rescue_team/textures/rescueteam_jacket.png</init_from>
     </image>
     <image id="rescueteam_pants" name="rescueteam_pants">
-      <init_from>textures/rescueteam_pants.png</init_from>
+      <init_from>/m_rescue_team/textures/rescueteam_pants.png</init_from>
     </image>
     <image id="runningshoes" name="runningshoes">
-      <init_from>textures/runningshoes.png</init_from>
+      <init_from>/m_rescue_team/textures/runningshoes.png</init_from>
     </image>
     <image id="stethoscope" name="stethoscope">
-      <init_from>textures/stethoscope.png</init_from>
+      <init_from>/m_rescue_team/textures/stethoscope.png</init_from>
     </image>
     <image id="headmirror_norm" name="headmirror_norm">
-      <init_from>textures/headmirror_norm.png</init_from>
+      <init_from>/m_rescue_team/textures/headmirror_norm.png</init_from>
     </image>
     <image id="headmirror" name="headmirror">
-      <init_from>textures/headmirror.png</init_from>
+      <init_from>/m_rescue_team/textures/headmirror.png</init_from>
     </image>
     <image id="munskydd-normal" name="munskydd-normal">
-      <init_from>textures/munskydd-normal.png</init_from>
+      <init_from>/m_rescue_team/textures/munskydd-normal.png</init_from>
     </image>
     <image id="munskydd" name="munskydd">
-      <init_from>textures/munskydd.png</init_from>
+      <init_from>/m_rescue_team/textures/munskydd.png</init_from>
     </image>
   </library_images>
   <library_effects>

@@ -12,25 +12,25 @@
   </asset>
   <library_images>
     <image id="old_darkskinned_male_diffuse" name="old_darkskinned_male_diffuse">
-      <init_from>textures/old_darkskinned_male_diffuse.png</init_from>
+      <init_from>/m_casual_4/textures/old_darkskinned_male_diffuse.png</init_from>
     </image>
     <image id="short03_diffuse" name="short03_diffuse">
-      <init_from>textures/short03_diffuse.png</init_from>
+      <init_from>/m_casual_4/textures/short03_diffuse.png</init_from>
     </image>
     <image id="brown_eye" name="brown_eye">
-      <init_from>textures/brown_eye.png</init_from>
+      <init_from>/m_casual_4/textures/brown_eye.png</init_from>
     </image>
     <image id="eyebrow001" name="eyebrow001">
-      <init_from>textures/eyebrow001.png</init_from>
+      <init_from>/m_casual_4/textures/eyebrow001.png</init_from>
     </image>
     <image id="male_casualsuit03_diffuse" name="male_casualsuit03_diffuse">
-      <init_from>textures/male_casualsuit03_diffuse.png</init_from>
+      <init_from>/m_casual_4/textures/male_casualsuit03_diffuse.png</init_from>
     </image>
     <image id="male_casualsuit03_normal" name="male_casualsuit03_normal">
-      <init_from>textures/male_casualsuit03_normal.png</init_from>
+      <init_from>/m_casual_4/textures/male_casualsuit03_normal.png</init_from>
     </image>
     <image id="shoes06_diffuse" name="shoes06_diffuse">
-      <init_from>textures/shoes06_diffuse.png</init_from>
+      <init_from>/m_casual_4/textures/shoes06_diffuse.png</init_from>
     </image>
   </library_images>
   <library_effects>

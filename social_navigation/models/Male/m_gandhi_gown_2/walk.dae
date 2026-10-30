@@ -12,22 +12,22 @@
   </asset>
   <library_images>
     <image id="old_darkskinned_male_diffuse" name="old_darkskinned_male_diffuse">
-      <init_from>textures/old_darkskinned_male_diffuse.png</init_from>
+      <init_from>/m_gandhi_gown_2/textures/old_darkskinned_male_diffuse.png</init_from>
     </image>
     <image id="short01_diffuse" name="short01_diffuse">
-      <init_from>textures/short01_diffuse.png</init_from>
+      <init_from>/m_gandhi_gown_2/textures/short01_diffuse.png</init_from>
     </image>
     <image id="brown_eye" name="brown_eye">
-      <init_from>textures/brown_eye.png</init_from>
+      <init_from>/m_gandhi_gown_2/textures/brown_eye.png</init_from>
     </image>
     <image id="eyebrow001" name="eyebrow001">
-      <init_from>textures/eyebrow001.png</init_from>
+      <init_from>/m_gandhi_gown_2/textures/eyebrow001.png</init_from>
     </image>
     <image id="Ghandi_gown_n" name="Ghandi_gown_n">
-      <init_from>textures/Ghandi_gown_n.png</init_from>
+      <init_from>/m_gandhi_gown_2/textures/Ghandi_gown_n.png</init_from>
     </image>
     <image id="Ghandi_gown_d" name="Ghandi_gown_d">
-      <init_from>textures/Ghandi_gown_d.png</init_from>
+      <init_from>/m_gandhi_gown_2/textures/Ghandi_gown_d.png</init_from>
     </image>
   </library_images>
   <library_effects>

@@ -85,22 +85,11 @@ public:
     publish_period_ = 1.0 / std::max(1.0, sdf->Get<double>(
         "ground_truth_rate", 20.0).first);
 
-    // Prediction window published with every person. These have to agree with
-    // observation.constraint_field.prediction_times in rl_train.yaml, which is
-    // what sizes the CNN; block D checks the two against each other on the
-    // first message rather than quietly using whichever it was handed.
-    prediction_horizon_ = sdf->Get<double>("prediction_horizon", 2.0).first;
-    prediction_dt_ = std::max(1e-3, sdf->Get<double>("prediction_dt", 0.5).first);
-
-    // Below this a person is standing, not walking. Extrapolating tracker
-    // noise on somebody standing still would drag their predicted position two
-    // metres down the corridor by the end of the horizon.
-    still_speed_ = sdf->Get<double>("still_speed", 0.1).first;
-
-    // Whose frame radial_velocity and motion_type are measured against. Those
-    // two fields are the only thing in this plugin that needs the robot at
-    // all; without the model they stay at 0.0 and "".
-    robot_name_ = sdf->Get<std::string>("robot_name", std::string("linorobot2")).first;
+    // Trajectory prediction and robot-relative motion were dropped 10-09-2026:
+    // block B is tracking only now, and block D (the Gaussian grounding node)
+    // works off the current pose and velocity alone. The plugin publishes just
+    // id, pose and velocity per person to match the trimmed social_perception
+    // Person.msg.
 
     route_start_x_ = sdf->Get<double>("route_start_x", route_start_x_).first;
     route_start_y_ = sdf->Get<double>("route_start_y", route_start_y_).first;
@@ -127,6 +116,17 @@ public:
       [this](std_msgs::msg::String::ConstSharedPtr message) {
         SelectScenario(message->data);
       });
+    // 12-09-2026: /animated_people/scenario is a one-shot command, gone the
+    // instant it is sent -- a subscriber that starts (or restarts, as
+    // zone_markers.py does every debug session) after that message is lost
+    // has no way to learn the current scenario from that topic itself.
+    // TRANSIENT_LOCAL + depth 1 here means a late subscriber gets the last
+    // bare scenario name immediately on connecting, no resend needed. This
+    // plugin lives as long as Gazebo does, so it is the one stable place to
+    // hold that state.
+    scenario_state_publisher_ = node_->create_publisher<std_msgs::msg::String>(
+      "/animated_people/current_scenario",
+      rclcpp::QoS(1).transient_local());
     gzmsg << "Animated people factory plugin loaded\n";
   }
 
@@ -562,71 +562,6 @@ private:
 
   // ------------------------------------------------------------ ground truth
 
-  // Constant-velocity extrapolation over the published horizon. The plugin
-  // knows the actual waypoints and could publish the true future instead; it
-  // does not on purpose, because the robot's own block B cannot, and a policy
-  // conditioned on an oracle is a policy that stops working off the simulator.
-  //
-  // The first sample is t = 0.0 and repeats the present pose, so block D reads
-  // the instant it charges the reward at out of the same array as the instants
-  // it rasterises.
-  void FillPrediction(double x, double y, double facing_yaw,
-    double vx, double vy, social_perception::msg::Person * entry) const
-  {
-    const bool moving = std::hypot(vx, vy) >= still_speed_;
-    // Direction of travel once somebody is walking; the reported facing while
-    // they stand, which for a conversation is the whole point.
-    const double heading = moving ? std::atan2(vy, vx) : facing_yaw;
-    for (double t = 0.0; t <= prediction_horizon_ + 1e-9; t += prediction_dt_) {
-      geometry_msgs::msg::Pose pose;
-      pose.position.x = x + (moving ? vx * t : 0.0);
-      pose.position.y = y + (moving ? vy * t : 0.0);
-      pose.position.z = 0.0;
-      pose.orientation.z = std::sin(heading / 2.0);
-      pose.orientation.w = std::cos(heading / 2.0);
-      entry->prediction_times.push_back(static_cast<float>(t));
-      entry->predicted_poses.push_back(pose);
-    }
-  }
-
-  // How this person moves as seen from the robot. Geometry only -- this is
-  // block B's half of the judgement, and it stays filled when block C is off.
-  void FillRelativeMotion(double robot_x, double robot_y, double robot_yaw,
-    double x, double y, double vx, double vy,
-    social_perception::msg::Person * entry) const
-  {
-    const double speed = std::hypot(vx, vy);
-    if (speed < still_speed_) {
-      entry->radial_velocity = 0.0;
-      entry->motion_type = "static";
-      return;
-    }
-
-    // Unit vector robot -> person. A person on top of the robot has no defined
-    // direction, so the guard keeps the division finite; at that range the
-    // episode is over on the obstacle rule anyway.
-    const double dx = x - robot_x;
-    const double dy = y - robot_y;
-    const double range = std::max(std::hypot(dx, dy), 1e-6);
-    const double radial = (vx * dx + vy * dy) / range;
-    entry->radial_velocity = static_cast<float>(radial);
-
-    // Closing or opening within 45 degrees of the line of sight is head on or
-    // receding; anything flatter than that is a crossing, and which way it
-    // crosses is the sign of the sideways component in the ROBOT's frame,
-    // where +y is the robot's left.
-    const double along = radial / speed;
-    if (along < -kHeadOnCosine) {
-      entry->motion_type = "head_on";
-    } else if (along > kHeadOnCosine) {
-      entry->motion_type = "receding";
-    } else {
-      const double sideways =
-        -std::sin(robot_yaw) * vx + std::cos(robot_yaw) * vy;
-      entry->motion_type = sideways < 0.0 ? "left_to_right" : "right_to_left";
-    }
-  }
-
   // Velocity is differentiated here rather than taken from Gazebo. Every actor
   // is driven with SetWorldPose(..., false, false), which moves the body
   // without telling the physics engine, so Actor::WorldLinearVel and the twist
@@ -649,22 +584,6 @@ private:
     // robot's own pose from /model_states, so this needs no TF and no
     // localizer -- the training loop runs without AMCL entirely.
     message.header.frame_id = "world";
-
-    // radial_velocity and motion_type are the only two fields measured against
-    // the robot. Missing model means the world has not spawned it yet, in
-    // which case both stay at their "not known" values rather than being
-    // filled with a guess that reads like a measurement.
-    double robot_x = 0.0;
-    double robot_y = 0.0;
-    double robot_yaw = 0.0;
-    bool robot_known = false;
-    if (const auto robot = world_->ModelByName(robot_name_)) {
-      const auto pose = robot->WorldPose();
-      robot_x = pose.Pos().X();
-      robot_y = pose.Pos().Y();
-      robot_yaw = pose.Rot().Yaw();
-      robot_known = true;
-    }
 
     std::unordered_map<std::string, std::pair<double, double>> current;
     for (const auto & person : pending_people_) {
@@ -694,19 +613,9 @@ private:
       }
       entry.velocity.linear.x = vx;
       entry.velocity.linear.y = vy;
-      entry.scene_type = person.scene_type;
-      // Block C's slot, filled by the simulator. 1.0 because this is not an
-      // estimate: the scenario was chosen here, so the situation is known
-      // rather than inferred from pixels. The stamp is this instant for the
-      // same reason -- the ruling is re-made every publish, it is never a
-      // cached answer going stale the way the VLM's is.
-      entry.scene_confidence = 1.0F;
-      entry.scene_stamp = message.header.stamp;
-      FillPrediction(person.x, person.y, person.facing_yaw, vx, vy, &entry);
-      if (robot_known) {
-        FillRelativeMotion(robot_x, robot_y, robot_yaw,
-          person.x, person.y, vx, vy, &entry);
-      }
+      // scene_type is no longer carried on Person.msg. The training scenario is
+      // known from /animated_people/scenario, which ground_truth.py reads
+      // directly; block D on the real robot infers it from count and speed.
       message.people.push_back(entry);
       current.emplace(person.name, std::make_pair(person.x, person.y));
     }
@@ -717,10 +626,6 @@ private:
   // 1.0 m in one publish period is 20 m/s at the default 20 Hz -- far past
   // walking, and reached only by a teleport.
   static constexpr double kMaximumStep = 1.0;
-
-  // cos(45 degrees). Wider than this and "walking towards the robot" starts
-  // covering people who will pass well to one side.
-  static constexpr double kHeadOnCosine = 0.7071067811865476;
 
   void SpawnPeople()
   {
@@ -816,6 +721,11 @@ private:
   // would put most of them nowhere near the robot, and an episode where nobody
   // is ever in the way teaches nothing about avoidance.
 
+  // Which face of the shelf a `waiting` person stands at: -1 = the face that
+  // looks towards world -y, +1 = towards +y. Set per command by the `face`
+  // token and put back to -y on every SelectScenario, like the offset band.
+  double waiting_face_{-1.0};
+
   double NextUniform(double low, double high)
   {
     return std::uniform_real_distribution<double>(low, high)(rng_);
@@ -895,17 +805,18 @@ private:
         centre_y + side * reach * std::sin(sideways),
         centre_x - side * reach * std::cos(sideways),
         centre_y - side * reach * std::sin(sideways),
-        // 0.40-0.75, not the 0.6-1.1 it was. The arithmetic, on the default
-        // route: it is 4.79 m long, so the robot at 0.5 m/s covers it in
-        // 9.58 s and reaches a crossing placed 35-75% along at t = 3.35-7.18 s.
-        // A walker starting 2.5-3.5 m out has to average reach/t to be at the
-        // crossing point when the robot is -- 0.75-1.04 m/s for the earliest
-        // placement, but only 0.47-0.66 mid-route and 0.35-0.49 for the
-        // latest. The old range was tuned for the near end of that and walked
-        // through and away before the robot arrived everywhere else, which
-        // turns a crossing episode into an empty one. This band centres on the
-        // mid-route figure.
-        NextUniform(0.40, 0.75));
+        // 0.8-1.0 (11-09-2026, requested range). Was 0.40-0.75, tuned so the
+        // walker's average speed (reach/t) matched the robot reaching a
+        // crossing placed anywhere in ratio 0.35-0.75: 0.75-1.04 m/s for the
+        // earliest placement but only 0.35-0.66 m/s mid/late-route -- see the
+        // arithmetic this replaced, still true, just above in git blame. At a
+        // FIXED 0.8-1.0 m/s the walker crosses too early relative to the
+        // robot for roughly the back half of that ratio range, which is the
+        // "empty crossing" failure this range used to avoid. Not re-tuned
+        // here; verify with `ros2 topic echo /social_gt/people` that the
+        // walker and robot are still both present near the crossing point
+        // before trusting this in a training run.
+        NextUniform(0.8, 1.0));
     }
     spawned_ = true;
     gzmsg << "Spawned crossing scenario with " << count << " walker(s)\n";
@@ -936,7 +847,8 @@ private:
       RoutePoint(NextUniform(-0.25, -0.05), offset, &to_x, &to_y);
       WalkLine(
         kWalkers[index], "passing", from_x, from_y, to_x, to_y,
-        NextUniform(0.5, 0.9));
+        // 0.8-1.0 (11-09-2026, requested range). Was 0.5-0.9.
+        NextUniform(0.8, 1.0));
     }
     spawned_ = true;
     gzmsg << "Spawned approaching scenario with " << count << " walker(s)\n";
@@ -980,20 +892,146 @@ private:
     gzmsg << "Spawned backs-turned pair facing " << facing << " rad\n";
   }
 
-  // The conversation pair, but placed somewhere on the route rather than at
-  // the fixed spot SpawnPeople uses. The line between them is what the robot
-  // must not cross.
-  void SpawnTalkingPeople()
+  // The shelf a `waiting` person looks at, and half its thickness (its local x
+  // axis; measured from the visual mesh, +-0.36 m). The same two numbers live
+  // in rl_train.yaml as env.waiting_object_model / waiting_object_half_thickness
+  // -- ground_truth.py turns them into d_obj -- so change one, change both.
+  static constexpr const char * kWaitingShelfName = "BookshelfA_01_002";
+  static constexpr double kWaitingShelfHalfThickness = 0.36;
+  // How far the person stands from the shelf FACE, drawn per episode, and how
+  // far along the shelf from the middle of that face they may stand (half the
+  // shelf's 1.47 m width is 0.74, so 0.6 keeps them in front of it).
+  static constexpr double kWaitingDistanceMin = 0.8;
+  static constexpr double kWaitingDistanceMax = 1.5;
+  static constexpr double kWaitingAlongLimit = 0.6;
+  // Positions along the shelf whose gap to the route is within this of the best
+  // one count as equally good, and one of them is drawn at random.
+  static constexpr double kWaitingGapTolerance = 0.15;
+
+  // One person stands still in front of the shelf, scene_type `waiting`, and
+  // looks at the middle of its face.
+  //
+  // 28-09-2026, rewritten. It used to stand on a RoutePoint and merely turn
+  // towards a hard-coded shelf coordinate (BookshelfA_01_001, since deleted
+  // from bookstore.world), so nothing tied the person to a shelf. Now:
+  //   * the shelf is looked up by name, so moving it in Gazebo and saving the
+  //     world moves the scenario with it;
+  //   * the person stands `distance` (0.8-1.5 m, per episode) from the shelf
+  //     face named by the command (default the one that looks towards world -y), at the point of a strip parallel to
+  //     that face which lies nearest the robot's straight line start -> goal,
+  //     so that line runs through their zone. Near-ties are drawn at random so
+  //     they do not always stand at one end of the shelf;
+  //   * they face the middle of the face, the same object point the robot's
+  //     grounding node measures d_obj to (make_waiting_zone).
+  // The route has to be the one ros_env sends ("waiting route x0 y0 x1 y1"):
+  // the person is placed against it, not against the default line.
+  void SpawnWaitingPeople()
   {
     std::lock_guard<std::mutex> lock(actor_mutex_);
     if (spawned_) {
       return;
     }
     ClearScenario();
-    // The axis they face each other along. Randomised so the robot does not
-    // always meet the pair broadside.
-    const double axis = NextUniform(-M_PI, M_PI);
-    const double half_gap = 0.5 * NextUniform(1.6, pair_separation_);
+    const gazebo::physics::ModelPtr shelf = world_->ModelByName(kWaitingShelfName);
+    if (!shelf) {
+      gzerr << "waiting scenario: no model [" << kWaitingShelfName <<
+        "] in the world, so nobody was spawned\n";
+      return;
+    }
+    const auto shelf_pose = shelf->WorldPose();
+    const double shelf_x = shelf_pose.Pos().X();
+    const double shelf_y = shelf_pose.Pos().Y();
+    const double shelf_yaw = shelf_pose.Rot().Yaw();
+    // Face normal (local x) and the direction along the shelf (local y).
+    const double normal_x = std::cos(shelf_yaw);
+    const double normal_y = std::sin(shelf_yaw);
+    const double along_x = -normal_y;
+    const double along_y = normal_x;
+
+    // The face the person stands at is named by the command ("... face -1" is
+    // the face that looks towards world -y, "face 1" towards +y), so a route
+    // keeps the same side every episode instead of the plugin guessing it from
+    // the route (28-09-2026). Default -y. Tied to a world direction rather than
+    // to the shelf's own +x so it does not flip if the shelf is turned.
+    const double side = (normal_y * waiting_face_ >= 0.0) ? 1.0 : -1.0;
+
+    const double distance = NextUniform(kWaitingDistanceMin, kWaitingDistanceMax);
+    const double strip_x =
+      shelf_x + side * normal_x * (kWaitingShelfHalfThickness + distance);
+    const double strip_y =
+      shelf_y + side * normal_y * (kWaitingShelfHalfThickness + distance);
+
+    // Distance from each candidate spot on the strip to the route segment.
+    const double route_dx = route_end_x_ - route_start_x_;
+    const double route_dy = route_end_y_ - route_start_y_;
+    const double route_length_squared = route_dx * route_dx + route_dy * route_dy;
+    constexpr int kSteps = 30;
+    std::vector<double> gaps;
+    for (int i = -kSteps; i <= kSteps; ++i) {
+      const double along = kWaitingAlongLimit * i / kSteps;
+      const double x = strip_x + along * along_x;
+      const double y = strip_y + along * along_y;
+      double ratio = 0.0;
+      if (route_length_squared > 1e-9) {
+        ratio = std::clamp(
+          ((x - route_start_x_) * route_dx + (y - route_start_y_) * route_dy) /
+          route_length_squared, 0.0, 1.0);
+      }
+      gaps.push_back(std::hypot(
+          x - (route_start_x_ + ratio * route_dx),
+          y - (route_start_y_ + ratio * route_dy)));
+    }
+    const double best_gap = *std::min_element(gaps.begin(), gaps.end());
+    std::vector<int> candidates;
+    for (int i = 0; i < static_cast<int>(gaps.size()); ++i) {
+      if (gaps[i] <= best_gap + kWaitingGapTolerance) {
+        candidates.push_back(i);
+      }
+    }
+    const int chosen = candidates[std::min(
+        static_cast<int>(candidates.size()) - 1,
+        static_cast<int>(NextUniform(0.0, static_cast<double>(candidates.size()))))];
+    const double along = kWaitingAlongLimit * (chosen - kSteps) / kSteps;
+    const double person_x = strip_x + along * along_x;
+    const double person_y = strip_y + along * along_y;
+
+    const double face_x = shelf_x + side * normal_x * kWaitingShelfHalfThickness;
+    const double face_y = shelf_y + side * normal_y * kWaitingShelfHalfThickness;
+    const double facing = std::atan2(face_y - person_y, face_x - person_x);
+    SpawnTalkingActor(
+      "m_sweater", person_x, person_y,
+      facing + kStandingMeshYawOffset, 1.112927, 0.878344, 3.75, 0.0,
+      facing, "waiting");
+    spawned_ = true;
+    gzmsg << "Spawned waiting person at (" << person_x << ", " << person_y <<
+      "), " << distance << " m from the face of " << kWaitingShelfName <<
+      ", " << gaps[chosen] << " m from the route, d_obj " <<
+      std::hypot(face_x - person_x, face_y - person_y) << " m\n";
+  }
+
+  // The conversation pair is placed on the episode route. Its orientation is
+  // varied while its shared talking-region centre remains on that route.
+  void SpawnTalkingPeople(double goal_clearance)
+  {
+    std::lock_guard<std::mutex> lock(actor_mutex_);
+    if (spawned_) {
+      return;
+    }
+    ClearScenario();
+    // Equal thirds: route-aligned, diagonal, and perpendicular. All retain
+    // +/-10 deg jitter, while their common centre stays on the route.
+    const double orientation_draw = NextUniform(0.0, 1.0);
+    const double orientation_offset = orientation_draw < 1.0 / 3.0 ? 0.0 :
+      (orientation_draw < 2.0 / 3.0 ? M_PI / 3.0 : M_PI / 2.0);
+    const double axis = RouteHeading() + orientation_offset +
+      NextUniform(-M_PI / 18.0, M_PI / 18.0);
+    // Person-to-person gap in [1.0, 1.5] m (11-09-2026, requested range).
+    // Was NextUniform(1.6, pair_separation_) = [1.6, 2.8]; narrower on purpose
+    // to make the pair a tighter squeeze for the policy. No physical actor
+    // collision exists to violate (the proxy collision cylinders are
+    // commented out in lirs_test.world), so nothing stops the robot driving
+    // this close mechanically -- it is a training-difficulty choice only.
+    const double half_gap = 0.5 * NextUniform(1.0, 1.5);
     double centre_x = 0.0;
     double centre_y = 0.0;
     // OFF THE ROUTE ON PURPOSE, NOT ON IT (31-08-2026). This used to be
@@ -1038,8 +1076,73 @@ private:
     // This is stage one of a curriculum. Once the policy has the direction
     // rule, widen back towards 0.0 so it also handles the pair blocking the
     // route head-on, which is the case it has to break the symmetry itself.
+    //
+    // 0.4-1.0 -> 0.7-0.9 (12-09-2026, requested for the none80/talking20
+    // phase: "robot luôn phải gặp vùng xã hội trên đường tới đích"). The
+    // measured table above says 0.8 m is the ONE point with 100% of episodes
+    // having a usable slope (vs 67% at 0.4 m, 72% at 1.2 m) -- narrowing to
+    // a tight band around it is the closest thing to "always" this geometry
+    // supports without reverting to 0.0 m, which the same measurement showed
+    // has NO gradient to learn from at all (6% usable, a flat plateau with a
+    // cliff). Not re-measured at this narrower band; if `talking` episodes
+    // start looking suspiciously easy or the pocket failure mode from the
+    // 31-08 note above reappears, widen back towards 0.4-1.0.
+    //
+    // 0.7-0.9 -> 0.3-0.5 (16-09-2026, theo yêu cầu, để robot CHẮC CHẮN gặp
+    // người trên đường tới đích). CẢNH BÁO: đi NGƯỢC với số đo ở trên -- bảng
+    // đo chỉ có 0.0/0.4/0.8/1.2/1.6/2.0, không có điểm nào ở 0.3-0.5, nhưng
+    // nội suy giữa 0.0 m (6% usable) và 0.4 m (67% usable) thì dải này nhiều
+    // khả năng THẤP HƠN 67%, tức đường dốc để học né MỜ hơn hẳn so với 0.8 m
+    // (100%) đang dùng trước đó.
+    //
+    // 0.3-0.5 -> 0.7-0.9 (17-09-2026, theo yêu cầu, TRẢ VỀ). Xác nhận đúng
+    // nghi ngờ ở trên: run 20260917_003717 (resume 165352, đúng dải 0.3-0.5 +
+    // tỉ lệ 40/60) cho `ep_rew_mean` giảm ròng 15.2 -> 10.9 suốt 100k bước,
+    // kèm một giai đoạn sập rõ (step 208k-223k: goal 40-55%, timeout 45-50%)
+    // không hồi phục hoàn toàn. Rộng lại về mức đã đo 100% "đường dốc học
+    // được" trước khi bắt đầu giai đoạn học né nghiêm túc.
+    //
+    // 0.7-0.9 -> 0.5-0.6 (19-09-2026, theo yêu cầu). Resume từ checkpoint
+    // 230352 (run 20260918_020756, train ở đúng 0.7-0.9 + 40/60 + lr 1e-4,
+    // PASS 4/4 ở offset train nhưng FAIL clear_episodes ở offset=0: 43.3%/
+    // 52.5%). Chỉ đổi offset so với điều kiện đã train ra 230352. Nội suy từ
+    // bảng đo: ~75-85% tập có đường dốc học né (0.4 m: 67%, 0.8 m: 100%);
+    // lần 0.3-0.5 sập nhưng chạy với lr 3e-4 nên chưa tách được lỗi do
+    // offset hay do lr.
+    //
+    // 0.0-0.4 -> 0.0 (23-09-2026, theo yêu cầu). Tâm cặp người nằm đúng trên
+    // đường start->goal; phía trái/phải không còn ý nghĩa khi biên bằng 0.
+    // Lý do: (1) muốn tâm hai người sát đường đi của robot; (2) run 235537
+    // (335k-412k) THỰC RA đã train ở offset 0 cố định vì lỗi offset dính (xem
+    // SelectScenario) và cho 412852 PASS 4/4 ở offset=0, nên dải này bao trùm
+    // điều nó đã học mà vẫn có đa dạng hình học. Bảng đo trên: 0.0 m chỉ 6% tập
+    // có đường dốc học né, 0.4 m 67% - dải trộn giữ được cả hai đầu. Giữ lr
+    // 1e-4 (lần 0.3-0.5 cũ sập nhưng chạy lr 3e-4). Các ô eval "offset train"
+    // trước 21-09 bị nhiễm offset dính.
+    //
+    // 18-09-2026: dải này giờ đọc từ talking_offset_min_/max_ (mặc định lúc
+    // đó 0.7/0.9, KHÔNG đổi hành vi train) thay vì hardcode, để lệnh scenario
+    // "talking route ... offset lo hi" có thể ép một dải khác CHỈ cho một
+    // lần gọi SelectScenario - dùng để eval "người đứng hẳn giữa đường"
+    // (offset 0 0), không phải để đổi số train. Xem EnvConfig.talking_offset_override.
+    const double route_length = std::hypot(
+      route_end_x_ - route_start_x_, route_end_y_ - route_start_y_);
+    constexpr double kMinimumTalkingRatio = 0.45;
+    constexpr double kMaximumTalkingRatio = 0.80;
+    // Keep a completion pose and its 0.35 m goal radius away from the hard
+    // talking zone. The trainer rejects routes too short for this bound before
+    // sending the command; fail safe here if an external caller does not.
+    const double maximum_ratio = std::min(
+      kMaximumTalkingRatio,
+      1.0 - goal_clearance / std::max(route_length, 1e-6));
+    if (maximum_ratio < kMinimumTalkingRatio) {
+      gzerr << "Talking route is too short for " << goal_clearance <<
+        " m goal clearance; skipping pair spawn\n";
+      return;
+    }
     const double side = (NextUniform(0.0, 1.0) < 0.5) ? 1.0 : -1.0;
-    RoutePoint(NextUniform(0.45, 0.8), side * NextUniform(0.4, 1.0),
+    RoutePoint(NextUniform(kMinimumTalkingRatio, maximum_ratio),
+      side * NextUniform(talking_offset_min_, talking_offset_max_),
       &centre_x, &centre_y);
     SpawnTalkingActor(
       "m_sweater",
@@ -1056,7 +1159,8 @@ private:
       1.195040, 0.836640, 10.25, 1.25, axis, "talking");
     spawned_ = true;
     gzmsg << "Spawned talking pair at (" << centre_x << ", " << centre_y <<
-      "), gap " << 2.0 * half_gap << " m\n";
+      "), gap " << 2.0 * half_gap << " m, goal clearance " <<
+      goal_clearance << " m\n";
   }
 
   // Empty the three actor lists without touching `spawned_`. The spawn
@@ -1076,6 +1180,25 @@ private:
     std::istringstream stream(command);
     std::string scenario;
     stream >> scenario;
+
+    // 21-09-2026: the `offset` token below used to STICK: talking_offset_min_/
+    // max_ are members, so after one `offset 0 0` (an eval-only worst case)
+    // every later command without the token -- a plain --eval, or a training
+    // run on the same still-running Gazebo -- silently kept offset 0 until
+    // gzserver restarted. Measured: right after an `offset 0 0` call a plain
+    // `talking` command still put the pair centre 0.00 m from the route.
+    // Reset to the defaults on every call; the token then applies to this
+    // call only, which is what the comment on it always claimed.
+    talking_offset_min_ = default_talking_offset_min_;
+    talking_offset_max_ = default_talking_offset_max_;
+    waiting_face_ = -1.0;
+    double talking_goal_clearance = 0.0;
+
+    // Latched republish of the bare name, so a late subscriber (zone_markers.py
+    // after a restart) can catch up without anyone resending the command.
+    std_msgs::msg::String state_message;
+    state_message.data = scenario;
+    scenario_state_publisher_->publish(state_message);
 
     // "<scenario>", "<scenario> <seed>", "<scenario> route x0 y0 x1 y1", or
     // both. The `route` keyword rather than four bare numbers because a seed
@@ -1112,11 +1235,55 @@ private:
         }
         continue;
       }
+      // 28-09-2026: "face -1" / "face 1", which side of the shelf a `waiting`
+      // person stands at. Sent by ros_env for every `waiting` route.
+      if (token == "face") {
+        double face = 0.0;
+        if (stream >> face && face != 0.0) {
+          waiting_face_ = face > 0.0 ? 1.0 : -1.0;
+        } else {
+          gzerr << "scenario command [" << command << "] has `face` without a "
+                << "non-zero number after it; keeping the default -y face\n";
+        }
+        continue;
+      }
+      // 18-09-2026: EVAL-ONLY override of the `talking` pair's lateral
+      // offset band, e.g. "offset 0.0 0.0" to plant the pair dead-centre on
+      // the route -- the worst case for probing avoidance, not something
+      // any training run sends. See EnvConfig.talking_offset_override on the
+      // Python side; default here (0.0, 0.0) is untouched unless this token
+      // arrives.
+      if (token == "offset") {
+        double lo = 0.0, hi = 0.0;
+        if (stream >> lo >> hi) {
+          talking_offset_min_ = lo;
+          talking_offset_max_ = hi;
+        } else {
+          gzerr << "scenario command [" << command << "] has `offset` "
+                << "without two numbers after it; keeping the previous "
+                << "offset band\n";
+        }
+        continue;
+      }
+      // The trainer supplies this for every talking episode. Keeping it in
+      // the command, rather than a world constant, makes map-specific route
+      // lengths and the RL goal threshold part of the same episode contract.
+      if (token == "goal_clearance") {
+        double clearance = 0.0;
+        if (stream >> clearance && clearance >= 0.0) {
+          talking_goal_clearance = clearance;
+        } else {
+          gzerr << "scenario command [" << command << "] has `goal_clearance` "
+            "without a non-negative value; using 0\n";
+        }
+        continue;
+      }
       try {
         rng_.seed(static_cast<unsigned int>(std::stoul(token)));
       } catch (const std::exception &) {
         gzerr << "scenario command [" << command << "] carries [" << token
-              << "], which is neither a seed nor `route`\n";
+              << "], which is neither a seed, `route`, `face`, `offset`, nor "
+              "`goal_clearance`\n";
       }
     }
 
@@ -1129,7 +1296,7 @@ private:
       return;
     }
     if (scenario == "talking") {
-      SpawnTalkingPeople();
+      SpawnTalkingPeople(talking_goal_clearance);
     } else if (scenario == "passing") {
       // The RL mix now asks for one merged "somebody walks past" situation.
       // Half the episodes get the crossing geometry, half the head-on one;
@@ -1145,6 +1312,8 @@ private:
       SpawnApproachingPeople();
     } else if (scenario == "backs_turned") {
       SpawnBacksTurnedPeople();
+    } else if (scenario == "waiting") {
+      SpawnWaitingPeople();
     } else if (scenario == "gathering") {
       SpawnGatheringPeople();
     } else if (scenario == "static_pair") {
@@ -1152,8 +1321,8 @@ private:
       SpawnPeople();
     } else {
       gzerr << "Unknown scenario [" << scenario << "]. Known: talking, "
-        "passing, crossing, approaching, backs_turned, gathering, static_pair, "
-        "none\n";
+        "passing, crossing, approaching, backs_turned, waiting, gathering, "
+        "static_pair, none\n";
     }
   }
 
@@ -1205,6 +1374,7 @@ private:
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr hide_subscription_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr scenario_subscription_;
   rclcpp::Publisher<social_perception::msg::People>::SharedPtr people_publisher_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr scenario_state_publisher_;
   std::vector<TalkingActor> talking_actors_;
   std::vector<WalkingActor> walking_actors_;
   std::vector<GatheringActor> gathering_actors_;
@@ -1222,10 +1392,6 @@ private:
   double pair_separation_{2.8};
   double publish_period_{0.05};
   double last_publish_time_{-1.0};
-  double prediction_horizon_{2.0};
-  double prediction_dt_{0.5};
-  double still_speed_{0.1};
-  std::string robot_name_{"linorobot2"};
   // The nominal route the RL scenarios are laid out around, in world
   // coordinates: from the robot spawn in gazebo.launch.py to the middle of the
   // goal cluster in rl_train.yaml. Overridable from the world file so that
@@ -1235,6 +1401,16 @@ private:
   double route_start_y_{-2.0};
   double route_end_x_{1.2};
   double route_end_y_{0.3};
+
+  // 18-09-2026: `talking` pair lateral offset band, in metres either side of
+  // the route. Matches the trained default (0.0); only a `offset lo hi`
+  // token in SelectScenario's command changes it, and that token is only
+  // ever sent for an eval-only worst case, never during training. See
+  // EnvConfig.talking_offset_override.
+  const double default_talking_offset_min_{0.0};
+  const double default_talking_offset_max_{0.0};
+  double talking_offset_min_{0.0};
+  double talking_offset_max_{0.0};
 };
 
 GZ_REGISTER_WORLD_PLUGIN(AnimatedPeopleRelease)
