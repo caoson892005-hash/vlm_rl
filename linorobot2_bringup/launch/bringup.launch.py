@@ -150,7 +150,7 @@ def generate_launch_description():
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
-            name='world_to_odom',
+            name='world_to_map',
             arguments=[
                 LaunchConfiguration('offset_x'),   # X
                 LaunchConfiguration('offset_y'),   # Y
@@ -159,7 +159,7 @@ def generate_launch_description():
                 '0',                              # Pitch
                 '0',                              # Roll
                 'world',                          # Parent Frame
-                'odom'                            # Child Frame
+                'map'                             # SLAM owns map -> odom
             ]
         ),
 

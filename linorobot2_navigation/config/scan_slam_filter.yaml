@@ -1,0 +1,13 @@
+scan_slam_filter:
+  ros__parameters:
+    filter1:
+      name: near_robot_range
+      type: laser_filters/LaserScanRangeFilter
+      params:
+        use_message_range_limits: false
+        # Metres from the LiDAR origin. Returns inside 0.6 m are ignored by SLAM.
+        # Nearby walls and other obstacles inside this radius disappear too.
+        lower_threshold: 0.6
+        upper_threshold: 100000.0
+        lower_replacement_value: -.inf
+        upper_replacement_value: .inf

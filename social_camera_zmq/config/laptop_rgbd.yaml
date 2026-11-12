@@ -1,0 +1,25 @@
+zmq_camera_receiver:
+  ros__parameters:
+    # Use the Pi address from the existing receiver configuration; verify it
+    # on the network before starting the stream.
+    connect_endpoint: tcp://172.20.10.2:5555
+    rgb_topic: camera.rgb.v1
+    depth_topic: camera.depth.v1
+    camera_info_topic: camera.info.v1
+    status_topic: camera.status.v1
+    receive_hwm: 2
+    poll_period_ms: 5
+    stale_timeout_s: 1.0
+    # Accept RGB/depth captured within 0.15 seconds of each other.
+    max_pair_delta_s: 0.15
+    max_payload_bytes: 8388608
+
+    # Hold RGB until aligned depth and both CameraInfo messages arrive.
+    receive_depth: true
+    require_depth: true
+
+    output_rgb_topic: /camera/color/image_raw
+    output_depth_topic: /camera/depth/image_raw
+    output_camera_info_topic: /camera/color/camera_info
+    output_depth_camera_info_topic: /camera/depth/camera_info
+    camera_info_file: ""

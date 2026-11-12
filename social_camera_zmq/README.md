@@ -2,7 +2,7 @@
 
 This ROS 2 Humble package sends a Pi camera stream to a laptop with ZeroMQ.
 The laptop publishes the regular ROS camera topics that `social_perception`
-expects. It supports a USB webcam now and an RGB-D ROS driver later.
+expects. It supports a USB webcam or an RGB-D ROS driver.
 
 | Mode | Pi source | Data sent | Laptop topics |
 | --- | --- | --- | --- |
@@ -51,7 +51,7 @@ webcam disconnects, the sender retries opening it every `reopen_interval_s`
 
 ### Laptop: receive and publish ROS images
 
-Edit `config/laptop_receiver.yaml`: replace `192.168.1.50` in
+Edit `config/laptop_receiver.yaml`: replace `10.136.10.188` in
 `connect_endpoint` with the actual Pi IP address. Then run:
 
 ```bash
@@ -68,36 +68,34 @@ laptop's `camera_info_file`. Its resolution must match the actual webcam image.
 Otherwise `/camera/color/camera_info` stays absent. Calibration alone does not
 provide depth.
 
-## Switch to an RGB-D camera later
+## RealSense D435i on the Pi
 
-The transport and laptop ROS topic names stay the same. Install the camera's
-ROS driver on the Pi and configure it to publish RGB, **depth aligned to the
-RGB pixels**, and CameraInfo for both streams. The depth image must be
-`16UC1` in millimetres. Copy `config/pi_webcam.yaml` to a local configuration
-file and change these entries to the vendor driver's real topic names:
-
-```yaml
-source: ros
-camera_mode: rgbd
-ros_rgb_topic: /camera/color/image_raw
-ros_depth_topic: /camera/aligned_depth_to_color/image_raw
-ros_camera_info_topic: /camera/color/camera_info
-ros_depth_camera_info_topic: /camera/aligned_depth_to_color/camera_info
-```
-
-On the laptop, copy `config/laptop_receiver.yaml` to a local configuration
-file and set:
-
-```yaml
-receive_depth: true
-require_depth: true
-```
-
-Launch each side with its custom configuration:
+The ready-to-use configuration files are `config/pi_realsense_d435i.yaml` and
+`config/laptop_rgbd.yaml`. Install `realsense2_camera` on the Pi, then run its
+driver with RGB, depth aligned to RGB pixels, and synchronized frames:
 
 ```bash
-ros2 launch social_camera_zmq zmq_camera_sender.launch.py config_file:=/absolute/path/pi_rgbd.yaml
-ros2 launch social_camera_zmq zmq_camera_receiver.launch.py config_file:=/absolute/path/laptop_rgbd.yaml
+ros2 launch realsense2_camera rs_launch.py align_depth.enable:=true enable_sync:=true
+ros2 topic list -t | grep camera
+ros2 topic echo /camera/camera/aligned_depth_to_color/image_raw --once --field encoding
+```
+
+The sender requires `16UC1` depth in millimetres and uses the RealSense ROS
+default `/camera/camera/...` topics. If the driver uses another namespace,
+update the four `ros_*_topic` entries in `pi_realsense_d435i.yaml` to match
+the topics on the Pi. The aligned depth image must match the RGB resolution.
+On the laptop, set `connect_endpoint` in `laptop_rgbd.yaml` to the Pi's current
+IP address; it currently mirrors the existing receiver configuration.
+
+Launch each side with its RGB-D configuration after building and sourcing this
+package on both machines:
+
+```bash
+# Pi
+ros2 launch social_camera_zmq zmq_camera_sender.launch.py config_file:=$(ros2 pkg prefix social_camera_zmq)/share/social_camera_zmq/config/pi_realsense_d435i.yaml
+
+# Laptop
+ros2 launch social_camera_zmq zmq_camera_receiver.launch.py config_file:=$(ros2 pkg prefix social_camera_zmq)/share/social_camera_zmq/config/laptop_rgbd.yaml
 ```
 
 In `require_depth` mode the receiver publishes an RGB/depth pair only when
@@ -121,8 +119,9 @@ cannot install or start an unknown vendor driver.
 
 ## Parameters and limits
 
-The Pi-side parameters are in `config/pi_webcam.yaml`; the laptop-side
-parameters are in `config/laptop_receiver.yaml`. `jpeg_quality` is 1–100
+The Pi-side parameters are in `config/pi_webcam.yaml` or
+`config/pi_realsense_d435i.yaml`; the laptop-side parameters are in
+`config/laptop_receiver.yaml` or `config/laptop_rgbd.yaml`. `jpeg_quality` is 1–100
 (default 80). `send_hwm` and `receive_hwm` bound the ZeroMQ queues to two
 messages. `stale_timeout_s` is 1.0 s: the receiver warns after no new RGB
 arrives, without publishing the previous image again. `max_payload_bytes`

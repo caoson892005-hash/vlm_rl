@@ -1,0 +1,22 @@
+zmq_camera_sender:
+  ros__parameters:
+    # Relay the RealSense ROS driver; V4L2 cannot provide calibrated depth.
+    source: ros
+    camera_mode: rgbd
+    jpeg_quality: 65
+
+    bind_endpoint: tcp://0.0.0.0:5555
+    rgb_topic: camera.rgb.v1
+    depth_topic: camera.depth.v1
+    camera_info_topic: camera.info.v1
+    status_topic: camera.status.v1
+    send_hwm: 2
+    status_period_s: 1.0
+
+    # Default realsense2_camera namespace is /camera/camera. Depth must be
+    # aligned to color pixels so each RGB detection samples the right distance.
+    # Confirm these topics on the Pi after starting the driver.
+    ros_rgb_topic: /camera/camera/color/image_raw
+    ros_depth_topic: /camera/camera/aligned_depth_to_color/image_raw
+    ros_camera_info_topic: /camera/camera/color/camera_info
+    ros_depth_camera_info_topic: /camera/camera/aligned_depth_to_color/camera_info

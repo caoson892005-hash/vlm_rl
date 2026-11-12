@@ -9,7 +9,7 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
     default_config = PathJoinSubstitution([
-        FindPackageShare('social_camera_zmq'), 'config', 'pi_webcam.yaml'
+        FindPackageShare('social_camera_zmq'), 'config', 'pi_realsense_d435i.yaml'
     ])
     return LaunchDescription([
         DeclareLaunchArgument(

@@ -33,6 +33,10 @@ def generate_launch_description():
         [FindPackageShare('linorobot2_navigation'), 'config', 'slam.yaml']
     )
 
+    scan_filter_config_path = PathJoinSubstitution(
+        [FindPackageShare('linorobot2_navigation'), 'config', 'scan_slam_filter.yaml']
+    )
+
     navigation_launch_path = PathJoinSubstitution(
         [FindPackageShare('nav2_bringup'), 'launch', 'navigation_launch.py']
     )
@@ -62,6 +66,17 @@ def generate_launch_description():
             name='rviz', 
             default_value='false',
             description='Run rviz'
+        ),
+
+        # Keep /scan unchanged for obstacle avoidance; only mapping consumes
+        # the range-filtered /scan_slam stream.
+        Node(
+            package='laser_filters',
+            executable='scan_to_scan_filter_chain',
+            name='scan_slam_filter',
+            output='screen',
+            parameters=[scan_filter_config_path],
+            remappings=[('/scan_filtered', '/scan_slam')]
         ),
 
         IncludeLaunchDescription(
